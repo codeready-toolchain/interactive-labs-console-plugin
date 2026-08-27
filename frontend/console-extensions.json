@@ -1,0 +1,22 @@
+[
+  {
+    "type": "console.navigation/href",
+    "properties": {
+      "id": "interactive-labs-console-plugin-nav",
+      "name": "Interactive Labs",
+      "href": "/interactive-labs",
+      "perspective": "admin",
+      "section": "home"
+    }
+  },
+  {
+    "type": "console.page/route",
+    "properties": {
+      "exact": true,
+      "path": "/interactive-labs",
+      "component": {
+        "$codeRef": "main.InteractiveLabsPage"
+      }
+    }
+  }
+]

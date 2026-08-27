@@ -1,0 +1,68 @@
+{
+  "name": "@codeready-toolchain/interactive-labs-console-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "webpack",
+    "start": "webpack serve",
+    "type-check": "tsc --noEmit",
+    "test": "jest",
+    "lint": "eslint src --ext .ts,.tsx"
+  },
+  "consolePlugin": {
+    "name": "interactive-labs-console-plugin",
+    "version": "0.1.0",
+    "displayName": "Interactive Labs",
+    "description": "Guided interactive labs for OpenShift Console",
+    "exposedModules": {
+      "main": "./src/index"
+    },
+    "dependencies": {
+      "@console/pluginAPI": ">=4.21.0 <5.0.0"
+    },
+    "extensions": [
+      {
+        "type": "console.navigation/href",
+        "properties": {
+          "id": "interactive-labs-console-plugin-nav",
+          "name": "Interactive Labs",
+          "href": "/interactive-labs",
+          "perspective": "admin",
+          "section": "home"
+        }
+      },
+      {
+        "type": "console.page/route",
+        "properties": {
+          "exact": true,
+          "path": "/interactive-labs",
+          "component": {
+            "$codeRef": "main.InteractiveLabsPage"
+          }
+        }
+      }
+    ]
+  },
+  "dependencies": {
+    "@openshift-console/dynamic-plugin-sdk": "4.21.0",
+    "react": "17.0.2",
+    "react-dom": "17.0.2"
+  },
+  "devDependencies": {
+    "@openshift-console/dynamic-plugin-sdk-webpack": "4.21.0",
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^17.0.89",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "eslint": "^8.57.1",
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0",
+    "ts-jest": "^29.2.0",
+    "ts-loader": "^9.6.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0",
+    "webpack": "^5.110.2",
+    "webpack-cli": "^6.0.1"
+  }
+}

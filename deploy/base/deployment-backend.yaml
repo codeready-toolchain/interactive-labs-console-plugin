@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: interactive-labs
+  namespace: interactive-labs-console-plugin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: interactive-labs-backend
+  template:
+    metadata:
+      labels:
+        app: interactive-labs-backend
+    spec:
+      serviceAccountName: interactive-labs-backend
+      containers:
+        - name: backend
+          image: interactive-labs-console-plugin:latest
+          ports:
+            - containerPort: 9001
+              name: backend-https
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: backend-tls
+              mountPath: /etc/tls/backend
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: backend-tls
+          secret:
+            secretName: interactive-labs-console-plugin-tls

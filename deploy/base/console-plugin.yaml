@@ -1,0 +1,22 @@
+apiVersion: console.openshift.io/v1
+kind: ConsolePlugin
+metadata:
+  name: interactive-labs-console-plugin
+spec:
+  displayName: Interactive Labs
+  backend:
+    type: Service
+    service:
+      name: interactive-labs-console-plugin
+      namespace: interactive-labs-console-plugin
+      port: 9001
+      basePath: /
+  proxy:
+    - alias: backend
+      authorization: UserToken
+      endpoint:
+        type: Service
+        service:
+          name: interactive-labs-console-plugin
+          namespace: interactive-labs-console-plugin
+          port: 9001
