@@ -120,3 +120,42 @@ MVP must prove complete user flow and give operators and authors enough informat
 - Security checks cover bundle paths, rendered content, routes, namespace boundaries, and token handling.
 
 **Dependencies:** STORY-4, STORY-5, STORY-6, STORY-7.
+
+## ☐ STORY-9: Resolve catalog metadata from cached approved lab manifests
+
+Catalog labels and descriptions must not drift from lab-authored metadata while
+administrators retain control of approved source locations and static overrides.
+
+**Goal:** Build catalog items and bundles from cached, validated repository snapshots.
+
+**Acceptance criteria:**
+- Catalog entries require only `repository`, `branch`, and `labPath`; optional
+  `attributeOverrides` remains administrator-owned deployment policy.
+- Backend derives unchanged `catalogRef` before reading remote metadata, then returns
+  manifest `displayName` and `description`.
+- Backend caches one immutable shallow-cloned snapshot per configured repository/branch;
+  cache hits do not clone again, and catalog and bundle loading use same snapshot.
+- A cache miss validates configured manifests and returns valid items in configured order.
+- An unreachable repository, missing manifest, or invalid lab omits only that lab;
+  browser receives no unavailable-entry state or raw upstream failure detail.
+- Backend logs safe structured failure context and emits bounded namespaced Warning Events
+  against `interactive-labs-catalog`; invalid configuration remains `configuration_error`.
+- Cached snapshots do not refresh remotely in this story; source changes appear only after
+  cache loss until STORY-10 adds refresh.
+
+**Dependencies:** STORY-1, STORY-2.
+
+## ☐ STORY-10: Refresh cached approved lab sources
+
+Cached approved sources must receive branch updates without repeated user-request clones.
+
+**Goal:** Periodically replace cached repository snapshots through bounded backend refresh.
+
+**Acceptance criteria:**
+- Backend refreshes configured repository/branch snapshots on defined cadence without browser requests.
+- It validates configured lab paths before atomically replacing a snapshot; readers never see partial updates.
+- Failed refresh retains last known-good snapshot and emits safe structured logs and bounded Warning Events.
+- Initial misses and sources with no valid snapshot remain unavailable only to their affected labs.
+- Refresh introduces no user-facing update notification, revision pinning, migration, or session reconciliation.
+
+**Dependencies:** STORY-9.
