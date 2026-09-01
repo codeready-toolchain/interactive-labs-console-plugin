@@ -1,24 +1,45 @@
-# Interactive labs Dynamic plugin
+# Interactive Labs Dynamic Plugin
 
-## Project description
+## Delivery state
 
-This is an OpenShift Dynamic plugin for "interactive labs". An interactive lab is a set of instructions that a user can follow to achieve some goal in the OpenShift cluster.
+STORY-1 and STORY-2 are implemented: secure Console-to-backend boundary, administrator-selected catalog, validated lab-bundle API, and catalog-listing page. Frontend `Launch` remains disabled. Backend setup derives release identity and returns a success-shaped response but does **not** execute Helm.
 
-A lab usually comes with a Helm chart that defines the resources that need to be present in the cluster prior to starting the lab.
+Drawer launch, AsciiDoc rendering/navigation, Console guidance links, and Helm setup are decided target behavior, not current functionality. Namespace selection and manual checkpoints remain provisional directions pending open policy decisions. See [dev/docs](dev/docs/README.md) and [stories](dev/efforts/interactive-labs/stories.md).
 
-The content of the lab is shown in an (minimizable and closeable) overlay panel.
+## Product
 
-The content is a collection of inter-linked Asciidoc pages (the Asciidoctor flavor). The pages can also contain special links pointing into the console itself. When the user clicks such a link, the corresponding section in the OpenShift console is highlighted similarly to how it is done in OpenShift quickstarts.
+Interactive Labs is an OpenShift Dynamic Plugin for guided, multi-page AsciiDoc labs. Target MVP shows content in a minimizable, closeable overlay, prepares optional Helm-chart prerequisites, and links users to supported OpenShift Console locations.
 
 ## Deployment and trust model
 
-The plugin is installed in Red Hat customer OpenShift clusters. Red Hat authors and maintains lab repositories, so lab content is trusted.
+Plugin runs in Red Hat customer OpenShift clusters. Customers opt into Red Hat-authored labs through `interactive-labs-catalog` ConfigMap in namespace `interactive-labs-console-plugin`.
 
-Customers opt in to the labs available in their cluster by composing the plugin configuration ConfigMap with their selected labs. After a lab is enabled, the plugin backend keeps it up to date by polling its Red Hat-authored repository directly. Do not assume a separate CI validation or publishing environment for lab updates.
+Browser is untrusted: it must not clone repositories, execute Helm, retain user tokens, decide authorization, or silently choose namespaces. Console forwards current user token through required `UserToken` proxy; backend uses current-user RBAC. Tokens are request-scoped: never log, persist, echo, or return them.
 
-## Open questions
+Backend loads configured approved HTTPS repository branch when bundle is requested. MVP does not pin or expose revisions, poll/detect upstream changes, migrate sessions, reconcile running labs, or provide rollback. Do not assume separate CI validation or publishing environment for lab updates.
 
-* How to handle the situation where more namespaces are required by the Helm chart?
-* When only a single namespace is required by the helmchart, how to "pick" which one should it be?
-* How to check that the user actually followed the instructions in the lab?
-* How to "solve" a section of the lab for the user?
+## Decided target conventions
+
+- Catalog identity is backend-derived opaque SHA-256 over repository, branch, lab path, and attribute overrides. Attribute precedence: manifest, catalog overrides, backend runtime attributes.
+- Content is data, not executable code. Target renderer allows only documented restricted AsciiDoc, bundle-local paths/includes, typed guidance links, and DOM sanitization.
+- Setup is target synchronous, bounded, and current-user-RBAC based. MVP has no automatic retry, cleanup, cancellation, or recovery.
+- Prefer direct, existing platform/library capabilities; do not add abstractions or dependencies without demonstrated need.
+
+## Provisional directions
+
+- Current namespace candidate is explicit selection of existing release namespace and `values.schema.json` namespace-name bindings. Namespace selection and lifecycle are not settled.
+- Current checkpoint candidate is browser-local `type: manual` user attestation. It is not a settled completion model.
+- Use `jj` for version-control operations in this repository.
+
+## Open or deferred
+
+Namespace selection and lifecycle; completion evidence and checkpoint rules; and section-solving behavior remain open. Current manual namespace selection and `type: manual` checkpoint directions are provisional. Automated verification, durable/audited progress, asynchronous setup/recovery, author validation tooling, revision lifecycle/migration/rollback, and disconnected delivery are deferred.
+
+## Sources of truth
+
+- [Architecture](dev/docs/architecture.md)
+- [Design decisions](dev/docs/design-decisions.md)
+- [Engineering conventions](dev/docs/engineering-conventions.md)
+- [Administrator guide](dev/docs/administrator-guide.md)
+- [Lab content contract](dev/docs/lab-content-contract.md)
+- [Architect notes](dev/efforts/interactive-labs/architect-notes.md)

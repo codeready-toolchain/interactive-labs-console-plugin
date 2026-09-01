@@ -1,0 +1,85 @@
+# Design decisions
+
+Status: decisions below describe target MVP unless explicitly marked **implemented and verified**.
+
+## Q1 — Current-user proxy authorization
+
+**Decision:** Use Console `UserToken` proxy and one supported Console/Dynamic Plugin SDK compatibility range.
+
+**Why:** preserves current-user RBAC and avoids privileged identity/impersonation. Forwarded tokens are request-scoped and never logged, persisted, audited, echoed, or returned in errors.
+
+**Implemented and verified:** proxy alias `backend` uses `UserToken`; backend authenticates token against OpenShift user API.
+
+## Q2 — Failed setup handling
+
+**Decision:** no automatic retry, cleanup, or recovery in MVP.
+
+**Why:** retrying or cleaning partially installed charts needs an explicit chart lifecycle policy. Terminal errors require manual user or administrator intervention.
+
+**Deferred:** cancellation, durable operation records, recovery protocol, and async status.
+
+## Q3 — Rendered content safety
+
+**Decision:** restricted AsciiDoc authoring subset plus DOM sanitization.
+
+**Why:** trusted repository delivery does not make generated HTML safe for Console. Remote includes, executable extensions, arbitrary filesystem access, unsupported raw HTML, external navigation, and arbitrary selectors are prohibited.
+
+**Deferred:** renderer and sanitizer implementation; author capability expands only after security review.
+
+## Q4 — Console guidance links
+
+**Decision:** typed Quick Start-compatible macro with supported same-Console route and optional symbolic target ID.
+
+**Why:** avoids author-controlled raw routes/selectors and relies on supported `data-quickstart-id` addressing. Missing or unsupported targets use route-only fallback.
+
+**Deferred:** macro parser, target validation, and spotlight implementation.
+
+## Q5 — Completion evidence, checkpoints, and section solving
+
+**Status: open.** Evidence rules, checkpoint semantics, automated verification, and section-solver behavior need a shared model before they become MVP contract.
+
+**Provisional direction:** browser-local `type: manual` checkpoint as user attestation. It avoids premature cluster-query/check DSL, but does not prove instruction completion. Page navigation must not claim completion.
+
+## Q6 — Progress durability
+
+**Decision:** browser-local state only.
+
+**Why:** avoids new storage, identity, privacy, retention, audit, and reset systems. State is scoped by lab identity and configured branch; reset clears browser data only.
+
+**Tradeoff:** no cross-device resume or audit history.
+
+## Q7 — Namespace selection and lifecycle
+
+**Status: open.** Product needs policy for one and multiple namespaces.
+
+**Provisional direction:** explicit existing release-namespace selection plus `values.schema.json` fields annotated `x-interactive-labs: { kind: namespace-name }` for additional inputs. This avoids duplicate manifest lists and brittle template inference, but does not settle selection or lifecycle policy. Current candidate permits accessible current-namespace preselection and shared bindings.
+
+## Q8 — Manifest/API evolution
+
+**Decision:** support only semantic `v1alpha1` manifest in MVP; backend and plugin reject unsupported versions. No general migration framework.
+
+**Implemented and verified:** backend accepts only `apiVersion: v1alpha1`, `kind: Lab`, and required metadata fields; client checks compatible manifest version and required metadata.
+
+## Q9 — Lab-content delivery
+
+**Decision:** catalog references approved Red Hat HTTPS repository branches; backend loads complete bundle at launch. Optional chart dependencies may resolve from sources declared by approved chart.
+
+**Why:** centrally maintained branches avoid customer ConfigMap changes for each content update.
+
+**Tradeoff:** MVP exposes no resolved revision and has no update notification, migration, rollback, or running-session reconciliation.
+
+## Cross-cutting decisions
+
+- `catalogRef` is opaque SHA-256 over repository, branch, lab path, and catalog attribute overrides. Display fields and runtime attributes do not affect identity.
+- Attribute precedence is manifest, then catalog overrides, then backend runtime attributes. Runtime attributes do not affect catalog identity or Helm release name.
+- Helm release identity is backend-derived, deterministic, and user-specific: static content identity, static effective attributes, and namespace bindings contribute; runtime attributes do not.
+- Use one unified frontend/backend image and one HTTPS Service.
+- Use direct standard-library Kubernetes REST/TLS calls for current narrow ConfigMap/user calls, avoiding `client-go` dependency weight.
+
+## Open or deferred
+
+Namespace selection/lifecycle, completion evidence/checkpoint rules, and section-solving behavior are open. Current explicit existing-namespace selection and browser-local manual-checkpoint approaches are provisional. No commitment exists for automated verification, author-validation tool, durable/audited progress, asynchronous setup/recovery, upstream revision lifecycle, rollback, disconnected delivery, or broad chart topology support.
+
+## Decision records
+
+Detailed open-question records, provisional directions, and resolved decisions live in [architect notes](../efforts/interactive-labs/architect-notes.md).

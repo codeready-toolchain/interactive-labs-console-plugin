@@ -21,9 +21,8 @@ Deliver an OpenShift Dynamic Plugin that presents an interactive lab inside Cons
 
 ## Open design decisions
 
-- Namespace selection and lifecycle when a chart needs one namespace.
-- Namespace selection and lifecycle when a chart needs multiple namespaces.
-- Evidence and rules for determining whether a user completed instructions.
+- Namespace selection and lifecycle for charts requiring one or multiple namespaces. Current explicit selection of existing namespaces is a provisional direction, not a settled policy.
+- Evidence and rules for determining whether a user completed instructions. Current local `type: manual` checkpoint is a provisional direction, not a completion model.
 - What it means to solve a lab section for a user, including whether actions are automated.
 
 ## Non-goals

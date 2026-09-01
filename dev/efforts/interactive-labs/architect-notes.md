@@ -14,9 +14,9 @@ Evidence: `proposal.md`, `stories.md`, and OpenShift Console Dynamic Plugin docu
 
 - **Console-native.** Use Dynamic Plugin SDK, Console navigation, `consoleFetch`, Console service proxy, and existing `data-quickstart-id` targets. Do not recreate Console routing or Quick Starts.
 - **Browser is untrusted.** Client never clones arbitrary repositories, runs Helm, stores user tokens, or decides authorization.
-- **Content is data, not code.** Lab content comes only from catalog-approved Red Hat branches. MVP does not detect, reconcile, or migrate upstream content updates. Rendering permits only lab-local documents, known link directives, and checkpoint metadata (`type: manual` in MVP).
-- **Explicit user intent.** User confirms namespace selection and manual progress. Navigation never marks progress complete.
-- **Small MVP.** One lab path, one optional prerequisite chart, local progress, and synchronous bounded setup. No background worker, CRD, namespace creation, user cancellation, or automated solving.
+- **Content is data, not code.** Lab content comes only from catalog-approved Red Hat branches. MVP does not detect, reconcile, or migrate upstream content updates. Rendering permits only lab-local documents and known link directives. The current `type: manual` checkpoint proposal is provisional pending evidence and checkpoint rules.
+- **Explicit user intent.** Current namespace-selection proposal requires confirmation; selection and lifecycle policy remain open. Navigation must not claim progress completion.
+- **Small MVP.** One lab path, one optional prerequisite chart, and synchronous bounded setup. Browser-local manual progress is a provisional candidate, not a settled completion model. No background worker, CRD, namespace creation, user cancellation, or automated solving.
 - **Recoverable failures.** Every lab-content, setup, render, route, and verification failure gives user an actionable manual next step. MVP never retries, cleans up, or recovers Helm automatically.
 - **Accessible overlay.** Keyboard operation, focus management, semantic controls, and non-pointer spotlight dismissal are baseline requirements.
 
@@ -55,7 +55,7 @@ MVP has no setup cancellation, automatic retry, cleanup, recovery, asynchronous 
 
 1. Plugin lists catalog entries and asks backend for selected lab's validated manifest and complete lab bundle from its configured branch.
 2. Plugin validates client-facing manifest shape before using it. Backend remains trust boundary for catalog, branch, paths, and lab-content retrieval. Page navigation uses loaded bundle; MVP does not check upstream changes during session.
-3. Plugin derives namespace fields from manifest; it preselects current Console namespace only after client/server validation and always asks user to confirm.
+3. Namespace-selection policy remains open. Current provisional direction derives fields from chart metadata, optionally preselects accessible current Console namespace, and requires user confirmation; implementation must not freeze this direction as final policy.
 4. Backend derives stable Helm release identity from authenticated user subject, lab ID, configured branch, and normalized namespace bindings: `il-` plus a truncated SHA-256 digest of their canonical representation. Client never supplies release identity; backend derives expected identity again before reusing a release.
 5. Plugin calls setup only after confirmation. MVP backend invokes Helm synchronously with `Wait` and bounded timeout, then returns typed final result: `success`, `failure`, or `timeout`.
 6. On success—or immediately for lab without chart—plugin opens first page. Any terminal setup error preserves selected context and requires manual intervention by user or administrator. Client neither retries nor guesses cleanup.
@@ -111,9 +111,9 @@ sequenceDiagram
 
 ### Panel and progress flow
 
-Overlay state contains active lab/version, current page, panel mode (`open` or `minimized`), namespace bindings, and local section progress. Closing hides panel; reopening restores valid state. Reset removes only this browser state. It does not call cleanup, stop setup, delete cluster resources, or alter any future audit record.
+Overlay state contains active lab/version, current page, panel mode (`open` or `minimized`), namespace bindings, and local section progress. Closing hides panel; explicit user activation reopens valid state. Route remount and browser refresh never auto-open the panel. Reset removes only this browser state. It does not call cleanup, stop setup, delete cluster resources, or alter any future audit record.
 
-MVP has no automated or cluster-state verification. A section can expose an explicit `type: manual` checkpoint; its `Confirmed` state is local user attestation, not evidence that instructions were completed. Neither page visit nor cached page state can manufacture confirmation. Browser-local state is MVP boundary: clearing browser storage or switching browser/device loses checkpoint state. Automated verification and durable progress are deferred.
+Evidence, checkpoint, and completion rules remain open. Current provisional direction is an explicit browser-local `type: manual` checkpoint whose `Confirmed` state is user attestation, not evidence that instructions were completed. Neither page visit nor cached page state may claim confirmation. Browser-local state would be lost when storage is cleared or browser/device changes. Automated verification, solver behavior, and durable progress remain deferred pending this model.
 
 ## Core Concepts
 
@@ -122,23 +122,23 @@ MVP has no automated or cluster-state verification. A section can expose an expl
 | **Catalog entry** | Admin-visible lab locator: approved Red Hat repository, branch, AsciiDoc path, optional chart path. | List, select, display availability/error. Never dereference arbitrary URLs. |
 | **Lab manifest** | Versioned lab-content contract: attributes, optional setup, links, and typed `checkpoints`. Page paths and entry order derive from loaded content. | Validate schema before use; render only supported features. |
 | **Lab session** | Loaded lab bundle plus browser-local state for one selected lab and namespace bindings. | Navigate within loaded bundle; persist/restore panel and progress state. |
-| **Namespace binding** | Explicit mapping from chart release namespace or annotated chart value to existing user-accessible namespace. | Preselect only when valid; require confirmation; pass binding unchanged to backend. |
+| **Namespace binding** | Provisional mapping from chart release namespace or annotated chart value to a namespace. | Do not treat current explicit-selection approach as settled policy. |
 | **Helm release identity** | Server-derived identity for one user's deployment of one configured lab branch into one normalized set of namespace bindings. | Never generate, persist as authority, or submit it; use it only as backend-provided correlation context. |
 | **Setup result** | Final backend result for optional Helm prerequisite installation. | Show typed status and safe next action. |
 | **Lab page** | One lab-local AsciiDoc page. | Resolve allowed relative links; show loading, missing-page, malformed-content states. |
 | **Console guidance link** | Typed `{ route, targetId? }` instruction using Console-supported Quick Start addressing, not URL/selector escape hatch. | Validate, navigate, attempt spotlight, fallback safely. |
-| **Checkpoint** | Typed section-progress marker; MVP supports only `type: manual`, explicit user confirmation. | Persist local `Confirmed` state; never present it as automated verification. |
+| **Checkpoint** | Provisional typed section-progress marker; current candidate is `type: manual`. | Never present user attestation as automated verification or settled completion evidence. |
 
 ### Lab content delivery
 
 Catalog identifies a lab by canonical approved Red Hat repository identity and branch. Browser never fetches repository content. At lab launch, backend loads manifest, pages, includes, and optional chart from that branch into one bundle and rejects paths outside lab tree. Helm dependencies may resolve at runtime from sources declared by approved chart; catalog approval trusts those declarations. MVP does not expose resolved revision, detect an upstream update, migrate state, or reconcile running labs after upstream content changes.
 
 
-### Namespace model
+### Provisional namespace direction
 
-A chart's Helm release namespace is always an explicit user-confirmed selector. Additional selectors come only from chart `values.schema.json`: every field annotated with `x-interactive-labs: { "kind": "namespace-name" }` is a namespace input. Its JSON-property path is binding key; standard `title`, `description`, and `required` drive UI. Other `values.yaml` fields need no schema entry and remain allowed because schema does not set `additionalProperties: false`.
+Namespace selection and lifecycle for single and multiple namespaces remain open. Current candidate uses an explicit release-namespace selector plus `values.schema.json` fields annotated `x-interactive-labs: { "kind": "namespace-name" }` for additional inputs. Property path would be binding key; standard `title`, `description`, and `required` would drive UI. This is not final authoring or lifecycle policy.
 
-Client asks user to bind each selector to an existing namespace. Current Console namespace may preselect only when accessible and permitted. Client must not create namespaces or choose one silently. Multiple selectors may choose same namespace; MVP does not add cross-field distinction rules.
+Current candidate asks user to bind each selector to an existing namespace and may preselect accessible current Console namespace. It does not create namespaces or choose them silently; multiple selectors may choose same namespace. Revisit these rules when resolving namespace policy rather than treating them as acceptance criteria.
 
 ### State ownership
 
@@ -146,8 +146,8 @@ Client asks user to bind each selector to an existing namespace. Current Console
 | --- | --- | --- |
 | Catalog validation, lab-content retrieval, setup, authorization | Backend | Backend-defined operational state |
 | Current user/namespace/routing | OpenShift Console | Console |
-| Overlay/page/minimized state and local checkpoint state | Plugin | Namespaced browser local storage |
-| `type: manual` checkpoint | Plugin | Browser local storage; user attestation only |
+| Overlay/page/minimized state | Plugin | Namespaced browser local storage |
+| Provisional `type: manual` checkpoint | Plugin | Candidate: browser local storage; user attestation only |
 
 Local storage key must include lab identity and configured branch. On manifest incompatibility or reset, discard incompatible client state rather than attempting migration.
 
@@ -186,14 +186,14 @@ That future path needs release-scoped mutual exclusion across backend replicas�
 
 ### Phase 5 — Verify and harden representative lab (STORY-8)
 
-- Render explicit `type: manual` checkpoints; navigation alone must never confirm a section. Defer other checkpoint types until their contracts are designed.
+- Implement checkpoints only after evidence and checkpoint rules are decided. Current `type: manual` browser-local design is provisional; navigation must not claim completion.
 - Add unit tests for schema/link/state rules, component tests for overlay/render/error states, accessibility tests, proxy/backend integration tests, and an OpenShift smoke test.
 - Publish author/admin contract, supported Console range, RBAC needs, recovery guidance, and one complete fixture lab.
 
 ## Deferred to V2
 
 - **Lab author validation tool.** Validate lab content, manifest, chart `values.schema.json` namespace annotations, and Helm chart before publication.
-- **Automated verification.** Add non-manual checkpoint types through a general, non-ad-hoc evidence/check contract.
+- **Verification and solver model.** Decide evidence, checkpoint, automated-verification, and section-solver rules before adding non-manual checkpoint types.
 - **Asynchronous setup lifecycle.** Add release lease, status/recovery UI, and server-side deadline when synchronous setup no longer meets user needs.
 - **Upstream-content lifecycle.** Add revision visibility, update notification, migration/reconciliation, and rollback behavior for branch-delivered lab content.
 - **Offline/change-controlled delivery.** Add digest-published lab content for disconnected or tightly governed clusters.
@@ -248,19 +248,17 @@ Authors need stable links while Console DOM remains private implementation. Cons
 
 _Considered and rejected: Option B (author-controlled target definitions cannot guarantee supported/stable Console addressing), Option C (arbitrary selectors/routes are unsupported and unstable.)_
 
-## ✔ Q5: Verification declaration and section completion
+## ☐ Q5: Evidence, checkpoint, and section-solver rules
 
-Arbitrary manifest checks would become an ad-hoc and increasingly complex execution language as labs require richer verification.
+Labs need an honest way to describe progress and, if supported later, prove completion or solve a section. Arbitrary manifest checks risk becoming an ad-hoc execution language.
 
-### Option C: Typed checkpoints; manual only in MVP
-- **Pro:** Smallest honest implementation; no premature check DSL or unsafe arbitrary cluster query surface.
-- **Con:** `Confirmed` records user attestation only; it does not prove instructions were completed.
+### Option A: Typed browser-local manual checkpoint (provisional)
+- **Pro:** Smallest initial user-attestation experience; avoids premature check DSL and arbitrary cluster-query surface.
+- **Con:** `Confirmed` does not prove instructions were completed and does not define automated verification or solver behavior.
 
-**Decision:** Option C — `checkpoints` is a typed extension point; MVP accepts only explicit local `type: manual` checkpoints. Navigation never confirms a section. Non-manual types are deferred until a general, non-ad-hoc contract is designed.
+**Recommendation:** Retain Option A only as provisional exploration while defining valid evidence, checkpoint types and semantics, automated-verification boundaries, and section-solver behavior. Do not make checkpoint behavior an MVP contract yet.
 
-_Considered and rejected: Option A (typed check definitions still grow into an ad-hoc DSL as requirements expand), Option B (couples renderer and execution semantics.)_
-
-**Scope impact:** This defers SANDBOX-2004's observable-check acceptance criteria. Update that story before treating MVP as complete.
+**Scope impact:** Do not treat the provisional manual checkpoint as satisfying observable-check acceptance criteria.
 
 ## ✔ Q6: Progress durability and audit scope
 
@@ -270,21 +268,19 @@ Browser-local state satisfies close/reopen on one browser but disappears on clea
 - **Pro:** Matches current scope; no new storage, identity, or privacy system.
 - **Con:** No cross-device resume or audit trail.
 
-**Decision:** Option A — store panel state and `type: manual` checkpoint state only in browser local storage. Do not claim durable completion history.
+**Decision:** Store panel state in browser local storage. If provisional manual checkpoints are retained after Q5, keep their state browser-local and do not claim durable completion history.
 
 _Considered and rejected: Option B (adds persistence, authorization, retention, and reset semantics before MVP needs them.)_
 
-## ✔ Q7: Namespace requirement and binding rules
+## ☐ Q7: Namespace selection and lifecycle
 
-Charts can target one release namespace and, through values, additional namespaces. Lab authors must declare those inputs once without duplicating them in lab manifest.
+Charts can target one release namespace and, through values, additional namespaces. Product needs a consistent selection and lifecycle policy for both cases.
 
-### Option A: Chart `values.schema.json` annotations define namespace inputs
-- **Pro:** One chart-local source; client can build explicit namespace selectors without brittle template inference; unrelated `values.yaml` entries need no schema definition.
-- **Con:** Introduces small Interactive Labs `x-interactive-labs` annotation convention that backend must validate.
+### Option A: Explicit existing-namespace bindings from chart schema (provisional)
+- **Pro:** Chart-local inputs can drive a visible selection UI without brittle template inference or duplicated manifest namespace lists.
+- **Con:** Does not yet resolve selection/lifecycle policy, and introduces `x-interactive-labs` authoring convention that backend must validate.
 
-**Decision:** Option A — every chart uses explicit release namespace selection. Additional namespace inputs are `values.schema.json` fields with `x-interactive-labs: { "kind": "namespace-name" }`; property path is binding key and standard JSON Schema UI metadata drives selector. Multiple inputs may select same namespace. Lab manifest does not list namespaces.
-
-_Considered and rejected: manifest namespace lists (duplicates authoring), template/dry-run inference (validates output but cannot reliably discover user inputs.)_
+**Recommendation:** Retain Option A only as provisional exploration while deciding selection and lifecycle rules for one and multiple namespaces. Current candidate uses explicit release-namespace selection plus `values.schema.json` fields marked `x-interactive-labs: { "kind": "namespace-name" }`; property path is binding key, current namespace may preselect when accessible, and multiple inputs may share a namespace.
 
 ## ✔ Q8: Manifest and API evolution policy
 

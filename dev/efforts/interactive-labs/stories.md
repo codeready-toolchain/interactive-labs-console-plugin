@@ -40,7 +40,7 @@ Users need to launch a selected supported lab beside Console work with predictab
 **Acceptance criteria:**
 - Enabled Launch loads and validates selected lab bundle; a lab without a prerequisite chart opens its first navigable page.
 - Drawer supports keyboard-accessible open, minimize, restore, close, and reset actions with focus management.
-- Close/reopen restores valid selected-lab, page, and panel state from browser local storage.
+- Close/reopen restores valid selected-lab, page, and panel state from browser local storage. Reopen requires explicit user activation; route remount or browser refresh never auto-opens the drawer.
 - Reset clears only browser-local Interactive Labs state and never alters cluster resources or setup activity.
 
 **Dependencies:** STORY-1, STORY-2.
@@ -64,13 +64,14 @@ restricted, sanitised rendering path; STORY-1 only transports raw text.
 
 ## ☐ STORY-5: Select namespaces and deploy prerequisite charts
 
-Labs with prerequisites must target namespaces only with user intent and use current-user RBAC rather than browser-side or privileged Helm execution.
+Labs with prerequisites need a namespace-selection policy that preserves user intent and current-user RBAC rather than browser-side or privileged Helm execution.
 
-**Goal:** Bind required existing namespaces explicitly, then run bounded synchronous Helm setup before opening chart-backed labs.
+**Goal:** Implement the namespace-selection policy once decided, then run bounded synchronous Helm setup before opening chart-backed labs.
+
+**Planning status:** Explicit selection of existing namespaces, with `values.schema.json` namespace annotations, is a provisional direction. Namespace selection and lifecycle for single and multiple namespaces remain open.
 
 **Acceptance criteria:**
-- Release namespace and annotated `values.schema.json` namespace inputs each require explicit confirmation.
-- Console current namespace is preselected only when accessible and permitted; plugin never creates namespaces or chooses silently.
+- Release namespace and annotated `values.schema.json` namespace inputs follow resolved, documented selection and lifecycle rules.
 - Backend revalidates bindings, ownership, catalog, and chart inputs; it derives Helm release identity server-side.
 - Helm setup runs with forwarded user's RBAC, waits within bounded timeout, and returns typed success, failure, or timeout results without automatic retry or cleanup.
 
@@ -90,17 +91,19 @@ Instructions must direct users to relevant Console UI without binding content to
 
 **Dependencies:** STORY-3, STORY-4.
 
-## ☐ STORY-7: Record explicit local checkpoints
+## ☐ STORY-7: Record progress after checkpoint model decision
 
 Users need visible progress without claiming that page visits or cached state prove cluster work completed.
 
-**Goal:** Persist explicit local section checkpoints, initially `type: manual`, as browser-local user attestation.
+**Goal:** Implement section-progress behavior after evidence and checkpoint rules are decided.
+
+**Planning status:** Browser-local `type: manual` checkpoints are a provisional direction, not a settled completion model. Evidence rules, automated verification, and solver behavior remain open.
 
 **Acceptance criteria:**
-- MVP accepts only `type: manual` checkpoints; sections expose their explicit user-confirmation controls.
-- Manual checkpoint confirmation produces local `Confirmed` state only; navigation and page rendering never confirm a section.
-- State is scoped by lab identity and configured branch, persists across panel close/reopen, and is discarded on reset or incompatible manifest.
-- UI clearly distinguishes manual confirmation from automated verification, which is out of scope.
+- Checkpoint types and confirmation semantics follow resolved, documented evidence rules.
+- Navigation and page rendering never claim a section is complete without satisfying those rules.
+- Any persisted state is scoped by lab identity and configured branch and is discarded on reset or incompatible manifest.
+- UI distinguishes user attestation from automated verification when both concepts are supported.
 
 **Dependencies:** STORY-3, STORY-4.
 
@@ -111,7 +114,7 @@ MVP must prove complete user flow and give operators and authors enough informat
 **Goal:** Deliver one supported lab plus automated coverage and operational documentation for complete MVP path.
 
 **Acceptance criteria:**
-- Fixture lab works end to end: catalog selection, content, namespace confirmation, optional setup, navigation, guidance, and `type: manual` checkpoints.
+- Fixture lab works end to end: catalog selection, content, resolved namespace-selection flow, optional setup, navigation, guidance, and resolved checkpoint behavior.
 - Unit, component, accessibility, proxy/backend integration, and OpenShift smoke tests cover expected success and failure states.
 - Documentation defines supported content subset, catalog/manifest/chart conventions, proxy configuration, RBAC, Console compatibility range, and recovery steps.
 - Security checks cover bundle paths, rendered content, routes, namespace boundaries, and token handling.
