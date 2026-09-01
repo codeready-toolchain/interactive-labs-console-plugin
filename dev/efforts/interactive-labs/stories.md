@@ -1,6 +1,6 @@
 # Interactive Labs — Stories
 
-Stories for [proposal.md](proposal.md). These are local planning records only; no Jira issues have been created or updated.
+Stories for [proposal.md](proposal.md). These are local planning records; Jira issues are tracked in `.jira.properties`.
 
 ## ☑ STORY-1: Establish secure plugin, backend, and lab-bundle contract
 
@@ -16,21 +16,36 @@ Interactive Labs needs a safe Console-to-backend boundary and a stable content c
 
 **Dependencies:** None.
 
-## ☐ STORY-2: Render lab content in persistent accessible overlay
+## ☑ STORY-2: List available labs
 
-Users need readable instructions beside Console work, with predictable controls and safe navigation inside a loaded lab.
+Users need a clear catalog of administrator-approved labs before any lab can be launched.
 
-**Goal:** Let a user select and read a supported lab bundle in an accessible overlay that preserves browser-local panel state.
+**Goal:** Render catalog entries on `InteractiveLabsPage` with a deliberately disabled Launch control.
 
 **Acceptance criteria:**
-- User can select a catalog lab and launch its first page when no prerequisite chart is configured.
-- Overlay supports keyboard-accessible open, minimize, restore, close, and reset actions with focus management.
-- Close/reopen restores valid selected-lab, page, and panel state from browser local storage.
-- Reset clears only browser-local Interactive Labs state and never alters cluster resources or setup activity.
+- Page loads and displays catalog lab names and optional descriptions through the existing proxy client.
+- Catalog uses direct, Console-compatible PatternFly dependencies and components; it never relies on transitive PatternFly installation through Dynamic Plugin SDK.
+- Loading, empty catalog, typed API error, and retry states are accessible and actionable.
+- Each catalog entry exposes an inert disabled PatternFly `Launch` button with adjacent availability explanation.
+- Story does not load a bundle, persist session state, deploy setup, or render a drawer or content.
 
 **Dependencies:** STORY-1.
 
-## ☐ STORY-3: Render restricted AsciiDoc and navigate lab-local pages
+## ☐ STORY-3: Launch lab in persistent accessible sliding drawer
+
+Users need to launch a selected supported lab beside Console work with predictable controls and local panel state.
+
+**Goal:** Enable Launch and show a validated no-chart lab's entry page in a persistent accessible sliding drawer.
+
+**Acceptance criteria:**
+- Enabled Launch loads and validates selected lab bundle; a lab without a prerequisite chart opens its first navigable page.
+- Drawer supports keyboard-accessible open, minimize, restore, close, and reset actions with focus management.
+- Close/reopen restores valid selected-lab, page, and panel state from browser local storage.
+- Reset clears only browser-local Interactive Labs state and never alters cluster resources or setup activity.
+
+**Dependencies:** STORY-1, STORY-2.
+
+## ☐ STORY-4: Render restricted AsciiDoc and navigate lab-local pages
 
 Lab authors need inter-linked instructional pages without allowing content to execute code, escape its bundle, or inject unsafe DOM into Console.
 
@@ -45,9 +60,9 @@ restricted, sanitised rendering path; STORY-1 only transports raw text.
 - Allowed relative pages and lab-local includes resolve within validated bundle paths.
 - Remote includes, executable extensions, arbitrary filesystem access, unsupported raw HTML, malformed content, and missing pages fail safely with actionable UI states.
 
-**Dependencies:** STORY-1, STORY-2.
+**Dependencies:** STORY-1, STORY-3.
 
-## ☐ STORY-4: Select namespaces and deploy prerequisite charts
+## ☐ STORY-5: Select namespaces and deploy prerequisite charts
 
 Labs with prerequisites must target namespaces only with user intent and use current-user RBAC rather than browser-side or privileged Helm execution.
 
@@ -59,9 +74,9 @@ Labs with prerequisites must target namespaces only with user intent and use cur
 - Backend revalidates bindings, ownership, catalog, and chart inputs; it derives Helm release identity server-side.
 - Helm setup runs with forwarded user's RBAC, waits within bounded timeout, and returns typed success, failure, or timeout results without automatic retry or cleanup.
 
-**Dependencies:** STORY-1, STORY-2.
+**Dependencies:** STORY-1, STORY-3.
 
-## ☐ STORY-5: Guide users to supported Console targets
+## ☐ STORY-6: Guide users to supported Console targets
 
 Instructions must direct users to relevant Console UI without binding content to private selectors or unsafe arbitrary routes.
 
@@ -73,9 +88,9 @@ Instructions must direct users to relevant Console UI without binding content to
 - Found targets scroll into view and show accessible spotlight that dismisses on interaction, Escape, route change, or timeout.
 - Missing or unsupported targets fall back to route-only navigation; arbitrary selectors and external navigation are rejected.
 
-**Dependencies:** STORY-2, STORY-3.
+**Dependencies:** STORY-3, STORY-4.
 
-## ☐ STORY-6: Record explicit local checkpoints
+## ☐ STORY-7: Record explicit local checkpoints
 
 Users need visible progress without claiming that page visits or cached state prove cluster work completed.
 
@@ -87,9 +102,9 @@ Users need visible progress without claiming that page visits or cached state pr
 - State is scoped by lab identity and configured branch, persists across panel close/reopen, and is discarded on reset or incompatible manifest.
 - UI clearly distinguishes manual confirmation from automated verification, which is out of scope.
 
-**Dependencies:** STORY-2, STORY-3.
+**Dependencies:** STORY-3, STORY-4.
 
-## ☐ STORY-7: Publish and harden representative end-to-end lab
+## ☐ STORY-8: Publish and harden representative end-to-end lab
 
 MVP must prove complete user flow and give operators and authors enough information to deploy, support, and recover from predictable failures.
 
@@ -101,4 +116,4 @@ MVP must prove complete user flow and give operators and authors enough informat
 - Documentation defines supported content subset, catalog/manifest/chart conventions, proxy configuration, RBAC, Console compatibility range, and recovery steps.
 - Security checks cover bundle paths, rendered content, routes, namespace boundaries, and token handling.
 
-**Dependencies:** STORY-3, STORY-4, STORY-5, STORY-6.
+**Dependencies:** STORY-4, STORY-5, STORY-6, STORY-7.

@@ -8,7 +8,11 @@ const config: Configuration = {
   devtool: "source-map",
   resolve: { extensions: [".ts", ".tsx", ".js"] },
   module: {
-    rules: [{ test: /\.tsx?$/, use: "ts-loader", exclude: /node_modules/ }],
+    rules: [
+      { test: /\.tsx?$/, use: "ts-loader", exclude: /node_modules/ },
+      // PatternFly 6 ESM imports React 17's extensionless JSX runtime path.
+      { test: /\.m?js$/, include: /node_modules[\\/]@patternfly[\\/]/, resolve: { fullySpecified: false } },
+    ],
   },
 };
 

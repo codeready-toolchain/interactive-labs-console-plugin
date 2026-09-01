@@ -15,7 +15,7 @@
     "displayName": "Interactive Labs",
     "description": "Guided interactive labs for OpenShift Console",
     "exposedModules": {
-      "main": "./src/index"
+      "main": "./src/InteractiveLabsPage"
     },
     "dependencies": {
       "@console/pluginAPI": ">=4.21.0 <5.0.0"
@@ -45,12 +45,14 @@
   },
   "dependencies": {
     "@openshift-console/dynamic-plugin-sdk": "4.21.0",
+    "@patternfly/react-core": "6.6.1",
     "react": "17.0.2",
     "react-dom": "17.0.2"
   },
   "devDependencies": {
     "@openshift-console/dynamic-plugin-sdk-webpack": "4.21.0",
     "@types/jest": "^29.5.0",
+    "@types/react-dom": "^17.0.0",
     "@types/node": "^20.0.0",
     "@types/react": "^17.0.89",
     "@typescript-eslint/eslint-plugin": "^7.18.0",

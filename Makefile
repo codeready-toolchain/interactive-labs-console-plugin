@@ -6,7 +6,7 @@ NAMESPACE ?= interactive-labs-console-plugin
 REGISTRY ?= $(shell $(OC) get route default-route -n openshift-image-registry --template='{{ .spec.host }}' 2>/dev/null)
 DEV_IMAGE ?= $(REGISTRY)/$(NAMESPACE)/interactive-labs-console-plugin:latest
 
-.PHONY: all build test frontend-build frontend-test backend-build backend-test image push-image validate-deploy deploy check-registry create-namespace dev-image push-dev-image dev-deploy help
+.PHONY: all build test frontend-build frontend-test backend-build backend-test image push-image validate-frontend-bundle validate-deploy validate-demo-catalog validate-catalog-namespace deploy check-registry create-namespace dev-image push-dev-image dev-deploy dev-deploy-with-demo-catalog help
 
 help: ## List available targets
 	@printf 'Usage: make <target>\n\nTargets:\n'; \
@@ -35,6 +35,10 @@ backend-test: ## Test and vet backend
 	cd backend && go test ./...
 	cd backend && go vet ./...
 
+validate-frontend-bundle: ## Validate exposed page module initialization
+	npm --prefix frontend run build
+	@! grep -Fq 'reexport safe' frontend/dist/exposed-main.js
+
 image: ## Build container image
 	$(CONTAINER_TOOL) build -f docker/Dockerfile -t $(IMAGE) .
 
@@ -44,8 +48,15 @@ push-image: image ## Build and push default image
 validate-deploy: ## Validate Kustomize deployment manifests
 	$(OC) kustomize deploy/base | $(OC) apply --dry-run=client -f -
 
+validate-demo-catalog: ## Validate demo catalog deployment manifests
+	$(OC) kustomize deploy/demo | $(OC) apply --dry-run=client -f -
+
+validate-catalog-namespace: ## Validate catalog ConfigMap namespace
+	@for dir in deploy/base deploy/demo; do $(KUSTOMIZE) build "$$dir" | grep -A1 -Fx '  name: interactive-labs-catalog' | grep -Fx '  namespace: interactive-labs-console-plugin' >/dev/null || exit 1; done
+
 deploy: ## Apply deployment manifests
 	$(OC) apply -k deploy/base
+
 
 check-registry: ## Verify OpenShift registry access
 	@test -n "$(REGISTRY)" || { echo "OpenShift image registry route unavailable."; exit 1; }
@@ -64,6 +75,14 @@ push-dev-image: check-registry dev-image ## Build and push development image
 dev-deploy: push-dev-image ## Build, push, and deploy development image
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	cp -R deploy/base/. "$$tmp"; \
+	cd "$$tmp"; \
+	$(KUSTOMIZE) edit set image interactive-labs-console-plugin=$(DEV_IMAGE); \
+	$(KUSTOMIZE) build . | $(OC) apply -f -
+
+dev-deploy-with-demo-catalog: push-dev-image ## Build, push, and deploy development image with demo catalog
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	cp -R deploy/base/. "$$tmp"; \
+	cp deploy/demo/catalog.yaml "$$tmp/catalog.yaml"; \
 	cd "$$tmp"; \
 	$(KUSTOMIZE) edit set image interactive-labs-console-plugin=$(DEV_IMAGE); \
 	$(KUSTOMIZE) build . | $(OC) apply -f -

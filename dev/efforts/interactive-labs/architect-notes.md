@@ -8,7 +8,7 @@ status: Advisory
 
 Interactive Labs adds guided, multi-page tasks to OpenShift Console without turning Console, browser, or lab authors into cluster administrators. This note designs client side of MVP and records backend contracts client requires. Product goal and acceptance criteria remain in [proposal.md](proposal.md).
 
-Evidence: `proposal.md`; SANDBOX-1998 through SANDBOX-2005; OpenShift Console Dynamic Plugin documentation. Repository has no source, `docs/`, tests, or plugin scaffold. File paths below are target structure, not existing code.
+Evidence: `proposal.md`, `stories.md`, and OpenShift Console Dynamic Plugin documentation. STORY-1 source, tests, and deployment scaffold now exist; later-story paths below remain target structure until their story is implemented.
 
 ## Design Principles
 
@@ -166,19 +166,25 @@ That future path needs release-scoped mutual exclusion across backend replicas�
 - Define TypeScript schemas for catalog view, `v1alpha1` manifest view, setup result, chart namespace annotations, guidance links, typed checkpoints, and persisted session.
 - Backend and plugin reject unsupported manifest `apiVersion`; agree error envelope before UI implementation. No migration framework in MVP.
 
-### Phase 2 — Lab launch and overlay
+### Phase 2 — List catalog labs (STORY-2)
 
-- Build catalog selection, validated manifest fetch, namespace confirmation, and bounded setup UX.
-- Build accessible overlay shell with open/minimize/close/reset and browser-state restore.
-- Test keyboard/focus behavior and all setup error states.
+- Build catalog listing on `InteractiveLabsPage` with loading, empty, typed-error, and retry states.
+- Render each approved catalog entry with a keyboard-accessible disabled Launch button.
+- Do not load bundles, persist sessions, run setup, render a drawer, or render content.
 
-### Phase 3 — Render and navigate content
+### Phase 3 — Launch and persistent sliding drawer (STORY-3)
+
+- Enable Launch, load and validate selected lab bundle, and open first navigable page immediately only when no chart is available.
+- Build accessible side drawer shell with open/minimize/restore/close/reset and browser-state restore; do not trap focus because Console remains usable beside drawer.
+- Test keyboard controls, focus movement/restoration, bundle errors, and reset's no-cluster-mutation boundary.
+
+### Phase 4 — Render and navigate content (STORY-4)
 
 - Add restricted Asciidoctor.js adapter with lab-local page/include resolver and runtime-attribute precedence.
 - Add page navigation, invalid content/missing-page states, and typed Console guidance links.
 - Implement route-first spotlight adapter around allow-listed `data-quickstart-id` targets.
 
-### Phase 4 — Verify and harden representative lab
+### Phase 5 — Verify and harden representative lab (STORY-8)
 
 - Render explicit `type: manual` checkpoints; navigation alone must never confirm a section. Defer other checkpoint types until their contracts are designed.
 - Add unit tests for schema/link/state rules, component tests for overlay/render/error states, accessibility tests, proxy/backend integration tests, and an OpenShift smoke test.
