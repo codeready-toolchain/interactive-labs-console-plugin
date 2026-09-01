@@ -77,7 +77,9 @@ dev-deploy: push-dev-image ## Build, push, and deploy development image
 	cp -R deploy/base/. "$$tmp"; \
 	cd "$$tmp"; \
 	$(KUSTOMIZE) edit set image interactive-labs-console-plugin=$(DEV_IMAGE); \
-	$(KUSTOMIZE) build . | $(OC) apply -f -
+	$(KUSTOMIZE) build . | $(OC) apply -f - && \
+	$(OC) rollout restart deployment/interactive-labs -n $(NAMESPACE) && \
+	$(OC) rollout status deployment/interactive-labs -n $(NAMESPACE)
 
 dev-deploy-with-demo-catalog: push-dev-image ## Build, push, and deploy development image with demo catalog
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
@@ -85,4 +87,6 @@ dev-deploy-with-demo-catalog: push-dev-image ## Build, push, and deploy developm
 	cp deploy/demo/catalog.yaml "$$tmp/catalog.yaml"; \
 	cd "$$tmp"; \
 	$(KUSTOMIZE) edit set image interactive-labs-console-plugin=$(DEV_IMAGE); \
-	$(KUSTOMIZE) build . | $(OC) apply -f -
+	$(KUSTOMIZE) build . | $(OC) apply -f - && \
+	$(OC) rollout restart deployment/interactive-labs -n $(NAMESPACE) && \
+	$(OC) rollout status deployment/interactive-labs -n $(NAMESPACE)

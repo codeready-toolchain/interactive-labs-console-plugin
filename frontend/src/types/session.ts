@@ -1,9 +1,4 @@
 export interface PersistedSession {
-  catalogRef: string;
-  branch: string;
-  currentPagePath: string | null;
+  currentPagePath: string;
   panelMode: "open" | "minimized";
-  namespaceBindings: Record<string, string>;
-  /** pagePath → user-confirmed */
-  checkpoints: Record<string, boolean>;
 }

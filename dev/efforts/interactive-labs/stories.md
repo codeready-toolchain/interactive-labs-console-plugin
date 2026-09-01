@@ -31,7 +31,7 @@ Users need a clear catalog of administrator-approved labs before any lab can be 
 
 **Dependencies:** STORY-1.
 
-## ☐ STORY-3: Launch lab in persistent accessible sliding drawer
+## ☑ STORY-3: Launch lab in persistent accessible sliding drawer
 
 Users need to launch a selected supported lab beside Console work with predictable controls and local panel state.
 

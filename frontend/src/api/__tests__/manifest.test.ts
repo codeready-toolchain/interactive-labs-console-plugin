@@ -1,6 +1,11 @@
 // Phase D — Client-side manifest validation and bundle page normalization.
 
-import { validateManifest } from "../client";
+import * as client from "../client";
+
+const { validateManifest } = client;
+const getNavigablePagePaths = (client as typeof client & {
+  getNavigablePagePaths: (pages: Record<string, string>) => string[];
+}).getNavigablePagePaths;
 
 describe("validateManifest", () => {
   const validManifest = {
@@ -31,36 +36,64 @@ describe("validateManifest", () => {
     expect(() => validateManifest(bad)).toThrow();
   });
 
+  it("throws for kind !== Lab", () => {
+    expect(() => validateManifest({ ...validManifest, kind: "Other" })).toThrow();
+  });
+
+  it("throws for a missing or non-object spec", () => {
+    expect(() => validateManifest({ ...validManifest, spec: undefined })).toThrow();
+    expect(() => validateManifest({ ...validManifest, spec: "not an object" })).toThrow();
+  });
+
   it("throws for non-object input", () => {
     expect(() => validateManifest(null)).toThrow();
     expect(() => validateManifest("string")).toThrow();
     expect(() => validateManifest(42)).toThrow();
   });
+
+  it.each([
+    ["a null value", null],
+    ["a non-record value", "not an attribute record"],
+    ["an array", ["not", "an", "attribute", "record"]],
+    ["a record with a non-string value", { audience: 42 }],
+  ])("throws for attributes with %s", (_description, attributes) => {
+    expect(() => validateManifest({ ...validManifest, spec: { attributes } })).toThrow();
+  });
+
+  it.each([
+    ["a non-array value", "not checkpoint records"],
+    ["a record instead of an array", {}],
+    ["a null item", [null]],
+    ["an array item", [[]]],
+    ["a scalar item", ["checkpoint"]],
+    ["a non-manual type", [{ id: "done", type: "automatic", pagePath: "intro.adoc", label: "Done" }]],
+    ["a missing type", [{ id: "done", pagePath: "intro.adoc", label: "Done" }]],
+    ["a missing id", [{ type: "manual", pagePath: "intro.adoc", label: "Done" }]],
+    ["an empty id", [{ id: "", type: "manual", pagePath: "intro.adoc", label: "Done" }]],
+    ["a non-string id", [{ id: 1, type: "manual", pagePath: "intro.adoc", label: "Done" }]],
+    ["a missing pagePath", [{ id: "done", type: "manual", label: "Done" }]],
+    ["an empty pagePath", [{ id: "done", type: "manual", pagePath: "", label: "Done" }]],
+    ["a non-string pagePath", [{ id: "done", type: "manual", pagePath: 1, label: "Done" }]],
+    ["a missing label", [{ id: "done", type: "manual", pagePath: "intro.adoc" }]],
+    ["an empty label", [{ id: "done", type: "manual", pagePath: "intro.adoc", label: "" }]],
+    ["a non-string label", [{ id: "done", type: "manual", pagePath: "intro.adoc", label: 1 }]],
+  ])("throws for checkpoints with %s", (_description, checkpoints) => {
+    expect(() => validateManifest({ ...validManifest, spec: { checkpoints } })).toThrow();
+  });
 });
 
 describe("bundle page normalization", () => {
-  it("underscore-prefixed paths are include-only (not navigation targets)", () => {
+  it("excludes paths with underscore-prefixed segments from lexical navigation", () => {
     const pages = {
-      "010-intro.adoc": "content",
-      "_shared/notice.adoc": "include",
       "020-install.adoc": "content",
+      "010-intro.adoc": "content",
+      "chapter/_shared/notice.adoc": "include",
+      "_shared/appendix.adoc": "include",
     };
-    const navPaths = Object.keys(pages)
-      .filter(p => !p.split("/").some(seg => seg.startsWith("_")))
-      .sort();
-    expect(navPaths).toEqual(["010-intro.adoc", "020-install.adoc"]);
-    expect(navPaths[0]).toBe("010-intro.adoc"); // lexically first = entry page
-  });
 
-  it("entry page is lexically first navigable path", () => {
-    const pages = {
-      "020-step.adoc": "x",
-      "010-intro.adoc": "y",
-      "_shared/notice.adoc": "z",
-    };
-    const nav = Object.keys(pages)
-      .filter(p => !p.split("/").some(s => s.startsWith("_")))
-      .sort();
-    expect(nav[0]).toBe("010-intro.adoc");
+    const navigablePaths = getNavigablePagePaths(pages);
+
+    expect(navigablePaths).toEqual(["010-intro.adoc", "020-install.adoc"]);
+    expect(navigablePaths[0]).toBe("010-intro.adoc");
   });
 });

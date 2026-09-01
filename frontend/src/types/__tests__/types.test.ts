@@ -84,16 +84,27 @@ describe("SetupResult shape", () => {
   });
 });
 
+type IsExact<Left, Right> = (
+  <Value>() => Value extends Left ? 1 : 2
+) extends (
+  <Value>() => Value extends Right ? 1 : 2
+)
+  ? true
+  : false;
+
+type PersistedSessionContract = {
+  currentPagePath: string;
+  panelMode: "open" | "minimized";
+};
+
 describe("PersistedSession shape", () => {
-  it("holds catalogRef, branch, panel state, and checkpoint map", () => {
+  it("contains only current page path and panel mode", () => {
     const s: PersistedSession = {
-      catalogRef: "l1",
-      branch: "main",
       currentPagePath: "010-intro.adoc",
       panelMode: "open",
-      namespaceBindings: { releaseNamespace: "my-ns" },
-      checkpoints: {},
     };
+    const exactContract: IsExact<PersistedSession, PersistedSessionContract> = true;
+    expect(exactContract).toBe(true);
     expect(s.panelMode).toBe("open");
   });
 });

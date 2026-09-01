@@ -40,6 +40,17 @@
             "$codeRef": "main.InteractiveLabsPage"
           }
         }
+      },
+      {
+        "type": "console.context-provider",
+        "properties": {
+          "provider": {
+            "$codeRef": "main.InteractiveLabsProvider"
+          },
+          "useValueHook": {
+            "$codeRef": "main.useInteractiveLabs"
+          }
+        }
       }
     ]
   },

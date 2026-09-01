@@ -17,6 +17,26 @@ function makeJsonResponse(body: unknown, status = 200): Response {
   } as unknown as Response;
 }
 
+function validBundle() {
+  return {
+    apiVersion: "v1alpha1",
+    kind: "LabBundle",
+    manifest: {
+      apiVersion: "v1alpha1",
+      kind: "Lab",
+      metadata: { name: "l1", displayName: "L" },
+      spec: {},
+    },
+    pages: { "010-intro.adoc": "= Intro" },
+    runtimeContext: { catalogRef: "l1", branch: "main", helmChartAvailable: false },
+  };
+}
+
+async function expectBundleValidationFailure(body: unknown): Promise<void> {
+  mockFetch.mockResolvedValueOnce(makeJsonResponse(body));
+  await expect(loadLabBundle("l1")).rejects.toThrow();
+}
+
 beforeEach(() => {
   mockFetch.mockReset();
 });
@@ -45,13 +65,7 @@ describe("listCatalog", () => {
 
 describe("loadLabBundle", () => {
   it("calls GET /api/v1alpha1/labs/{catalogRef}/bundle via proxy", async () => {
-    const bundleBody = {
-      apiVersion: "v1alpha1",
-      kind: "LabBundle",
-      manifest: { apiVersion: "v1alpha1", kind: "Lab", metadata: { name: "l1", displayName: "L" }, spec: {} },
-      pages: {},
-      runtimeContext: { catalogRef: "l1", branch: "main", helmChartAvailable: false },
-    };
+    const bundleBody = validBundle();
     mockFetch.mockResolvedValueOnce(makeJsonResponse(bundleBody));
 
     const result = await loadLabBundle("l1");
@@ -65,6 +79,52 @@ describe("loadLabBundle", () => {
     mockFetch.mockResolvedValueOnce(makeJsonResponse(errBody, 404));
 
     await expect(loadLabBundle("missing")).rejects.toMatchObject({ type: "lab_not_found" });
+  });
+
+  it("rejects an invalid LabBundle envelope", async () => {
+    await expectBundleValidationFailure({ ...validBundle(), apiVersion: "v2" });
+    await expectBundleValidationFailure({ ...validBundle(), kind: "Other" });
+  });
+
+  it("rejects an invalid nested manifest", async () => {
+    await expectBundleValidationFailure({
+      ...validBundle(),
+      manifest: { ...validBundle().manifest, kind: "Other" },
+    });
+    await expectBundleValidationFailure({
+      ...validBundle(),
+      manifest: { ...validBundle().manifest, metadata: { name: "l1" } },
+    });
+  });
+
+  it("rejects malformed runtime context", async () => {
+    await expectBundleValidationFailure({
+      ...validBundle(),
+      runtimeContext: { catalogRef: "l1", branch: "", helmChartAvailable: false },
+    });
+    await expectBundleValidationFailure({
+      ...validBundle(),
+      runtimeContext: { catalogRef: "l1", branch: "main", helmChartAvailable: "false" },
+    });
+  });
+
+  it("rejects a runtime catalogRef that differs from requested catalogRef", async () => {
+    await expectBundleValidationFailure({
+      ...validBundle(),
+      runtimeContext: { catalogRef: "other", branch: "main", helmChartAvailable: false },
+    });
+  });
+
+  it("rejects missing pages and non-string page source", async () => {
+    await expectBundleValidationFailure({ ...validBundle(), pages: undefined });
+    await expectBundleValidationFailure({ ...validBundle(), pages: { "010-intro.adoc": 42 } });
+  });
+
+  it("rejects a bundle with no navigable page", async () => {
+    await expectBundleValidationFailure({
+      ...validBundle(),
+      pages: { "_shared/notice.adoc": "include", "chapter/_shared/tip.adoc": "include" },
+    });
   });
 });
 
