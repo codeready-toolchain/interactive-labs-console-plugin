@@ -29,7 +29,6 @@ Backend loads configured approved HTTPS repository branch when bundle is request
 
 - Current namespace candidate is explicit selection of existing release namespace and `values.schema.json` namespace-name bindings. Namespace selection and lifecycle are not settled.
 - Current checkpoint candidate is browser-local `type: manual` user attestation. It is not a settled completion model.
-- Use `jj` for version-control operations in this repository.
 
 ## Open or deferred
 
