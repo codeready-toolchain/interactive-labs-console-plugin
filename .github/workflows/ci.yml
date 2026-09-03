@@ -1,0 +1,62 @@
+name: ci
+on:
+  push:
+    branches:
+      - master
+    tags-ignore:
+      - '*.*'
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install Go
+      uses: actions/setup-go@v7
+      with:
+        go-version-file: go.mod
+
+    - name: Test
+      run: |
+        make test
+  
+  build-image:
+    # verifying the image can be built (real build and push is done in the `cd` workflow)
+    name: Build Image
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Build image
+      id: build-image
+      uses: redhat-actions/buildah-build@v3
+      with:
+        image: codeready-toolchain/interactive-labs-console-plugin
+        tags: latest # we won't push the image to a registry in this workflow, so we're good with just the `latest` tag
+        containerfiles: Containerfile
+        platforms: linux/amd64
+      
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install Go
+      uses: actions/setup-go@v7
+      with:
+        go-version-file: go.mod
+
+    - name: Lint
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: latest
+        args: --config=./.golangci.yml --verbose
