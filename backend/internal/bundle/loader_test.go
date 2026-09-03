@@ -24,11 +24,11 @@ kind: Lab
 metadata:
   name: lab1
   displayName: "Lab 1"
-spec: {}`), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "010-intro.adoc"), []byte("= Intro\n\nHello."), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "_shared.adoc"), []byte("include"), 0o644))
+spec: {}`), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "010-intro.adoc"), []byte("= Intro\n\nHello."), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "_shared.adoc"), []byte("include"), 0o600))
 	// Minimal helm chart
-	require.NoError(t, os.WriteFile(filepath.Join(labPath, "setup", "helm", "Chart.yaml"), []byte("apiVersion: v2\nname: lab1\nversion: 0.1.0"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(labPath, "setup", "helm", "Chart.yaml"), []byte("apiVersion: v2\nname: lab1\nversion: 0.1.0"), 0o600))
 
 	result, err := bundle.LoadFromDir(labPath)
 	require.NoError(t, err)
@@ -48,8 +48,8 @@ kind: Lab
 metadata:
   name: lab2
   displayName: "Lab 2"
-spec: {}`), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "010-step.adoc"), []byte("= Step"), 0o644))
+spec: {}`), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "010-step.adoc"), []byte("= Step"), 0o600))
 
 	result, err := bundle.LoadFromDir(labPath)
 	require.NoError(t, err)

@@ -22,9 +22,9 @@ import (
 // Config holds injectable dependencies for the router.
 type Config struct {
 	// CatalogSource returns the live catalog ConfigMap; nil uses an empty ConfigMap.
-	CatalogSource func() (*corev1.ConfigMap, error)
+	CatalogSource func(ctx context.Context) (*corev1.ConfigMap, error)
 	// BundleLoader loads a bundle from the configured repo; nil means bundles are unavailable.
-	BundleLoader func(repoURL, branch, labPath string) (*bundle.Result, error)
+	BundleLoader func(ctx context.Context, repoURL, branch, labPath string) (*bundle.Result, error)
 	// Logger receives safe operational fields only; tokens must never be passed to it.
 	Logger *slog.Logger
 	// Authenticate resolves a forwarded user token to its server-verified subject.
@@ -57,7 +57,7 @@ func NewRouter(cfg Config) http.Handler {
 func writeJSON(w http.ResponseWriter, status int, body interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(body) //nolint:errcheck
+	json.NewEncoder(w).Encode(body) //nolint:errcheck,errchkjson
 }
 
 func writeError(w http.ResponseWriter, status int, e *laberr.LabError) {
@@ -85,7 +85,7 @@ func helmReleaseName(subject, repository, labPath, branch string, staticAttrs, n
 		Repository        string            `json:"repository"`
 		Subject           string            `json:"subject"`
 	}
-	b, _ := json.Marshal(canonical{
+	b, _ := json.Marshal(canonical{ //nolint:errchkjson
 		Attributes:        staticAttrs,
 		Branch:            branch,
 		LabPath:           labPath,
@@ -107,12 +107,12 @@ func mergeAttributes(layers ...map[string]string) map[string]string {
 }
 
 // catalogEntryByCatalogRef returns the catalog entry for the given catalogRef, or an error.
-func catalogEntryByCatalogRef(cfg Config, catalogRef string) (*catalog.Entry, *laberr.LabError) {
+func catalogEntryByCatalogRef(ctx context.Context, cfg Config, catalogRef string) (*catalog.Entry, *laberr.LabError) {
 	source := cfg.CatalogSource
 	if source == nil {
 		return nil, laberr.New(laberr.TypeCatalogUnavailable, "catalog not configured", nil)
 	}
-	cm, err := source()
+	cm, err := source(ctx)
 	if err != nil {
 		return nil, laberr.New(laberr.TypeCatalogUnavailable, "catalog read failed", nil)
 	}
@@ -130,14 +130,14 @@ func catalogEntryByCatalogRef(cfg Config, catalogRef string) (*catalog.Entry, *l
 
 // --- handler functions ---
 
-func handleCatalog(w http.ResponseWriter, _ *http.Request, cfg Config) {
+func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 	source := cfg.CatalogSource
 	if source == nil {
 		writeError(w, http.StatusServiceUnavailable,
 			laberr.New(laberr.TypeCatalogUnavailable, "catalog not configured", nil))
 		return
 	}
-	cm, err := source()
+	cm, err := source(r.Context())
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable,
 			laberr.New(laberr.TypeCatalogUnavailable, "catalog read failed", nil))
@@ -180,7 +180,7 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 
 	catalogRef := r.PathValue("catalogRef")
-	entry, labError := catalogEntryByCatalogRef(cfg, catalogRef)
+	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, catalogRef)
 	if labError != nil {
 		writeError(w, http.StatusNotFound, labError)
 		return
@@ -193,7 +193,7 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
-	result, err := loader(entry.Repository, entry.Branch, entry.LabPath)
+	result, err := loader(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
 	if err != nil {
 		writeError(w, http.StatusBadGateway,
 			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
@@ -243,7 +243,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
-	entry, labError := catalogEntryByCatalogRef(cfg, catalogRef)
+	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, catalogRef)
 	if labError != nil {
 		writeError(w, http.StatusNotFound, labError)
 		return
@@ -252,7 +252,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 	var req struct {
 		NamespaceBindings map[string]string `json:"namespaceBindings"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err = json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest,
 			laberr.New(laberr.TypeNamespaceBindingInvalid, "invalid request body", nil))
 		return
@@ -270,7 +270,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 			laberr.New(laberr.TypeRepositoryError, "bundle loader not configured", nil))
 		return
 	}
-	result, err := loader(entry.Repository, entry.Branch, entry.LabPath)
+	result, err := loader(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
 	if err != nil {
 		writeError(w, http.StatusBadGateway,
 			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))

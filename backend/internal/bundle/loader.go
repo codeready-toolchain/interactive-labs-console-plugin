@@ -2,6 +2,7 @@
 package bundle
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"net/url"
@@ -44,7 +45,7 @@ func ValidateCloneArgs(repoURL, branch string) error {
 // CloneAndLoad shallow-clones the repository at repoURL and returns a loaded bundle.
 // Uses exec.Command with a fixed argument vector — never a shell string.
 // The caller must ensure repoURL and branch have been validated with ValidateCloneArgs.
-func CloneAndLoad(repoURL, branch, labPath string) (*Result, error) {
+func CloneAndLoad(ctx context.Context, repoURL, branch, labPath string) (*Result, error) {
 	if err := ValidateCloneArgs(repoURL, branch); err != nil {
 		return nil, err
 	}
@@ -52,10 +53,10 @@ func CloneAndLoad(repoURL, branch, labPath string) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir) //nolint:errcheck
+	defer os.RemoveAll(tmpDir)
 
 	// ponytail: no shell — args passed as a slice, never concatenated into a string
-	cmd := exec.Command("git", "clone",
+	cmd := exec.CommandContext(ctx, "git", "clone",
 		"--depth", "1",
 		"--branch", branch,
 		"--", repoURL, tmpDir)
@@ -83,7 +84,7 @@ func LoadFromDir(labDir string) (*Result, error) {
 	// Load all .adoc files under content/
 	pages := map[string]string{}
 	contentDir := filepath.Join(labDir, "content")
-	err = filepath.WalkDir(contentDir, func(p string, d fs.DirEntry, walkErr error) error {
+	if err := filepath.WalkDir(contentDir, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -94,14 +95,13 @@ func LoadFromDir(labDir string) (*Result, error) {
 		if err != nil {
 			return err
 		}
-		content, err := os.ReadFile(p)
+		content, err := os.ReadFile(p) //nolint:gosec
 		if err != nil {
 			return err
 		}
 		pages[filepath.ToSlash(rel)] = string(content)
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("walk content dir: %w", err)
 	}
 
