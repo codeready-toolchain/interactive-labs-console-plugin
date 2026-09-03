@@ -13,7 +13,10 @@ COPY backend/ ./backend/
 RUN cd backend && CGO_ENABLED=0 go build -o /out/interactive-labs ./cmd/server
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates git && adduser -D -u 10001 interactive-labs
+RUN apk add --no-cache ca-certificates git && adduser -D -u 10001 interactive-labs && \
+    mkdir -p /var/lib/interactive-labs/cache && \
+    chown 0:0 /var/lib/interactive-labs/cache && \
+    chmod 0770 /var/lib/interactive-labs/cache
 WORKDIR /app
 COPY --from=frontend /src/frontend/dist ./frontend
 COPY --from=backend /out/interactive-labs /usr/local/bin/interactive-labs

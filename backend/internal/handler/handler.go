@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -24,7 +25,9 @@ type Config struct {
 	// CatalogSource returns the live catalog ConfigMap; nil uses an empty ConfigMap.
 	CatalogSource func() (*corev1.ConfigMap, error)
 	// BundleLoader loads a bundle from the configured repo; nil means bundles are unavailable.
-	BundleLoader func(repoURL, branch, labPath string) (*bundle.Result, error)
+	BundleLoader func(context.Context, string, string, string) (*bundle.Result, error)
+	// CatalogLabOmitted receives only safe catalog omission fields.
+	CatalogLabOmitted func(catalogRef, reason string)
 	// Logger receives safe operational fields only; tokens must never be passed to it.
 	Logger *slog.Logger
 	// Authenticate resolves a forwarded user token to its server-verified subject.
@@ -130,7 +133,7 @@ func catalogEntryByCatalogRef(cfg Config, catalogRef string) (*catalog.Entry, *l
 
 // --- handler functions ---
 
-func handleCatalog(w http.ResponseWriter, _ *http.Request, cfg Config) {
+func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 	source := cfg.CatalogSource
 	if source == nil {
 		writeError(w, http.StatusServiceUnavailable,
@@ -150,6 +153,12 @@ func handleCatalog(w http.ResponseWriter, _ *http.Request, cfg Config) {
 		return
 	}
 
+	loader := cfg.BundleLoader
+	if loader == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			laberr.New(laberr.TypeRepositoryError, "bundle loader not configured", nil))
+		return
+	}
 	type item struct {
 		CatalogRef  string `json:"catalogRef"`
 		DisplayName string `json:"displayName"`
@@ -157,7 +166,17 @@ func handleCatalog(w http.ResponseWriter, _ *http.Request, cfg Config) {
 	}
 	items := make([]item, 0, len(entries))
 	for _, e := range entries {
-		items = append(items, item{CatalogRef: e.CatalogRef, DisplayName: e.DisplayName, Description: e.Description})
+		result, err := loader(r.Context(), e.Repository, e.Branch, e.LabPath)
+		if reason := omittedLabReason(err); reason != "" {
+			recordCatalogOmission(cfg, e.CatalogRef, reason)
+			continue
+		}
+		if err != nil || result == nil || result.Manifest == nil {
+			writeError(w, http.StatusBadGateway,
+				laberr.New(laberr.TypeRepositoryError, "failed to resolve lab catalog", nil))
+			return
+		}
+		items = append(items, item{CatalogRef: e.CatalogRef, DisplayName: result.Manifest.Metadata.DisplayName, Description: result.Manifest.Metadata.Description})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"apiVersion": "v1alpha1",
@@ -193,7 +212,7 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
-	result, err := loader(entry.Repository, entry.Branch, entry.LabPath)
+	result, err := loader(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
 	if err != nil {
 		writeError(w, http.StatusBadGateway,
 			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
@@ -270,7 +289,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 			laberr.New(laberr.TypeRepositoryError, "bundle loader not configured", nil))
 		return
 	}
-	result, err := loader(entry.Repository, entry.Branch, entry.LabPath)
+	result, err := loader(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
 	if err != nil {
 		writeError(w, http.StatusBadGateway,
 			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
@@ -289,6 +308,28 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		"message":         "Lab setup complete (Helm execution deferred to STORY-4)",
 		"helmReleaseName": name,
 	})
+}
+
+func omittedLabReason(err error) string {
+	switch {
+	case errors.Is(err, bundle.ErrRepositoryUnavailable):
+		return "RepositoryUnavailable"
+	case errors.Is(err, bundle.ErrManifestMissing):
+		return "ManifestMissing"
+	case errors.Is(err, bundle.ErrLabInvalid):
+		return "LabInvalid"
+	default:
+		return ""
+	}
+}
+
+func recordCatalogOmission(cfg Config, catalogRef, reason string) {
+	if cfg.Logger != nil {
+		cfg.Logger.Warn("catalog lab omitted", "catalogRef", catalogRef, "reason", reason)
+	}
+	if cfg.CatalogLabOmitted != nil {
+		cfg.CatalogLabOmitted(catalogRef, reason)
+	}
 }
 
 func keys(m map[string]string) []string {

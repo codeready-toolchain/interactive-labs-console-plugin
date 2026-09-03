@@ -27,11 +27,9 @@ func TestReadCatalog_ValidEntry(t *testing.T) {
 	require.Len(t, entries, 1)
 	e := entries[0]
 	assert.Len(t, e.CatalogRef, 64, "catalogRef must be 64-char hex")
-	assert.Equal(t, "My Lab", e.DisplayName)
 	assert.Equal(t, "https://github.com/redhat-scholars/my-lab", e.Repository)
 	assert.Equal(t, "main", e.Branch)
 	assert.Equal(t, "lab/", e.LabPath)
-	assert.Equal(t, "Optional", e.Description)
 }
 
 func TestReadCatalog_EmptySequence(t *testing.T) {
@@ -89,25 +87,57 @@ func TestReadCatalog_OrderPreserved(t *testing.T) {
 	entries, err := catalog.Read(cm)
 	require.NoError(t, err)
 	require.Len(t, entries, 3)
-	assert.Equal(t, "Lab Z", entries[0].DisplayName)
-	assert.Equal(t, "Lab A", entries[1].DisplayName)
-	assert.Equal(t, "Lab M", entries[2].DisplayName)
+	assert.Equal(t, "https://github.com/redhat-scholars/lab-z", entries[0].Repository)
+	assert.Equal(t, "https://github.com/redhat-scholars/lab-a", entries[1].Repository)
+	assert.Equal(t, "https://github.com/redhat-scholars/lab-m", entries[2].Repository)
 }
 
-func TestReadCatalog_MissingDisplayName_ReturnsError(t *testing.T) {
-	cm := catalogCM(`- repository: "https://github.com/redhat-scholars/my-lab"
+func TestReadCatalog_DisplayFieldsAreOptionalAndIgnored(t *testing.T) {
+	without := catalogCM(`- repository: "https://github.com/redhat-scholars/my-lab"
   branch: "main"
   labPath: "lab/"`)
-	_, err := catalog.Read(cm)
-	require.Error(t, err)
+	with := catalogCM(`- displayName: "Legacy Name"
+  description: "Legacy description"
+  repository: "https://github.com/redhat-scholars/my-lab"
+  branch: "main"
+  labPath: "lab/"`)
+
+	withoutEntries, err := catalog.Read(without)
+	require.NoError(t, err)
+	withEntries, err := catalog.Read(with)
+	require.NoError(t, err)
+	assert.Equal(t, withoutEntries, withEntries)
 }
 
-func TestReadCatalog_MissingRepository_ReturnsError(t *testing.T) {
-	cm := catalogCM(`- displayName: "Bad Lab"
-  branch: "main"
-  labPath: "lab/"`)
-	_, err := catalog.Read(cm)
-	require.Error(t, err)
+func TestReadCatalog_MissingRequiredSourceFieldReturnsError(t *testing.T) {
+	for _, content := range []string{
+		`- branch: main
+  labPath: lab`,
+		`- repository: https://github.com/redhat/lab
+  labPath: lab`,
+		`- repository: https://github.com/redhat/lab
+  branch: main`,
+	} {
+		_, err := catalog.Read(catalogCM(content))
+		require.ErrorContains(t, err, "configuration_error")
+	}
+}
+
+func TestReadCatalog_RejectsUnsafeSourceLocator(t *testing.T) {
+	for _, content := range []string{
+		`- repository: http://github.com/redhat/lab
+  branch: main
+  labPath: lab`,
+		`- repository: https://github.com/redhat/lab
+  branch: ../main
+  labPath: lab`,
+		`- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: /lab`,
+	} {
+		_, err := catalog.Read(catalogCM(content))
+		require.ErrorContains(t, err, "configuration_error")
+	}
 }
 
 // --- New tests for catalogRef derivation (must be RED before implementation) ---

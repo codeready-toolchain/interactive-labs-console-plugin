@@ -2,9 +2,9 @@
 
 ## Delivery state
 
-STORY-1 and STORY-2 are implemented: secure Console-to-backend boundary, administrator-selected catalog, validated lab-bundle API, and catalog-listing page. Frontend `Launch` remains disabled. Backend setup derives release identity and returns a success-shaped response but does **not** execute Helm.
+STORY-1, STORY-2, and STORY-9 are implemented: secure Console-to-backend boundary, administrator-selected source catalog, manifest-derived catalog metadata, immutable hashed approved repository snapshots, validated lab-bundle API, safe catalog-omission Warning Events, and catalog-listing page. Frontend `Launch` remains disabled. Backend setup derives release identity and returns a success-shaped response but does **not** execute Helm.
 
-Drawer launch, AsciiDoc rendering/navigation, Console guidance links, and Helm setup are decided target behavior, not current functionality. Namespace selection and manual checkpoints remain provisional directions pending open policy decisions. See [dev/docs](dev/docs/README.md) and [stories](dev/efforts/interactive-labs/stories.md).
+Drawer launch, AsciiDoc rendering/navigation, browser page/include/image resource endpoint, Console guidance links, and Helm setup are decided target behavior, not current functionality. Namespace selection and manual checkpoints remain provisional directions pending open policy decisions. See [dev/docs](dev/docs/README.md) and [stories](dev/efforts/interactive-labs/stories.md).
 
 ## Product
 
@@ -16,7 +16,7 @@ Plugin runs in Red Hat customer OpenShift clusters. Customers opt into Red Hat-a
 
 Browser is untrusted: it must not clone repositories, execute Helm, retain user tokens, decide authorization, or silently choose namespaces. Console forwards current user token through required `UserToken` proxy; backend uses current-user RBAC. Tokens are request-scoped: never log, persist, echo, or return them.
 
-Backend loads configured approved HTTPS repository branch when bundle is requested. MVP does not pin or expose revisions, poll/detect upstream changes, migrate sessions, reconcile running labs, or provide rollback. Do not assume separate CI validation or publishing environment for lab updates.
+Backend shallow-clones each configured approved HTTPS repository/branch into a hashed snapshot under `/var/lib/interactive-labs/cache` and reuses it across process starts while that storage remains. Current deployment has no PVC, so pod/container replacement loses cache; future PVCs mount this fixed path. MVP does not pin or expose revisions, poll/detect upstream changes, migrate sessions, reconcile running labs, or provide rollback. Do not assume separate CI validation or publishing environment for lab updates.
 
 ## Decided target conventions
 

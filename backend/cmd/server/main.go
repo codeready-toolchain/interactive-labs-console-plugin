@@ -21,20 +21,27 @@ import (
 )
 
 const (
-	backendAddr    = ":9001"
-	backendTLSCert = "/etc/tls/backend/tls.crt"
-	backendTLSKey  = "/etc/tls/backend/tls.key"
-	pluginAssets   = "/app/frontend"
+	backendAddr       = ":9001"
+	backendTLSCert    = "/etc/tls/backend/tls.crt"
+	backendTLSKey     = "/etc/tls/backend/tls.key"
+	pluginAssets      = "/app/frontend"
+	snapshotCacheRoot = "/var/lib/interactive-labs/cache"
 )
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cache, err := bundle.NewCache(snapshotCacheRoot)
+	if err != nil {
+		log.Error("create snapshot cache failed")
+		return
+	}
 
 	cfg := handler.Config{
-		CatalogSource: inClusterCatalogSource(),
-		BundleLoader:  bundle.CloneAndLoad,
-		Logger:        log,
-		Authenticate:  inClusterIdentityResolver(),
+		CatalogSource:     inClusterCatalogSource(),
+		BundleLoader:      cache.Load,
+		CatalogLabOmitted: inClusterCatalogEventPoster(log),
+		Logger:            log,
+		Authenticate:      inClusterIdentityResolver(),
 	}
 
 	backend := &http.Server{
@@ -54,6 +61,7 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	backend.Shutdown(shutCtx) //nolint:errcheck
+	cache.Close()             //nolint:errcheck // preserves successful snapshots for next process
 }
 
 func serveTLS(log *slog.Logger, name string, server *http.Server, cert, key string) {

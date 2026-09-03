@@ -15,7 +15,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/bundle"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/handler"
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/manifest"
 )
 
 func TestPluginHandlerServesBuiltAssets(t *testing.T) {
@@ -64,6 +66,9 @@ func TestCombinedHandler(t *testing.T) {
   repository: https://github.com/redhat/lab
   branch: main
   labPath: lab`}}, nil
+		},
+		BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
+			return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}}, Pages: map[string]string{"intro.adoc": "= Intro"}}, nil
 		},
 		Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	}

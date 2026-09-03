@@ -2,16 +2,29 @@
 package bundle
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/manifest"
+)
+
+var (
+	// ErrRepositoryUnavailable means an approved source could not be obtained.
+	ErrRepositoryUnavailable = errors.New("repository unavailable")
+	// ErrManifestMissing means the configured lab has no lab.yaml.
+	ErrManifestMissing = errors.New("manifest missing")
+	// ErrLabInvalid means lab content cannot safely form a valid bundle.
+	ErrLabInvalid = errors.New("lab invalid")
 )
 
 // validBranchRE allows branch names that cannot contain shell-special characters.
@@ -32,55 +45,86 @@ func ValidateCloneArgs(repoURL, branch string) error {
 	if err != nil || u.Scheme != "https" {
 		return fmt.Errorf("repository URL must use https scheme: %q", repoURL)
 	}
-	if u.Host == "" {
-		return fmt.Errorf("repository URL must have a host: %q", repoURL)
+	if u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("repository URL must be a plain https URL: %q", repoURL)
 	}
-	if !validBranchRE.MatchString(branch) {
+	if !validBranchRE.MatchString(branch) || strings.HasPrefix(branch, "-") || strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") || strings.Contains(branch, "//") || strings.Contains(branch, "..") {
 		return fmt.Errorf("branch contains invalid characters: %q", branch)
 	}
 	return nil
 }
 
-// CloneAndLoad shallow-clones the repository at repoURL and returns a loaded bundle.
-// Uses exec.Command with a fixed argument vector — never a shell string.
-// The caller must ensure repoURL and branch have been validated with ValidateCloneArgs.
+// ValidateLabPath requires a non-empty repository-relative, non-traversing path.
+func ValidateLabPath(labPath string) error {
+	if labPath == "" || path.IsAbs(labPath) {
+		return errors.New("lab path must be repository-relative")
+	}
+	if slices.Contains(strings.Split(labPath, "/"), "..") {
+		return errors.New("lab path must not traverse")
+	}
+	return nil
+}
+
+// CloneAndLoad shallow-clones one repository for callers outside Cache.
 func CloneAndLoad(repoURL, branch, labPath string) (*Result, error) {
 	if err := ValidateCloneArgs(repoURL, branch); err != nil {
 		return nil, err
 	}
+	if err := ValidateLabPath(labPath); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrLabInvalid, err)
+	}
 	tmpDir, err := os.MkdirTemp("", "ilab-clone-*")
 	if err != nil {
-		return nil, fmt.Errorf("create temp dir: %w", err)
+		return nil, fmt.Errorf("%w: create temp dir", ErrRepositoryUnavailable)
 	}
 	defer os.RemoveAll(tmpDir) //nolint:errcheck
 
-	// ponytail: no shell — args passed as a slice, never concatenated into a string
-	cmd := exec.Command("git", "clone",
-		"--depth", "1",
-		"--branch", branch,
-		"--", repoURL, tmpDir)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("git clone failed: %w: %s", err, out)
+	cmd := exec.CommandContext(context.Background(), "git", cloneArgs(repoURL, branch, tmpDir)...)
+	cmd.Env = gitEnv(nil)
+	if _, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("%w: clone failed", ErrRepositoryUnavailable)
 	}
+	return LoadFromSnapshot(tmpDir, labPath)
+}
 
-	return LoadFromDir(filepath.Join(tmpDir, filepath.FromSlash(labPath)))
+// LoadFromSnapshot validates labPath before reading it from repositoryRoot.
+func LoadFromSnapshot(repositoryRoot, labPath string) (*Result, error) {
+	if err := ValidateLabPath(labPath); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrLabInvalid, err)
+	}
+	root, err := filepath.EvalSymlinks(repositoryRoot)
+	if err != nil {
+		return nil, fmt.Errorf("%w: repository snapshot unavailable", ErrRepositoryUnavailable)
+	}
+	labDir, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(labPath)))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: lab path", ErrManifestMissing)
+		}
+		return nil, fmt.Errorf("%w: resolve lab path", ErrLabInvalid)
+	}
+	rel, err := filepath.Rel(root, labDir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("%w: lab path escapes repository", ErrLabInvalid)
+	}
+	return LoadFromDir(labDir)
 }
 
 // LoadFromDir loads a lab bundle from an already-populated labPath on disk.
-// Exported for testing without a real git remote.
+// Exported for filesystem-focused tests.
 func LoadFromDir(labDir string) (*Result, error) {
-	// Parse manifest
 	manifestBytes, err := os.ReadFile(filepath.Join(labDir, "lab.yaml"))
 	if err != nil {
-		return nil, fmt.Errorf("read lab.yaml: %w", err)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: lab.yaml", ErrManifestMissing)
+		}
+		return nil, fmt.Errorf("%w: read lab.yaml", ErrLabInvalid)
 	}
 	m, labErr := manifest.ValidateManifest(manifestBytes)
 	if labErr != nil {
-		return nil, fmt.Errorf("invalid manifest: %s", labErr.Message)
+		return nil, fmt.Errorf("%w: manifest", ErrLabInvalid)
 	}
 
-	// Load all .adoc files under content/
 	pages := map[string]string{}
 	contentDir := filepath.Join(labDir, "content")
 	err = filepath.WalkDir(contentDir, func(p string, d fs.DirEntry, walkErr error) error {
@@ -102,17 +146,20 @@ func LoadFromDir(labDir string) (*Result, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("walk content dir: %w", err)
+		return nil, fmt.Errorf("%w: read content", ErrLabInvalid)
+	}
+	if labErr := manifest.ValidateBundlePaths(keys(pages)); labErr != nil {
+		return nil, fmt.Errorf("%w: content", ErrLabInvalid)
 	}
 
-	// Check for Helm chart
-	chartFile := filepath.Join(labDir, "setup", "helm", "Chart.yaml")
-	_, helmErr := os.Stat(chartFile)
-	helmAvailable := helmErr == nil
+	_, helmErr := os.Stat(filepath.Join(labDir, "setup", "helm", "Chart.yaml"))
+	return &Result{Manifest: m, Pages: pages, HelmChartAvailable: helmErr == nil}, nil
+}
 
-	return &Result{
-		Manifest:           m,
-		Pages:              pages,
-		HelmChartAvailable: helmAvailable,
-	}, nil
+func keys(m map[string]string) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	return ks
 }
