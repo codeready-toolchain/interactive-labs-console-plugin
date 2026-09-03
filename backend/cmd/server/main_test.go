@@ -23,7 +23,7 @@ func TestPluginHandlerServesBuiltAssets(t *testing.T) {
 	mustWrite(t, filepath.Join(dir, "plugin-manifest.json"), `{"name":"interactive-labs"}`)
 
 	rw := httptest.NewRecorder()
-	pluginHandler(dir).ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/plugin-manifest.json", nil))
+	pluginHandler(dir).ServeHTTP(rw, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/plugin-manifest.json", nil))
 
 	require.Equal(t, http.StatusOK, rw.Code)
 	require.Contains(t, rw.Body.String(), "interactive-labs")
@@ -32,7 +32,7 @@ func TestPluginHandlerServesBuiltAssets(t *testing.T) {
 func TestTokenNotLogged(t *testing.T) {
 	var logs bytes.Buffer
 	router := handler.NewRouter(handler.Config{
-		CatalogSource: func() (*corev1.ConfigMap, error) {
+		CatalogSource: func(_ context.Context) (*corev1.ConfigMap, error) {
 			return &corev1.ConfigMap{Data: map[string]string{"catalog.yaml": `- displayName: Lab
   repository: https://github.com/redhat/lab
   branch: main
@@ -43,8 +43,8 @@ func TestTokenNotLogged(t *testing.T) {
 			return "alice", nil
 		},
 	})
-	token := "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhbGljZSJ9."
-	req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/lab/setup", strings.NewReader(`{"namespaceBindings":{"releaseNamespace":"labs"}}`))
+	token := "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhbGljZSJ9." //nolint:gosec
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/lab/setup", strings.NewReader(`{"namespaceBindings":{"releaseNamespace":"labs"}}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(httptest.NewRecorder(), req)
@@ -59,7 +59,7 @@ func TestCombinedHandler(t *testing.T) {
 	mustWrite(t, filepath.Join(dir, "plugin-manifest.json"), `{"name":"interactive-labs"}`)
 
 	cfg := handler.Config{
-		CatalogSource: func() (*corev1.ConfigMap, error) {
+		CatalogSource: func(_ context.Context) (*corev1.ConfigMap, error) {
 			return &corev1.ConfigMap{Data: map[string]string{"catalog.yaml": `- displayName: Lab
   repository: https://github.com/redhat/lab
   branch: main
@@ -71,13 +71,13 @@ func TestCombinedHandler(t *testing.T) {
 
 	t.Run("asset served", func(t *testing.T) {
 		rw := httptest.NewRecorder()
-		h.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/plugin-manifest.json", nil))
+		h.ServeHTTP(rw, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/plugin-manifest.json", nil))
 		require.Equal(t, http.StatusOK, rw.Code)
 	})
 
 	t.Run("catalog reachable", func(t *testing.T) {
 		rw := httptest.NewRecorder()
-		h.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/api/v1alpha1/catalog", nil))
+		h.ServeHTTP(rw, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil))
 		require.Equal(t, http.StatusOK, rw.Code)
 		require.Contains(t, rw.Header().Get("Content-Type"), "application/json")
 	})

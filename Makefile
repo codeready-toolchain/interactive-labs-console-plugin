@@ -18,6 +18,10 @@ build: frontend-build backend-build ## Build frontend and backend
 
 test: frontend-test backend-test ## Run frontend and backend checks
 
+lint: ## Lint frontend and backend
+	npm --prefix frontend run lint
+	cd backend && golangci-lint run
+
 frontend-build: ## Install frontend dependencies and build frontend
 	npm --prefix frontend ci
 	npm --prefix frontend run build
@@ -40,7 +44,7 @@ validate-frontend-bundle: ## Validate exposed page module initialization
 	@! grep -Fq 'reexport safe' frontend/dist/exposed-main.js
 
 image: ## Build container image
-	$(CONTAINER_TOOL) build -f docker/Dockerfile -t $(IMAGE) .
+	$(CONTAINER_TOOL) build -f Containerfile -t $(IMAGE) .
 
 push-image: image ## Build and push default image
 	$(CONTAINER_TOOL) push $(IMAGE)
@@ -67,7 +71,7 @@ create-namespace: ## Create plugin namespace
 	$(OC) apply -f deploy/base/namespace.yaml
 
 dev-image: create-namespace ## Build development image
-	$(CONTAINER_TOOL) build -f docker/Dockerfile -t $(DEV_IMAGE) .
+	$(CONTAINER_TOOL) build -f Containerfile -t $(DEV_IMAGE) .
 
 push-dev-image: check-registry dev-image ## Build and push development image
 	$(CONTAINER_TOOL) push $(DEV_IMAGE) --creds="$$( $(OC) whoami ):$$( $(OC) whoami --show-token )" --tls-verify=false

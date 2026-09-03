@@ -1,6 +1,7 @@
 package handler_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +13,7 @@ import (
 
 func TestSetupHandler_RejectsMissingAuthorization(t *testing.T) {
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", strings.NewReader(`{"namespaceBindings":{"releaseNamespace":"labs"}}`))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", strings.NewReader(`{"namespaceBindings":{"releaseNamespace":"labs"}}`))
 	req.Header.Set("Content-Type", "application/json")
 	newRouter(t).ServeHTTP(rw, req)
 

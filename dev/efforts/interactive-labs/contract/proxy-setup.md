@@ -45,6 +45,6 @@ no `caCertificate` field is needed in the ConsolePlugin proxy stanza.
 
 ## Unified image and Kustomize deployment
 
-`docker/Dockerfile` builds plugin assets and backend into one image. `deploy/base` is the deployable
-Kustomize base: its one HTTPS Service serves plugin assets and proxied API requests from the same Pod. Build with `podman build -f docker/Dockerfile -t interactive-labs .`;
+`Containerfile` builds plugin assets and backend into one image. `deploy/base` is the deployable
+Kustomize base: its one HTTPS Service serves plugin assets and proxied API requests from the same Pod. Build with `podman build -f Containerfile -t interactive-labs .`;
 render or apply with `oc kustomize deploy/base`.
