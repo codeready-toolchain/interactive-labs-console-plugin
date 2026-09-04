@@ -25,8 +25,8 @@ import (
 )
 
 // stubCatalogReader provides a fixed ConfigMap for handler injection.
-func stubCatalogCM(data map[string]string) func() (*corev1.ConfigMap, error) {
-	return func() (*corev1.ConfigMap, error) {
+func stubCatalogCM(data map[string]string) func(ctx context.Context) (*corev1.ConfigMap, error) {
+	return func(_ context.Context) (*corev1.ConfigMap, error) {
 		return &corev1.ConfigMap{Data: data}, nil
 	}
 }
@@ -58,7 +58,7 @@ func newRouter(t *testing.T) http.Handler {
 
 func TestCatalogHandler_Returns200(t *testing.T) {
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/catalog", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil)
 	newRouter(t).ServeHTTP(rw, req)
 
 	require.Equal(t, http.StatusOK, rw.Code)
@@ -91,7 +91,7 @@ func TestCatalogHandler_ReturnsItemsInDeclaredOrder(t *testing.T) {
 		},
 	})
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/catalog", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil)
 	router.ServeHTTP(rw, req)
 
 	require.Equal(t, http.StatusOK, rw.Code)
@@ -108,7 +108,7 @@ func TestCatalogHandler_ReturnsItemsInDeclaredOrder(t *testing.T) {
 
 func TestCatalogHandler_NoAuthorizationEchoed(t *testing.T) {
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/catalog", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil)
 	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
 	newRouter(t).ServeHTTP(rw, req)
 
@@ -122,7 +122,7 @@ func TestBundleHandler_UnknownLabReturns404(t *testing.T) {
 	// Non-existent catalogRef (valid hex but not in catalog) returns 404 after auth.
 	unknownRef := fmt.Sprintf("%064x", 0)
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/labs/"+unknownRef+"/bundle", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+unknownRef+"/bundle", nil)
 	req.Header.Set("Authorization", "Bearer user1")
 	newRouter(t).ServeHTTP(rw, req)
 
@@ -138,7 +138,7 @@ func TestSetupHandler_InvalidBindings_Returns422(t *testing.T) {
 	payload := `{"namespaceBindings":{}}` // missing releaseNamespace
 	ref := goodCatalogRef()
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
 		strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
@@ -154,7 +154,7 @@ func TestSetupHandler_ValidBindings_Returns200WithHelmReleaseName(t *testing.T) 
 	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
 	ref := goodCatalogRef()
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
 		strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	// Provide a minimal JWT with sub=user1
@@ -178,7 +178,7 @@ func TestSetupHandler_DeterministicHelmReleaseName(t *testing.T) {
 
 	call := func() string {
 		rw := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
 			bytes.NewBufferString(payload))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -187,8 +187,9 @@ func TestSetupHandler_DeterministicHelmReleaseName(t *testing.T) {
 		json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
 		return body["helmReleaseName"].(string)
 	}
-
-	assert.Equal(t, call(), call())
+	firstCall := call()
+	secondCall := call()
+	assert.Equal(t, firstCall, secondCall, "deterministic helmReleaseName must be the same")
 }
 
 func TestSetupHandler_ContentPointerDeterminesReleaseName(t *testing.T) {
@@ -206,7 +207,7 @@ func TestSetupHandler_ContentPointerDeterminesReleaseName(t *testing.T) {
 		})
 		ref := catalog.DeriveRef(repository, branch, labPath, nil)
 		rw := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", strings.NewReader(payload))
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", strings.NewReader(payload))
 		req.Header.Set("Authorization", "Bearer user1")
 		router.ServeHTTP(rw, req)
 		var body map[string]any
@@ -235,7 +236,7 @@ func TestSetupHandler_DifferentManifestAttributes_DifferentReleaseName(t *testin
 			},
 		})
 		rw := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", strings.NewReader(payload))
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", strings.NewReader(payload))
 		req.Header.Set("Authorization", "Bearer user1")
 		router.ServeHTTP(rw, req)
 		var body map[string]any
@@ -253,7 +254,7 @@ func TestSetupHandler_DifferentSubject_DifferentReleaseName(t *testing.T) {
 
 	call := func(sub string) string {
 		rw := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
 			bytes.NewBufferString(payload))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+makeTestJWT(sub))
@@ -269,7 +270,7 @@ func TestSetupHandler_DifferentSubject_DifferentReleaseName(t *testing.T) {
 func TestSetupHandler_NoAuthorizationEchoed(t *testing.T) {
 	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup",
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup",
 		strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
@@ -285,7 +286,7 @@ func TestSetupHandler_TokenNotLogged(t *testing.T) {
 	// Here we just confirm the response body has no token material.
 	rw := httptest.NewRecorder()
 	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup",
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup",
 		strings.NewReader(payload))
 	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
 	req.Header.Set("Content-Type", "application/json")
@@ -302,7 +303,7 @@ func goodCatalogRef() string {
 
 func TestCatalogHandler_ExposesCatalogRef(t *testing.T) {
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/catalog", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil)
 	newRouter(t).ServeHTTP(rw, req)
 	require.Equal(t, http.StatusOK, rw.Code)
 	var body map[string]any
@@ -318,7 +319,7 @@ func TestCatalogHandler_ExposesCatalogRef(t *testing.T) {
 func TestBundleHandler_RequiresAuth(t *testing.T) {
 	ref := goodCatalogRef()
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
 	newRouter(t).ServeHTTP(rw, req)
 	require.Equal(t, http.StatusUnauthorized, rw.Code)
 	var body map[string]any
@@ -329,7 +330,7 @@ func TestBundleHandler_RequiresAuth(t *testing.T) {
 func TestBundleHandler_RuntimeContextUsesCatalogRef(t *testing.T) {
 	ref := goodCatalogRef()
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
 	req.Header.Set("Authorization", "Bearer user1")
 	newRouter(t).ServeHTTP(rw, req)
 	require.Equal(t, http.StatusOK, rw.Code)
@@ -371,7 +372,7 @@ func TestBundleHandler_AttributeMergeOrder(t *testing.T) {
 		},
 	})
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
 	req.Header.Set("Authorization", "Bearer user1")
 	router.ServeHTTP(rw, req)
 	require.Equal(t, http.StatusOK, rw.Code)
@@ -401,7 +402,7 @@ func TestSetupHandler_ReleaseNameExcludesRuntimeAttrs(t *testing.T) {
 	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
 	call := func(router http.Handler) string {
 		rw := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", strings.NewReader(payload))
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", strings.NewReader(payload))
 		req.Header.Set("Authorization", "Bearer user1")
 		router.ServeHTTP(rw, req)
 		var body map[string]any

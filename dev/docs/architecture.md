@@ -14,7 +14,7 @@ OpenShift Console user
 
 One container image contains frontend assets and Go backend. One HTTPS Service exposes both. Backend routes `/api/` requests to its API handler; all other requests serve frontend assets.
 
-Evidence: [Dockerfile](../../docker/Dockerfile), [server](../../backend/cmd/server/main.go), [ConsolePlugin](../../deploy/base/console-plugin.yaml).
+Evidence: [Containerfile](../../Containerfile), [server](../../backend/cmd/server/main.go), [ConsolePlugin](../../deploy/base/console-plugin.yaml).
 
 ## Ownership and trust boundary
 

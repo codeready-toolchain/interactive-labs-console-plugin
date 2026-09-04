@@ -66,7 +66,7 @@ func ValidateLabPath(labPath string) error {
 }
 
 // CloneAndLoad shallow-clones one repository for callers outside Cache.
-func CloneAndLoad(repoURL, branch, labPath string) (*Result, error) {
+func CloneAndLoad(ctx context.Context, repoURL, branch, labPath string) (*Result, error) {
 	if err := ValidateCloneArgs(repoURL, branch); err != nil {
 		return nil, err
 	}
@@ -77,9 +77,9 @@ func CloneAndLoad(repoURL, branch, labPath string) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: create temp dir", ErrRepositoryUnavailable)
 	}
-	defer os.RemoveAll(tmpDir) //nolint:errcheck
+	defer os.RemoveAll(tmpDir)
 
-	cmd := exec.CommandContext(context.Background(), "git", cloneArgs(repoURL, branch, tmpDir)...)
+	cmd := exec.CommandContext(ctx, "git", cloneArgs(repoURL, branch, tmpDir)...)
 	cmd.Env = gitEnv(nil)
 	if _, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("%w: clone failed", ErrRepositoryUnavailable)
@@ -127,7 +127,7 @@ func LoadFromDir(labDir string) (*Result, error) {
 
 	pages := map[string]string{}
 	contentDir := filepath.Join(labDir, "content")
-	err = filepath.WalkDir(contentDir, func(p string, d fs.DirEntry, walkErr error) error {
+	if err := filepath.WalkDir(contentDir, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -138,14 +138,13 @@ func LoadFromDir(labDir string) (*Result, error) {
 		if err != nil {
 			return err
 		}
-		content, err := os.ReadFile(p)
+		content, err := os.ReadFile(p) //nolint:gosec
 		if err != nil {
 			return err
 		}
 		pages[filepath.ToSlash(rel)] = string(content)
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("%w: read content", ErrLabInvalid)
 	}
 	if labErr := manifest.ValidateBundlePaths(keys(pages)); labErr != nil {

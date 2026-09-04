@@ -28,7 +28,7 @@ func TestNewError_WithDetail(t *testing.T) {
 	detail := map[string]string{"key": "value"}
 	e := errors.New(errors.TypeConfigurationError, "bad config", detail)
 
-	b, _ := json.Marshal(e)
+	b, _ := json.Marshal(e) //nolint:errchkjson
 	var got map[string]any
 	json.Unmarshal(b, &got) //nolint:errcheck
 
@@ -37,7 +37,7 @@ func TestNewError_WithDetail(t *testing.T) {
 
 func TestError_NeverContainsBearerToken(t *testing.T) {
 	e := errors.New(errors.TypeUnauthorized, "token rejected", nil)
-	b, _ := json.Marshal(e)
+	b, _ := json.Marshal(e) //nolint:errchkjson
 	s := string(b)
 	assert.NotContains(t, s, "Bearer")
 	assert.NotContains(t, s, "eyJ")

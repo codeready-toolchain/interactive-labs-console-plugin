@@ -97,16 +97,16 @@ func inClusterIdentityResolver() func(context.Context, string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("create identity client: %w", err)
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiHost+"/apis/user.openshift.io/v1/users/~", nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiHost+"/apis/user.openshift.io/v1/users/~", nil) //nolint:gosec
 		if err != nil {
 			return "", err
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := client.Do(req)
+		resp, err := client.Do(req) //nolint:gosec
 		if err != nil {
 			return "", err
 		}
-		defer resp.Body.Close() //nolint:errcheck
+		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			return "", fmt.Errorf("identity request status %d", resp.StatusCode)
 		}
@@ -128,7 +128,7 @@ func inClusterIdentityResolver() func(context.Context, string) (string, error) {
 // inClusterCatalogSource returns a function that reads the catalog ConfigMap from the cluster.
 // In-cluster client configuration is loaded from the mounted service account token.
 // ponytail: direct Kubernetes REST call without client-go to avoid the dependency weight.
-func inClusterCatalogSource() func() (*corev1.ConfigMap, error) {
+func inClusterCatalogSource() func(ctx context.Context) (*corev1.ConfigMap, error) {
 	namespace := os.Getenv("NAMESPACE")
 	if namespace == "" {
 		namespace = "interactive-labs-console-plugin"
@@ -136,11 +136,11 @@ func inClusterCatalogSource() func() (*corev1.ConfigMap, error) {
 	cmName := "interactive-labs-catalog"
 
 	// Read the service account token for in-cluster auth.
-	tokenPath := "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	tokenPath := "/var/run/secrets/kubernetes.io/serviceaccount/token" //nolint:gosec
 	caPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	apiHost := fmt.Sprintf("https://%s", os.Getenv("KUBERNETES_SERVICE_HOST")+":"+os.Getenv("KUBERNETES_SERVICE_PORT"))
 
-	return func() (*corev1.ConfigMap, error) {
+	return func(ctx context.Context) (*corev1.ConfigMap, error) {
 		token, err := os.ReadFile(tokenPath)
 		if err != nil {
 			return nil, fmt.Errorf("read service account token: %w", err)
@@ -153,14 +153,14 @@ func inClusterCatalogSource() func() (*corev1.ConfigMap, error) {
 		}
 
 		url := fmt.Sprintf("%s/api/v1/namespaces/%s/configmaps/%s", apiHost, namespace, cmName)
-		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec
 		req.Header.Set("Authorization", "Bearer "+string(token))
 
-		resp, err := client.Do(req)
+		resp, err := client.Do(req) //nolint:gosec
 		if err != nil {
 			return nil, fmt.Errorf("catalog configmap GET: %w", err)
 		}
-		defer resp.Body.Close() //nolint:errcheck
+		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("catalog configmap GET status %d", resp.StatusCode)

@@ -43,7 +43,7 @@ func DeriveRef(repository, branch, labPath string, overrides map[string]string) 
 		LabPath            string            `json:"labPath"`
 		Repository         string            `json:"repository"`
 	}
-	b, _ := json.Marshal(canonical{
+	b, _ := json.Marshal(canonical{ //nolint:errchkjson
 		AttributeOverrides: overrides,
 		Branch:             branch,
 		LabPath:            labPath,

@@ -23,7 +23,7 @@ import (
 // Config holds injectable dependencies for the router.
 type Config struct {
 	// CatalogSource returns the live catalog ConfigMap; nil uses an empty ConfigMap.
-	CatalogSource func() (*corev1.ConfigMap, error)
+	CatalogSource func(context.Context) (*corev1.ConfigMap, error)
 	// BundleLoader loads a bundle from the configured repo; nil means bundles are unavailable.
 	BundleLoader func(context.Context, string, string, string) (*bundle.Result, error)
 	// CatalogLabOmitted receives only safe catalog omission fields.
@@ -110,12 +110,12 @@ func mergeAttributes(layers ...map[string]string) map[string]string {
 }
 
 // catalogEntryByCatalogRef returns the catalog entry for the given catalogRef, or an error.
-func catalogEntryByCatalogRef(cfg Config, catalogRef string) (*catalog.Entry, *laberr.LabError) {
+func catalogEntryByCatalogRef(ctx context.Context, cfg Config, catalogRef string) (*catalog.Entry, *laberr.LabError) {
 	source := cfg.CatalogSource
 	if source == nil {
 		return nil, laberr.New(laberr.TypeCatalogUnavailable, "catalog not configured", nil)
 	}
-	cm, err := source()
+	cm, err := source(ctx)
 	if err != nil {
 		return nil, laberr.New(laberr.TypeCatalogUnavailable, "catalog read failed", nil)
 	}
@@ -140,7 +140,7 @@ func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 			laberr.New(laberr.TypeCatalogUnavailable, "catalog not configured", nil))
 		return
 	}
-	cm, err := source()
+	cm, err := source(r.Context())
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable,
 			laberr.New(laberr.TypeCatalogUnavailable, "catalog read failed", nil))
@@ -199,7 +199,7 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 
 	catalogRef := r.PathValue("catalogRef")
-	entry, labError := catalogEntryByCatalogRef(cfg, catalogRef)
+	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, catalogRef)
 	if labError != nil {
 		writeError(w, http.StatusNotFound, labError)
 		return
@@ -262,7 +262,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
-	entry, labError := catalogEntryByCatalogRef(cfg, catalogRef)
+	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, catalogRef)
 	if labError != nil {
 		writeError(w, http.StatusNotFound, labError)
 		return
