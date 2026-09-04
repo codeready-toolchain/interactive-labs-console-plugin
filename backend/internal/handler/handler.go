@@ -26,7 +26,7 @@ type Config struct {
 	CatalogSource func(context.Context) (*corev1.ConfigMap, error)
 	// BundleLoader loads a bundle from the configured repo; nil means bundles are unavailable.
 	BundleLoader func(context.Context, string, string, string) (*bundle.Result, error)
-	// CatalogLabOmitted receives only safe catalog omission fields.
+	// CatalogLabOmitted receives catalog entry omission notifications.
 	CatalogLabOmitted func(catalogRef, reason string)
 	// Logger receives safe operational fields only; tokens must never be passed to it.
 	Logger *slog.Logger
