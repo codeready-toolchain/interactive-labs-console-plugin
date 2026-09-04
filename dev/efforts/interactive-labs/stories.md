@@ -45,22 +45,23 @@ Users need to launch a selected supported lab beside Console work with predictab
 
 **Dependencies:** STORY-1, STORY-2.
 
-## ☐ STORY-4: Render restricted AsciiDoc and navigate lab-local pages
+## ☐ STORY-4: Render restricted AsciiDoc and navigate lab pages
 
 Lab authors need inter-linked instructional pages without allowing content to execute code, escape its bundle, or inject unsafe DOM into Console.
 
-**Goal:** Render documented supported AsciiDoc subset and resolve only allowed lab-local content.
+**Goal:** Render documented supported AsciiDoc subset, navigate allowed lab pages, and resolve approved repository-local includes.
 
-**Planning note:** Catalog `description` is AsciiDoc source. Client renders it through this story's
-restricted, sanitised rendering path; STORY-1 only transports raw text.
+**Planning note:** Catalog description is AsciiDoc in `lab.yaml` `metadata.description`. Client renders it through this story's
+full restricted, sanitised path with `lab.yaml` as relative-resource base; STORY-1 only transports raw text.
 
 **Acceptance criteria:**
-- Asciidoctor.js renders supported fixture-lab content after DOM sanitization.
+- Asciidoctor.js renders supported fixture-lab content and catalog descriptions after DOM sanitization, including syntax-highlighted source blocks and Mermaid diagrams.
 - Backend runtime attributes override author-defined attributes.
-- Allowed relative pages and lab-local includes resolve within validated bundle paths.
-- Remote includes, executable extensions, arbitrary filesystem access, unsupported raw HTML, malformed content, and missing pages fail safely with actionable UI states.
+- Bundle lists normalized navigable paths under `labPath/content` with server-approved source URLs; page navigation and ordinary links use only those paths in drawer, preserving same-page fragments. Validated page links in catalog descriptions are explicit Launch intent and open drawer at target after bundle validation.
+- Includes and images may resolve outside `labPath` only within same approved repository through backend-validated resource URLs.
+- Recoverable unsupported content, missing resources, Mermaid, and highlighter failures show explicit inline warnings; fetch, conversion, or sanitization failures show safe actionable page error. Remote includes, executable extensions, arbitrary filesystem access, repository-root escapes, and unsupported raw HTML never execute.
 
-**Dependencies:** STORY-1, STORY-3.
+**Dependencies:** STORY-1, STORY-3, STORY-9.
 
 ## ☐ STORY-5: Select namespaces and deploy prerequisite charts
 
@@ -121,12 +122,12 @@ MVP must prove complete user flow and give operators and authors enough informat
 
 **Dependencies:** STORY-4, STORY-5, STORY-6, STORY-7.
 
-## ☐ STORY-9: Resolve catalog metadata from cached approved lab manifests
+## ☑ STORY-9: Resolve catalog metadata from cached approved lab manifests
 
 Catalog labels and descriptions must not drift from lab-authored metadata while
 administrators retain control of approved source locations and static overrides.
 
-**Goal:** Build catalog items and bundles from cached, validated repository snapshots.
+**Goal:** Build catalog items and bundles from cached, validated repository snapshots, with reusable snapshot support for future resource reads.
 
 **Acceptance criteria:**
 - Catalog entries require only `repository`, `branch`, and `labPath`; optional
@@ -134,7 +135,7 @@ administrators retain control of approved source locations and static overrides.
 - Backend derives unchanged `catalogRef` before reading remote metadata, then returns
   manifest `displayName` and `description`.
 - Backend caches one immutable shallow-cloned snapshot per configured repository/branch;
-  cache hits do not clone again, and catalog and bundle loading use same snapshot.
+  cache hits do not clone again, and catalog, bundle, and setup loading use same snapshot. STORY-4 owns the browser resource route.
 - A cache miss validates configured manifests and returns valid items in configured order.
 - An unreachable repository, missing manifest, or invalid lab omits only that lab;
   browser receives no unavailable-entry state or raw upstream failure detail.

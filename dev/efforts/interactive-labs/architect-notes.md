@@ -8,13 +8,13 @@ status: Advisory
 
 Interactive Labs adds guided, multi-page tasks to OpenShift Console without turning Console, browser, or lab authors into cluster administrators. This note designs client side of MVP and records backend contracts client requires. Product goal and acceptance criteria remain in [proposal.md](proposal.md).
 
-Evidence: `proposal.md`, `stories.md`, and OpenShift Console Dynamic Plugin documentation. STORY-1 source, tests, and deployment scaffold now exist; later-story paths below remain target structure until their story is implemented.
+Evidence: `proposal.md`, `stories.md`, and OpenShift Console Dynamic Plugin documentation. STORY-1, STORY-2, and STORY-9 source, tests, and deployment records exist; later-story paths below remain target structure until their story is implemented.
 
 ## Design Principles
 
 - **Console-native.** Use Dynamic Plugin SDK, Console navigation, `consoleFetch`, Console service proxy, and existing `data-quickstart-id` targets. Do not recreate Console routing or Quick Starts.
 - **Browser is untrusted.** Client never clones arbitrary repositories, runs Helm, stores user tokens, or decides authorization.
-- **Content is data, not code.** Lab content comes only from catalog-approved Red Hat branches. MVP does not detect, reconcile, or migrate upstream content updates. Rendering permits only lab-local documents and known link directives. The current `type: manual` checkpoint proposal is provisional pending evidence and checkpoint rules.
+- **Content is data, not code.** Lab content comes only from catalog-approved Red Hat branches. MVP does not detect, reconcile, or migrate upstream content updates. Rendering navigates only `labPath/content` pages and loads same-repository supporting resources through backend-approved URLs. The current `type: manual` checkpoint proposal is provisional pending evidence and checkpoint rules.
 - **Explicit user intent.** Current namespace-selection proposal requires confirmation; selection and lifecycle policy remain open. Navigation must not claim progress completion.
 - **Small MVP.** One lab path, one optional prerequisite chart, and synchronous bounded setup. Browser-local manual progress is a provisional candidate, not a settled completion model. No background worker, CRD, namespace creation, user cancellation, or automated solving.
 - **Recoverable failures.** Every lab-content, setup, render, route, and verification failure gives user an actionable manual next step. MVP never retries, cleans up, or recovers Helm automatically.
@@ -43,8 +43,8 @@ Backend exposes three operations through the declared `UserToken` Console servic
 
 | Operation | Client input | Backend requirements | Result |
 | --- | --- | --- | --- |
-| **List catalog** | None | Read admin-configured approved catalog entries. | Catalog entries or typed catalog/configuration error. |
-| **Load lab bundle** | Selected catalog lab ID | Resolve configured repository and branch server-side; validate supported manifest `apiVersion`; load manifest, pages, lab-local includes, and optional chart as one bundle; reject paths outside lab tree. | Validated bundle plus runtime context, or typed content/version/repository error. |
+| **List catalog** | None | Read admin-configured approved source entries; derive `catalogRef` before reading each cached snapshot; return validated `lab.yaml` `metadata.displayName` and optional `metadata.description`. Unavailable, missing-manifest, or invalid labs are omitted; unsafe configuration is typed `configuration_error`. | Ordered valid catalog entries or typed catalog/configuration error. |
+| **Load lab bundle** | Selected catalog lab ID | Resolve configured repository and branch server-side from immutable hashed snapshot storage; validate supported manifest `apiVersion`; return manifest, current embedded page source map, and optional-chart availability. | Validated bundle plus runtime context, or typed content/version/repository error. |
 | **Setup lab** | Selected lab ID and confirmed namespace bindings | Revalidate catalog, bundle, namespace bindings, current-user access, release ownership, and chart inputs. Derive release identity server-side, then run Helm synchronously with `Wait` and bounded timeout. | Terminal `success`, `failure`, or `timeout`, with safe actionable error context. |
 
 Backend must treat catalog repository, branch, lab path, Helm release identity, and authorization identity as server-derived values. Client input must not override them. Forwarded user tokens are request-scoped only: backend must neither persist nor log them.
@@ -53,8 +53,8 @@ MVP has no setup cancellation, automatic retry, cleanup, recovery, asynchronous 
 
 ### Launch and setup flow
 
-1. Plugin lists catalog entries and asks backend for selected lab's validated manifest and complete lab bundle from its configured branch.
-2. Plugin validates client-facing manifest shape before using it. Backend remains trust boundary for catalog, branch, paths, and lab-content retrieval. Page navigation uses loaded bundle; MVP does not check upstream changes during session.
+1. **Implemented backend behavior:** Catalog, bundle, and setup loading share one immutable configured repository/branch snapshot at `/var/lib/interactive-labs/cache/<sha256 canonical repository+branch>/content`. `Close` preserves it; no PVC is mounted today, so pod/container replacement loses cache. A future PVC mounts this fixed path. Catalog metadata comes from each validated manifest; no browser resource route exists.
+2. **Decided target / planned:** Plugin validates client-facing manifest and page-descriptor shape before using it. Backend remains trust boundary for catalog, branch, paths, and lab-content retrieval. Page navigation uses returned page paths; rendering fetches sources only through returned server-approved URLs. MVP does not check upstream changes during session.
 3. Namespace-selection policy remains open. Current provisional direction derives fields from chart metadata, optionally preselects accessible current Console namespace, and requires user confirmation; implementation must not freeze this direction as final policy.
 4. Backend derives stable Helm release identity from authenticated user subject, lab ID, configured branch, and normalized namespace bindings: `il-` plus a truncated SHA-256 digest of their canonical representation. Client never supplies release identity; backend derives expected identity again before reusing a release.
 5. Plugin calls setup only after confirmation. MVP backend invokes Helm synchronously with `Wait` and bounded timeout, then returns typed final result: `success`, `failure`, or `timeout`.
@@ -84,9 +84,9 @@ sequenceDiagram
 
 ### Content, routes, and spotlight flow
 
-Plugin renders AsciiDoc in browser through Asciidoctor.js with a restricted, documented profile, then sanitizes generated DOM output. Lab-local includes and inter-page links resolve only through normalized paths present in the loaded bundle, relative to its `content/` root. Backend loads `.adoc` source files recursively. A path with any segment beginning `_` is include-only and cannot be a navigation target; remaining paths sort lexically, with first path as entry page and adjacent paths as previous/next navigation. Runtime attributes supplied by backend override author attributes. Remote includes, executable extensions, arbitrary filesystem access, raw HTML outside supported subset, external navigation directives, and arbitrary DOM selectors are rejected.
+**Decided target / planned STORY-4:** Plugin renders AsciiDoc in browser through Asciidoctor.js with a restricted, documented profile, then sanitizes generated DOM output. Bundle supplies normalized navigable page paths and server-approved source URLs; ordinary links navigate inside drawer only through known paths under `labPath/content/`, preserving same-page fragments and warning for unknown/external targets. A validated page link activated in catalog description is explicit Launch intent: it validates bundle and opens drawer at target without bypassing chart setup policy. Asciidoctor's include processor requests same-repository includes through backend resource URLs; images use that endpoint after inert rendered HTML has its `src` rewritten. Relative image targets use Asciidoctor's default flattened-document base—the rendered top-level page URL—even when declared in a partial. STORY-4 serves these resources from STORY-9's cached approved snapshot and rejects paths outside the repository. A path with any segment beginning `_` is include-only and cannot be a navigation target; remaining paths sort lexically, with first path as entry page and adjacent paths as previous/next navigation. Runtime attributes supplied by backend override author attributes. Remote includes, executable extensions, arbitrary filesystem access, repository-root escapes, raw HTML outside supported subset, external navigation directives, and arbitrary DOM selectors are rejected.
 
-Asciidoctor safe-mode choice alone does not establish browser XSS safety. Sanitizer policy and permitted AsciiDoc subset are versioned authoring contract; fixture lab defines first supported subset.
+Asciidoctor safe-mode choice alone does not establish browser XSS safety. Sanitizer policy and permitted AsciiDoc subset are versioned authoring contract; initial fixture supports syntax-highlighted source blocks and Mermaid diagrams, not arbitrary executable extensions or author-supplied SVG. Highlighting consumes text content and rejects unescaped HTML. Mermaid runs with strict security, no auto-start or click/callback binding; generated SVG receives a dedicated sanitizer pass before final DOM sanitization. Recoverable rejected content/resources and Mermaid/highlighter failures render explicit inline warnings; page fetch, conversion, or sanitizer failures render safe actionable page error. Do not share Asciidoctor's global logger across concurrent page/description conversions.
 
 A Quick Start-compatible AsciiDoc macro authors each Console guidance link and carries a same-Console route plus optional symbolic target ID. Plugin translates it to a typed instruction, then validates route and target against Console-supported Quick Start addressing. It navigates first, waits for target render, then finds matching `data-quickstart-id`, scrolls it into view, and displays spotlight. Missing or unsupported target falls back to route-only navigation. Dismiss spotlight on target interaction, Escape, route change, or timeout.
 
@@ -119,7 +119,7 @@ Evidence, checkpoint, and completion rules remain open. Current provisional dire
 
 | Concept | Role | Client responsibility |
 | --- | --- | --- |
-| **Catalog entry** | Admin-visible lab locator: approved Red Hat repository, branch, AsciiDoc path, optional chart path. | List, select, display availability/error. Never dereference arbitrary URLs. |
+| **Catalog entry** | Admin-visible lab locator: approved Red Hat repository, branch, AsciiDoc path, optional chart path, and `lab.yaml` description. | List, select, render description through restricted path using `lab.yaml` base, display availability/error. Never dereference arbitrary URLs. |
 | **Lab manifest** | Versioned lab-content contract: attributes, optional setup, links, and typed `checkpoints`. Page paths and entry order derive from loaded content. | Validate schema before use; render only supported features. |
 | **Lab session** | Loaded lab bundle plus browser-local state for one selected lab and namespace bindings. | Navigate within loaded bundle; persist/restore panel and progress state. |
 | **Namespace binding** | Provisional mapping from chart release namespace or annotated chart value to a namespace. | Do not treat current explicit-selection approach as settled policy. |
@@ -131,7 +131,9 @@ Evidence, checkpoint, and completion rules remain open. Current provisional dire
 
 ### Lab content delivery
 
-Catalog identifies a lab by canonical approved Red Hat repository identity and branch. Browser never fetches repository content. At lab launch, backend loads manifest, pages, includes, and optional chart from that branch into one bundle and rejects paths outside lab tree. Helm dependencies may resolve at runtime from sources declared by approved chart; catalog approval trusts those declarations. MVP does not expose resolved revision, detect an upstream update, migrate state, or reconcile running labs after upstream content changes.
+**Implemented and verified:** Catalog identifies a lab by canonical approved Red Hat repository identity and branch. Backend shallow-clones one immutable snapshot per identity on first use into `/var/lib/interactive-labs/cache/<sha256 canonical repository+branch>/content`, then reuses it for catalog metadata, bundle, and setup loading while cache storage remains. Entry directory is reserved for future metadata. `Close` does not remove snapshots; current deployment has no PVC, so pod/container replacement or cache clearing permits a new snapshot. Future PVCs mount this fixed path. Backend returns no revision and does not detect upstream changes. An unavailable repository, missing manifest, or invalid lab is omitted from catalog with one safe Warning Event per `(catalogRef, reason)` for backend lifetime.
+
+**Decided target / planned STORY-4:** Browser never selects or fetches arbitrary repository content: it loads page, include, and image sources only through backend-approved URLs. At lab launch, backend reads manifest, navigable pages under `labPath/content`, and optional chart from cached approved snapshot; resource requests reject paths outside that repository. Helm dependencies may resolve at runtime from sources declared by approved chart; catalog approval trusts those declarations. MVP does not expose resolved revision, detect an upstream update, migrate state, or reconcile running labs after upstream content changes.
 
 
 ### Provisional namespace direction
@@ -180,9 +182,8 @@ That future path needs release-scoped mutual exclusion across backend replicas�
 
 ### Phase 4 — Render and navigate content (STORY-4)
 
-- Add restricted Asciidoctor.js adapter with lab-local page/include resolver and runtime-attribute precedence.
-- Add page navigation, invalid content/missing-page states, and typed Console guidance links.
-- Implement route-first spotlight adapter around allow-listed `data-quickstart-id` targets.
+- After STORY-9 cached snapshots, add restricted Asciidoctor.js adapter that fetches page and same-repository include sources through backend-approved URLs; retain runtime-attribute precedence.
+- Add page navigation and invalid content/missing-resource states. Console guidance links and spotlight remain STORY-6 scope.
 
 ### Phase 5 — Verify and harden representative lab (STORY-8)
 

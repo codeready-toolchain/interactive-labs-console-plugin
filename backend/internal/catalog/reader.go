@@ -9,13 +9,13 @@ import (
 
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/bundle"
 )
 
 // Entry is a single catalog lab entry derived from the ConfigMap.
 type Entry struct {
 	CatalogRef         string
-	DisplayName        string
-	Description        string
 	Repository         string
 	Branch             string
 	LabPath            string
@@ -23,8 +23,6 @@ type Entry struct {
 }
 
 type rawEntry struct {
-	DisplayName        string            `yaml:"displayName"`
-	Description        string            `yaml:"description"`
 	Repository         string            `yaml:"repository"`
 	Branch             string            `yaml:"branch"`
 	LabPath            string            `yaml:"labPath"`
@@ -78,9 +76,6 @@ func Read(cm *corev1.ConfigMap) ([]Entry, error) {
 	entries := make([]Entry, 0, len(items))
 	for i, item := range items {
 		label := fmt.Sprintf("entry[%d]", i)
-		if item.DisplayName == "" {
-			return nil, fmt.Errorf("configuration_error: %s missing required field displayName", label)
-		}
 		if item.Repository == "" {
 			return nil, fmt.Errorf("configuration_error: %s missing required field repository", label)
 		}
@@ -90,6 +85,12 @@ func Read(cm *corev1.ConfigMap) ([]Entry, error) {
 		if item.LabPath == "" {
 			return nil, fmt.Errorf("configuration_error: %s missing required field labPath", label)
 		}
+		if err := bundle.ValidateCloneArgs(item.Repository, item.Branch); err != nil {
+			return nil, fmt.Errorf("configuration_error: %s has unsafe source locator", label)
+		}
+		if err := bundle.ValidateLabPath(item.LabPath); err != nil {
+			return nil, fmt.Errorf("configuration_error: %s has unsafe labPath", label)
+		}
 		ref := DeriveRef(item.Repository, item.Branch, item.LabPath, item.AttributeOverrides)
 		if seen[ref] {
 			return nil, fmt.Errorf("configuration_error: duplicate catalog entry ref (same repository, branch, labPath, and attributeOverrides)")
@@ -97,8 +98,6 @@ func Read(cm *corev1.ConfigMap) ([]Entry, error) {
 		seen[ref] = true
 		entries = append(entries, Entry{
 			CatalogRef:         ref,
-			DisplayName:        item.DisplayName,
-			Description:        item.Description,
 			Repository:         item.Repository,
 			Branch:             item.Branch,
 			LabPath:            item.LabPath,

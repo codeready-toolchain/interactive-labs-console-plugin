@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -22,9 +23,11 @@ import (
 // Config holds injectable dependencies for the router.
 type Config struct {
 	// CatalogSource returns the live catalog ConfigMap; nil uses an empty ConfigMap.
-	CatalogSource func(ctx context.Context) (*corev1.ConfigMap, error)
+	CatalogSource func(context.Context) (*corev1.ConfigMap, error)
 	// BundleLoader loads a bundle from the configured repo; nil means bundles are unavailable.
-	BundleLoader func(ctx context.Context, repoURL, branch, labPath string) (*bundle.Result, error)
+	BundleLoader func(context.Context, string, string, string) (*bundle.Result, error)
+	// CatalogLabOmitted receives catalog entry omission notifications.
+	CatalogLabOmitted func(ctx context.Context, catalogRef, reason string)
 	// Logger receives safe operational fields only; tokens must never be passed to it.
 	Logger *slog.Logger
 	// Authenticate resolves a forwarded user token to its server-verified subject.
@@ -54,10 +57,11 @@ func NewRouter(cfg Config) http.Handler {
 
 // --- helpers ---
 
-func writeJSON(w http.ResponseWriter, status int, body interface{}) {
+func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(body) //nolint:errcheck,errchkjson
+	json.NewEncoder(w). //nolint:errchkjson
+				Encode(body) //nolint:errcheck
 }
 
 func writeError(w http.ResponseWriter, status int, e *laberr.LabError) {
@@ -150,6 +154,12 @@ func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
+	loader := cfg.BundleLoader
+	if loader == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			laberr.New(laberr.TypeRepositoryError, "bundle loader not configured", nil))
+		return
+	}
 	type item struct {
 		CatalogRef  string `json:"catalogRef"`
 		DisplayName string `json:"displayName"`
@@ -157,9 +167,19 @@ func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 	items := make([]item, 0, len(entries))
 	for _, e := range entries {
-		items = append(items, item{CatalogRef: e.CatalogRef, DisplayName: e.DisplayName, Description: e.Description})
+		result, err := loader(r.Context(), e.Repository, e.Branch, e.LabPath)
+		if reason := omittedLabReason(err); reason != "" {
+			recordCatalogOmission(r.Context(), cfg, e.CatalogRef, reason)
+			continue
+		}
+		if err != nil || result == nil || result.Manifest == nil {
+			writeError(w, http.StatusBadGateway,
+				laberr.New(laberr.TypeRepositoryError, "failed to resolve lab catalog", nil))
+			return
+		}
+		items = append(items, item{CatalogRef: e.CatalogRef, DisplayName: result.Manifest.Metadata.DisplayName, Description: result.Manifest.Metadata.Description})
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"apiVersion": "v1alpha1",
 		"kind":       "CatalogList",
 		"items":      items,
@@ -213,12 +233,12 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 	result.Manifest.Spec.Attributes = mergeAttributes(staticAttrs, runtimeAttrs)
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"apiVersion": "v1alpha1",
 		"kind":       "LabBundle",
 		"manifest":   result.Manifest,
 		"pages":      result.Pages,
-		"runtimeContext": map[string]interface{}{
+		"runtimeContext": map[string]any{
 			"catalogRef":         entry.CatalogRef,
 			"branch":             entry.Branch,
 			"helmChartAvailable": result.HelmChartAvailable,
@@ -252,7 +272,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 	var req struct {
 		NamespaceBindings map[string]string `json:"namespaceBindings"`
 	}
-	if err = json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if derr := json.NewDecoder(r.Body).Decode(&req); derr != nil {
 		writeError(w, http.StatusBadRequest,
 			laberr.New(laberr.TypeNamespaceBindingInvalid, "invalid request body", nil))
 		return
@@ -282,13 +302,35 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 	name := helmReleaseName(subject, entry.Repository, entry.LabPath, entry.Branch, staticAttrs, req.NamespaceBindings)
 
 	// ponytail: Helm execution is STORY-4; stub returns success with derived release name.
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"apiVersion":      "v1alpha1",
 		"kind":            "SetupResult",
 		"outcome":         "success",
 		"message":         "Lab setup complete (Helm execution deferred to STORY-4)",
 		"helmReleaseName": name,
 	})
+}
+
+func omittedLabReason(err error) string {
+	switch {
+	case errors.Is(err, bundle.ErrRepositoryUnavailable):
+		return "RepositoryUnavailable"
+	case errors.Is(err, bundle.ErrManifestMissing):
+		return "ManifestMissing"
+	case errors.Is(err, bundle.ErrLabInvalid):
+		return "LabInvalid"
+	default:
+		return ""
+	}
+}
+
+func recordCatalogOmission(ctx context.Context, cfg Config, catalogRef, reason string) {
+	if cfg.Logger != nil {
+		cfg.Logger.Warn("catalog lab omitted", "catalogRef", catalogRef, "reason", reason)
+	}
+	if cfg.CatalogLabOmitted != nil {
+		cfg.CatalogLabOmitted(ctx, catalogRef, reason)
+	}
 }
 
 func keys(m map[string]string) []string {

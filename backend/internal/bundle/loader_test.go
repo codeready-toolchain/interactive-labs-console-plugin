@@ -24,6 +24,7 @@ kind: Lab
 metadata:
   name: lab1
   displayName: "Lab 1"
+  description: "Manifest description"
 spec: {}`), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "010-intro.adoc"), []byte("= Intro\n\nHello."), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "_shared.adoc"), []byte("include"), 0o600))
@@ -33,6 +34,8 @@ spec: {}`), 0o600))
 	result, err := bundle.LoadFromDir(labPath)
 	require.NoError(t, err)
 	assert.Equal(t, "lab1", result.Manifest.Metadata.Name)
+	assert.Equal(t, "Lab 1", result.Manifest.Metadata.DisplayName)
+	assert.Equal(t, "Manifest description", result.Manifest.Metadata.Description)
 	assert.Contains(t, result.Pages, "010-intro.adoc")
 	assert.Contains(t, result.Pages, "_shared.adoc")
 	assert.True(t, result.HelmChartAvailable)
@@ -64,6 +67,39 @@ func TestValidateCloneArgs_InvalidScheme(t *testing.T) {
 func TestValidateCloneArgs_InvalidBranch(t *testing.T) {
 	err := bundle.ValidateCloneArgs("https://github.com/org/repo", "main; rm -rf /")
 	require.Error(t, err)
+}
+
+func TestValidateCloneArgs_RejectsUnsafeGitRef(t *testing.T) {
+	require.Error(t, bundle.ValidateCloneArgs("https://github.com/org/repo", "../main"))
+}
+
+func TestValidateCloneArgs_RejectsCredentials(t *testing.T) {
+	require.Error(t, bundle.ValidateCloneArgs("https://token@github.com/org/repo", "main"))
+}
+
+func TestLoadFromSnapshot_ClassifiesContentAndContainsLabPath(t *testing.T) {
+	root := t.TempDir()
+	_, err := bundle.LoadFromSnapshot(root, "missing")
+	require.ErrorIs(t, err, bundle.ErrManifestMissing)
+
+	escaped := filepath.Join(t.TempDir(), "lab")
+	require.NoError(t, os.MkdirAll(filepath.Join(escaped, "content"), 0o755))
+	require.NoError(t, os.Symlink(escaped, filepath.Join(root, "outside")))
+	_, err = bundle.LoadFromSnapshot(root, "outside")
+	require.ErrorIs(t, err, bundle.ErrLabInvalid)
+}
+
+func TestLoadFromDir_InvalidContentIsLabInvalid(t *testing.T) {
+	lab := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(lab, "content"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(lab, "lab.yaml"), []byte(`apiVersion: invalid
+kind: Lab
+metadata:
+  name: lab
+  displayName: Lab
+spec: {}`), 0o600))
+	_, err := bundle.LoadFromDir(lab)
+	require.ErrorIs(t, err, bundle.ErrLabInvalid)
 }
 
 func TestValidateCloneArgs_Valid(t *testing.T) {

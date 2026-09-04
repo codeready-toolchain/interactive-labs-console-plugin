@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,7 +47,7 @@ func newRouter(t *testing.T) http.Handler {
 		},
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
-				Manifest: &manifest.LabManifest{},
+				Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Manifest Lab", Description: "Manifest description"}},
 				Pages:    map[string]string{"intro.adoc": "= Intro"},
 			}, nil
 		},
@@ -80,6 +82,13 @@ func TestCatalogHandler_ReturnsItemsInDeclaredOrder(t *testing.T) {
   branch: "main"
   labPath: "."`,
 		}),
+		BundleLoader: func(_ context.Context, repository, _, _ string) (*bundle.Result, error) {
+			name := "Lab A"
+			if strings.Contains(repository, "lab-z") {
+				name = "Lab Z"
+			}
+			return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: name, DisplayName: name}}, Pages: map[string]string{"intro.adoc": "= Intro"}}, nil
+		},
 	})
 	rw := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil)
@@ -405,6 +414,63 @@ func TestSetupHandler_ReleaseNameExcludesRuntimeAttrs(t *testing.T) {
 	assert.Equal(t, call(r1), call(r2), "runtime attrs must not affect helmReleaseName")
 }
 
+func TestCatalogHandler_UsesManifestMetadataAndOmitsOnlyClassifiedFailures(t *testing.T) {
+	var logs bytes.Buffer
+	var warnings []string
+	validRef := catalog.DeriveRef("https://github.com/redhat/good", "main", "lab", nil)
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: stubCatalogCM(map[string]string{"catalog.yaml": `- displayName: Legacy
+  description: Legacy
+  repository: https://github.com/redhat/good
+  branch: main
+  labPath: lab
+- repository: https://github.com/redhat/missing
+  branch: main
+  labPath: lab`}),
+		BundleLoader: func(_ context.Context, repository, _, _ string) (*bundle.Result, error) {
+			if strings.Contains(repository, "missing") {
+				return nil, fmt.Errorf("%w: private details", bundle.ErrManifestMissing)
+			}
+			return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: "good", DisplayName: "Manifest name", Description: "Manifest description"}}, Pages: map[string]string{"intro.adoc": "= Intro"}}, nil
+		},
+		Logger:            slog.New(slog.NewJSONHandler(&logs, nil)),
+		CatalogLabOmitted: func(_ context.Context, ref, reason string) { warnings = append(warnings, ref+":"+reason) },
+	})
+
+	rw := httptest.NewRecorder()
+	router.ServeHTTP(rw, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil))
+	require.Equal(t, http.StatusOK, rw.Code)
+	var body struct {
+		Items []struct {
+			CatalogRef  string `json:"catalogRef"`
+			DisplayName string `json:"displayName"`
+			Description string `json:"description"`
+		} `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+	require.Equal(t, []struct {
+		CatalogRef  string `json:"catalogRef"`
+		DisplayName string `json:"displayName"`
+		Description string `json:"description"`
+	}{{validRef, "Manifest name", "Manifest description"}}, body.Items)
+	assert.Equal(t, []string{catalog.DeriveRef("https://github.com/redhat/missing", "main", "lab", nil) + ":ManifestMissing"}, warnings)
+	assert.Contains(t, logs.String(), "catalog lab omitted")
+	assert.NotContains(t, logs.String(), "private details")
+	assert.NotContains(t, logs.String(), "https://github.com/redhat/missing")
+}
+
+func TestCatalogHandler_UnexpectedLoaderFailureIsNotOmitted(t *testing.T) {
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
+			return nil, errors.New("unexpected")
+		},
+	})
+	rw := httptest.NewRecorder()
+	router.ServeHTTP(rw, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil))
+	assert.Equal(t, http.StatusBadGateway, rw.Code)
+}
+
 // helpers
 
 func assertNoTokenInBody(t *testing.T, body string) {
@@ -418,6 +484,6 @@ func assertNoTokenInBody(t *testing.T, body string) {
 // No signature verification is expected in MVP; cluster validates the token.
 func makeTestJWT(sub string) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
-	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":%q}`, sub)))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":%q}`, sub))) //nolint:fmtappendf
 	return header + "." + payload + "."
 }
