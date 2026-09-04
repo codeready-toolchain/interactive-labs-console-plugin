@@ -71,7 +71,7 @@ func CloneAndLoad(ctx context.Context, repoURL, branch, labPath string) (*Result
 		return nil, err
 	}
 	if err := ValidateLabPath(labPath); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrLabInvalid, err)
+		return nil, fmt.Errorf("%w: %w", ErrLabInvalid, err)
 	}
 	tmpDir, err := os.MkdirTemp("", "ilab-clone-*")
 	if err != nil {
@@ -79,7 +79,7 @@ func CloneAndLoad(ctx context.Context, repoURL, branch, labPath string) (*Result
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cmd := exec.CommandContext(ctx, "git", cloneArgs(repoURL, branch, tmpDir)...)
+	cmd := exec.CommandContext(ctx, "git", cloneArgs(repoURL, branch, tmpDir)...) // #nosec: G204
 	cmd.Env = gitEnv(nil)
 	if _, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("%w: clone failed", ErrRepositoryUnavailable)
@@ -90,7 +90,7 @@ func CloneAndLoad(ctx context.Context, repoURL, branch, labPath string) (*Result
 // LoadFromSnapshot validates labPath before reading it from repositoryRoot.
 func LoadFromSnapshot(repositoryRoot, labPath string) (*Result, error) {
 	if err := ValidateLabPath(labPath); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrLabInvalid, err)
+		return nil, fmt.Errorf("%w: %w", ErrLabInvalid, err)
 	}
 	root, err := filepath.EvalSymlinks(repositoryRoot)
 	if err != nil {

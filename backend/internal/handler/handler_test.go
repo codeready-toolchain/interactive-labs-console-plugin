@@ -434,11 +434,11 @@ func TestCatalogHandler_UsesManifestMetadataAndOmitsOnlyClassifiedFailures(t *te
 			return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: "good", DisplayName: "Manifest name", Description: "Manifest description"}}, Pages: map[string]string{"intro.adoc": "= Intro"}}, nil
 		},
 		Logger:            slog.New(slog.NewJSONHandler(&logs, nil)),
-		CatalogLabOmitted: func(ref, reason string) { warnings = append(warnings, ref+":"+reason) },
+		CatalogLabOmitted: func(_ context.Context, ref, reason string) { warnings = append(warnings, ref+":"+reason) },
 	})
 
 	rw := httptest.NewRecorder()
-	router.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/api/v1alpha1/catalog", nil))
+	router.ServeHTTP(rw, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil))
 	require.Equal(t, http.StatusOK, rw.Code)
 	var body struct {
 		Items []struct {
@@ -467,7 +467,7 @@ func TestCatalogHandler_UnexpectedLoaderFailureIsNotOmitted(t *testing.T) {
 		},
 	})
 	rw := httptest.NewRecorder()
-	router.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/api/v1alpha1/catalog", nil))
+	router.ServeHTTP(rw, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil))
 	assert.Equal(t, http.StatusBadGateway, rw.Code)
 }
 
@@ -484,6 +484,6 @@ func assertNoTokenInBody(t *testing.T, body string) {
 // No signature verification is expected in MVP; cluster validates the token.
 func makeTestJWT(sub string) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
-	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":%q}`, sub)))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":%q}`, sub))) //nolint:fmtappendf
 	return header + "." + payload + "."
 }

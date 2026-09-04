@@ -61,7 +61,7 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	backend.Shutdown(shutCtx) //nolint:errcheck
-	cache.Close()             //nolint:errcheck // preserves successful snapshots for next process
+	cache.Close()             // preserves successful snapshots for next process
 }
 
 func serveTLS(log *slog.Logger, name string, server *http.Server, cert, key string) {

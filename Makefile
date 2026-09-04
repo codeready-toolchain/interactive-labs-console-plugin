@@ -18,9 +18,11 @@ build: frontend-build backend-build ## Build frontend and backend
 
 test: frontend-test backend-test ## Run frontend and backend checks
 
-lint: ## Lint frontend and backend
+lint: frontend-lint backend-lint ## Lint frontend and backend
+
+frontend-lint:
+	npm --prefix frontend ci
 	npm --prefix frontend run lint
-	cd backend && golangci-lint run
 
 frontend-build: ## Install frontend dependencies and build frontend
 	npm --prefix frontend ci
@@ -31,6 +33,9 @@ frontend-test: ## Type-check, test, and lint frontend
 	npm --prefix frontend run type-check
 	npm --prefix frontend test -- --coverage
 	npm --prefix frontend run lint
+
+backend-lint:
+	cd backend && golangci-lint run
 
 backend-build: ## Build backend server
 	cd backend && go build ./cmd/server

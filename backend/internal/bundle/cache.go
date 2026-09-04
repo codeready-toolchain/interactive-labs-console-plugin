@@ -51,7 +51,7 @@ func (c *Cache) Load(ctx context.Context, repository, branch, labPath string) (*
 		return nil, fmt.Errorf("%w: invalid source", ErrRepositoryUnavailable)
 	}
 	if err := ValidateLabPath(labPath); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrLabInvalid, err)
+		return nil, fmt.Errorf("%w: %w", ErrLabInvalid, err)
 	}
 
 	key := sourceKey{repository: repository, branch: branch}
@@ -150,7 +150,7 @@ func snapshotID(repository, branch string) string {
 		Branch     string `json:"branch"`
 		Repository string `json:"repository"`
 	}
-	b, _ := json.Marshal(canonical{Branch: branch, Repository: repository})
+	b, _ := json.Marshal(canonical{Branch: branch, Repository: repository}) //nolint:errchkjson
 	sum := sha256.Sum256(b)
 	return fmt.Sprintf("%x", sum)
 }
@@ -173,7 +173,7 @@ func gitEnv(base []string) []string {
 }
 
 func cloneSnapshot(ctx context.Context, repository, branch, destination string) error {
-	cmd := exec.CommandContext(ctx, "git", cloneArgs(repository, branch, destination)...)
+	cmd := exec.CommandContext(ctx, "git", cloneArgs(repository, branch, destination)...) // #nosec G204 -- these args are controlled and safe
 	cmd.Env = gitEnv(nil)
 	if _, err := cmd.CombinedOutput(); err != nil {
 		return err

@@ -31,15 +31,16 @@ func writeSnapshotLab(root, labPath string) error {
 	if err := os.MkdirAll(filepath.Join(lab, "content"), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(lab, "lab.yaml"), []byte(`apiVersion: v1alpha1
+	if err := os.WriteFile(filepath.Join(lab, "lab.yaml"),
+		[]byte(`apiVersion: v1alpha1
 kind: Lab
 metadata:
   name: test
   displayName: Test
-spec: {}`), 0o644); err != nil {
+spec: {}`), 0o600); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(lab, "content", "intro.adoc"), []byte("= Test"), 0o644)
+	return os.WriteFile(filepath.Join(lab, "content", "intro.adoc"), []byte("= Test"), 0o600)
 }
 
 func TestCache_ReusesSuccessfulSnapshotByRepositoryAndBranch(t *testing.T) {
@@ -253,7 +254,7 @@ func TestCache_PublishesContentOnlyAfterCloneCompletes(t *testing.T) {
 	<-started
 	sum := sha256.Sum256([]byte(`{"branch":"main","repository":"https://example.test/labs.git"}`))
 	_, err := os.Stat(filepath.Join(root, fmt.Sprintf("%x", sum), "content"))
-	assert.ErrorIs(t, err, os.ErrNotExist)
+	require.ErrorIs(t, err, os.ErrNotExist)
 	close(release)
 	require.NoError(t, <-done)
 }

@@ -26,8 +26,8 @@ metadata:
   displayName: "Lab 1"
   description: "Manifest description"
 spec: {}`), 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "010-intro.adoc"), []byte("= Intro\n\nHello."), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "_shared.adoc"), []byte("include"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "010-intro.adoc"), []byte("= Intro\n\nHello."), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "_shared.adoc"), []byte("include"), 0o600))
 	// Minimal helm chart
 	require.NoError(t, os.WriteFile(filepath.Join(labPath, "setup", "helm", "Chart.yaml"), []byte("apiVersion: v2\nname: lab1\nversion: 0.1.0"), 0o600))
 
@@ -97,7 +97,7 @@ kind: Lab
 metadata:
   name: lab
   displayName: Lab
-spec: {}`), 0o644))
+spec: {}`), 0o600))
 	_, err := bundle.LoadFromDir(lab)
 	require.ErrorIs(t, err, bundle.ErrLabInvalid)
 }

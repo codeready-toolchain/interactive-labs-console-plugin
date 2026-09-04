@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -33,7 +34,7 @@ func newCatalogEventPoster(namespace, apiHost string, token func() (string, erro
 	return &catalogEventPoster{attempted: make(map[eventKey]struct{}), namespace: namespace, apiHost: apiHost, token: token, client: client, log: log}
 }
 
-func (p *catalogEventPoster) Post(catalogRef, reason string) {
+func (p *catalogEventPoster) Post(ctx context.Context, catalogRef, reason string) {
 	key := eventKey{catalogRef: catalogRef, reason: reason}
 	p.mu.Lock()
 	if _, exists := p.attempted[key]; exists {
@@ -63,7 +64,7 @@ func (p *catalogEventPoster) Post(catalogRef, reason string) {
 		p.warn(catalogRef, reason)
 		return
 	}
-	req, err := http.NewRequest(http.MethodPost, p.apiHost+"/api/v1/namespaces/"+url.PathEscape(p.namespace)+"/events", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiHost+"/api/v1/namespaces/"+url.PathEscape(p.namespace)+"/events", bytes.NewReader(body))
 	if err != nil {
 		p.warn(catalogRef, reason)
 		return
@@ -73,12 +74,12 @@ func (p *catalogEventPoster) Post(catalogRef, reason string) {
 	resp, err := p.client.Do(req)
 	if err != nil || resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		if resp != nil {
-			resp.Body.Close() //nolint:errcheck
+			resp.Body.Close()
 		}
 		p.warn(catalogRef, reason)
 		return
 	}
-	resp.Body.Close() //nolint:errcheck
+	resp.Body.Close()
 }
 
 func (p *catalogEventPoster) warn(catalogRef, reason string) {
@@ -87,7 +88,7 @@ func (p *catalogEventPoster) warn(catalogRef, reason string) {
 	}
 }
 
-func inClusterCatalogEventPoster(log *slog.Logger) func(string, string) {
+func inClusterCatalogEventPoster(log *slog.Logger) func(context.Context, string, string) {
 	namespace := os.Getenv("NAMESPACE")
 	if namespace == "" {
 		namespace = "interactive-labs-console-plugin"
@@ -95,7 +96,7 @@ func inClusterCatalogEventPoster(log *slog.Logger) func(string, string) {
 	client, err := tlsClientWithCA("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 	if err != nil {
 		log.Warn("catalog event client unavailable")
-		return func(string, string) {}
+		return func(context.Context, string, string) {}
 	}
 	poster := newCatalogEventPoster(namespace,
 		fmt.Sprintf("https://%s", os.Getenv("KUBERNETES_SERVICE_HOST")+":"+os.Getenv("KUBERNETES_SERVICE_PORT")),

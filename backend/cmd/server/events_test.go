@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -24,7 +25,7 @@ func TestCatalogEventPosterPostsOneSafeWarningPerRefAndReason(t *testing.T) {
 		defer mu.Unlock()
 		posts++
 		assert.Equal(t, "Bearer service-account-token", r.Header.Get("Authorization"))
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&event))
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&event))
 		w.WriteHeader(http.StatusCreated)
 	}))
 	defer server.Close()
@@ -33,9 +34,10 @@ func TestCatalogEventPosterPostsOneSafeWarningPerRefAndReason(t *testing.T) {
 	poster := newCatalogEventPoster("interactive-labs-console-plugin", server.URL, func() (string, error) {
 		return "service-account-token", nil
 	}, server.Client(), slog.New(slog.NewJSONHandler(&logs, nil)))
-	poster.Post("opaque-ref", "ManifestMissing")
-	poster.Post("opaque-ref", "ManifestMissing")
-	poster.Post("opaque-ref", "LabInvalid")
+	ctx := context.Background()
+	poster.Post(ctx, "opaque-ref", "ManifestMissing")
+	poster.Post(ctx, "opaque-ref", "ManifestMissing")
+	poster.Post(ctx, "opaque-ref", "LabInvalid")
 
 	mu.Lock()
 	assert.Equal(t, 2, posts)
@@ -67,7 +69,7 @@ func TestCatalogEventPosterConcurrentFailureIsAttemptedOnce(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 10 {
 		wg.Add(1)
-		go func() { defer wg.Done(); poster.Post("opaque-ref", "RepositoryUnavailable") }()
+		go func() { defer wg.Done(); poster.Post(context.Background(), "opaque-ref", "RepositoryUnavailable") }()
 	}
 	wg.Wait()
 	mu.Lock()

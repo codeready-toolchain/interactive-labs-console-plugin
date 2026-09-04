@@ -27,7 +27,7 @@ type Config struct {
 	// BundleLoader loads a bundle from the configured repo; nil means bundles are unavailable.
 	BundleLoader func(context.Context, string, string, string) (*bundle.Result, error)
 	// CatalogLabOmitted receives catalog entry omission notifications.
-	CatalogLabOmitted func(catalogRef, reason string)
+	CatalogLabOmitted func(ctx context.Context, catalogRef, reason string)
 	// Logger receives safe operational fields only; tokens must never be passed to it.
 	Logger *slog.Logger
 	// Authenticate resolves a forwarded user token to its server-verified subject.
@@ -57,10 +57,11 @@ func NewRouter(cfg Config) http.Handler {
 
 // --- helpers ---
 
-func writeJSON(w http.ResponseWriter, status int, body interface{}) {
+func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(body) //nolint:errcheck
+	json.NewEncoder(w). //nolint:errchkjson
+				Encode(body) //nolint:errcheck
 }
 
 func writeError(w http.ResponseWriter, status int, e *laberr.LabError) {
@@ -88,7 +89,7 @@ func helmReleaseName(subject, repository, labPath, branch string, staticAttrs, n
 		Repository        string            `json:"repository"`
 		Subject           string            `json:"subject"`
 	}
-	b, _ := json.Marshal(canonical{
+	b, _ := json.Marshal(canonical{ //nolint:errchkjson
 		Attributes:        staticAttrs,
 		Branch:            branch,
 		LabPath:           labPath,
@@ -168,7 +169,7 @@ func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 	for _, e := range entries {
 		result, err := loader(r.Context(), e.Repository, e.Branch, e.LabPath)
 		if reason := omittedLabReason(err); reason != "" {
-			recordCatalogOmission(cfg, e.CatalogRef, reason)
+			recordCatalogOmission(r.Context(), cfg, e.CatalogRef, reason)
 			continue
 		}
 		if err != nil || result == nil || result.Manifest == nil {
@@ -178,7 +179,7 @@ func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 		}
 		items = append(items, item{CatalogRef: e.CatalogRef, DisplayName: result.Manifest.Metadata.DisplayName, Description: result.Manifest.Metadata.Description})
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"apiVersion": "v1alpha1",
 		"kind":       "CatalogList",
 		"items":      items,
@@ -232,12 +233,12 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 	result.Manifest.Spec.Attributes = mergeAttributes(staticAttrs, runtimeAttrs)
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"apiVersion": "v1alpha1",
 		"kind":       "LabBundle",
 		"manifest":   result.Manifest,
 		"pages":      result.Pages,
-		"runtimeContext": map[string]interface{}{
+		"runtimeContext": map[string]any{
 			"catalogRef":         entry.CatalogRef,
 			"branch":             entry.Branch,
 			"helmChartAvailable": result.HelmChartAvailable,
@@ -271,7 +272,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 	var req struct {
 		NamespaceBindings map[string]string `json:"namespaceBindings"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if derr := json.NewDecoder(r.Body).Decode(&req); derr != nil {
 		writeError(w, http.StatusBadRequest,
 			laberr.New(laberr.TypeNamespaceBindingInvalid, "invalid request body", nil))
 		return
@@ -301,7 +302,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 	name := helmReleaseName(subject, entry.Repository, entry.LabPath, entry.Branch, staticAttrs, req.NamespaceBindings)
 
 	// ponytail: Helm execution is STORY-4; stub returns success with derived release name.
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"apiVersion":      "v1alpha1",
 		"kind":            "SetupResult",
 		"outcome":         "success",
@@ -323,12 +324,12 @@ func omittedLabReason(err error) string {
 	}
 }
 
-func recordCatalogOmission(cfg Config, catalogRef, reason string) {
+func recordCatalogOmission(ctx context.Context, cfg Config, catalogRef, reason string) {
 	if cfg.Logger != nil {
 		cfg.Logger.Warn("catalog lab omitted", "catalogRef", catalogRef, "reason", reason)
 	}
 	if cfg.CatalogLabOmitted != nil {
-		cfg.CatalogLabOmitted(catalogRef, reason)
+		cfg.CatalogLabOmitted(ctx, catalogRef, reason)
 	}
 }
 
