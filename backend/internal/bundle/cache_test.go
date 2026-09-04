@@ -15,6 +15,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type observingContext struct {
+	context.Context
+	waiting chan<- struct{}
+	once    sync.Once
+}
+
+func (c *observingContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
+
 func writeSnapshotLab(root, labPath string) error {
 	lab := filepath.Join(root, filepath.FromSlash(labPath))
 	if err := os.MkdirAll(filepath.Join(lab, "content"), 0o755); err != nil {
@@ -68,13 +79,12 @@ func TestCache_SeparatesRepositoryAndBranch(t *testing.T) {
 	assert.Equal(t, 3, clones)
 }
 
-func TestCache_ConcurrentSameSourceClonesOnceAndWaiterCanCancel(t *testing.T) {
-	root := t.TempDir()
+func TestCache_ConcurrentSameSourceClonesOnce(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var mu sync.Mutex
 	clones := 0
-	cache := newCache(root, func(_ context.Context, _, _, destination string) error {
+	cache := newCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
 		mu.Lock()
 		clones++
 		mu.Unlock()
@@ -89,15 +99,44 @@ func TestCache_ConcurrentSameSourceClonesOnceAndWaiterCanCancel(t *testing.T) {
 		firstDone <- err
 	}()
 	<-started
+	secondWaiting := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		ctx := &observingContext{Context: context.Background(), waiting: secondWaiting}
+		_, err := cache.Load(ctx, "https://example.test/labs.git", "main", "lab")
+		secondDone <- err
+	}()
+	<-secondWaiting
+	close(release)
+	require.NoError(t, <-firstDone)
+	require.NoError(t, <-secondDone)
+	mu.Lock()
+	assert.Equal(t, 1, clones)
+	mu.Unlock()
+}
+
+func TestCache_WaiterCanCancelWhileCloneInProgress(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cloneErr := errors.New("clone failed")
+	cache := newCache(t.TempDir(), func(context.Context, string, string, string) error {
+		close(started)
+		<-release
+		return cloneErr
+	})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", "lab")
+		firstDone <- err
+	}()
+	<-started
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := cache.Load(ctx, "https://example.test/labs.git", "main", "lab")
 	require.ErrorIs(t, err, context.Canceled)
 	close(release)
-	require.NoError(t, <-firstDone)
-	mu.Lock()
-	assert.Equal(t, 1, clones)
-	mu.Unlock()
+	require.ErrorIs(t, <-firstDone, ErrRepositoryUnavailable)
 }
 
 func TestCache_UsesHashedEntryWithContentSnapshot(t *testing.T) {
@@ -142,9 +181,9 @@ func TestCache_FinishFailedEntryEvictsAndNotifiesWaiters(t *testing.T) {
 	select {
 	case <-entry.done:
 	default:
-		t.Fatal("finish did not notify waiters")
+		assert.FailNow(t, "finish did not notify waiters")
 	}
-	assert.ErrorIs(t, entry.err, cloneErr)
+	require.ErrorIs(t, entry.err, cloneErr)
 	_, found := cache.entries[key]
 	assert.False(t, found)
 }
