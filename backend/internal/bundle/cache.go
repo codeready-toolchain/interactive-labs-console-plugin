@@ -72,9 +72,6 @@ func (c *Cache) Load(ctx context.Context, repository, branch, labPath string) (*
 	}
 	c.mu.Unlock()
 
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -91,42 +88,48 @@ func (c *Cache) Load(ctx context.Context, repository, branch, labPath string) (*
 
 func (c *Cache) populate(key sourceKey, entry *cacheEntry) {
 	defer c.cloning.Done()
-	defer close(entry.done)
+	c.finish(key, entry, c.createSnapshot(key, entry.destination))
+}
 
-	if info, err := os.Stat(entry.destination); err == nil {
+func (c *Cache) finish(key sourceKey, entry *cacheEntry, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry.err = err
+	if err != nil && c.entries[key] == entry {
+		delete(c.entries, key)
+	}
+	close(entry.done)
+}
+
+func (c *Cache) createSnapshot(key sourceKey, destination string) error {
+	if info, err := os.Stat(destination); err == nil {
 		if !info.IsDir() {
-			entry.err = fmt.Errorf("%w: snapshot content is not a directory", ErrRepositoryUnavailable)
+			return fmt.Errorf("%w: snapshot content is not a directory", ErrRepositoryUnavailable)
 		}
-		return
+		return nil
 	} else if !os.IsNotExist(err) {
-		entry.err = fmt.Errorf("%w: inspect snapshot", ErrRepositoryUnavailable)
-		return
+		return fmt.Errorf("%w: inspect snapshot", ErrRepositoryUnavailable)
 	}
 
-	entryDir := filepath.Dir(entry.destination)
+	entryDir := filepath.Dir(destination)
 	if err := os.MkdirAll(entryDir, 0o700); err != nil {
-		entry.err = fmt.Errorf("%w: create snapshot directory", ErrRepositoryUnavailable)
-		return
+		return fmt.Errorf("%w: create snapshot directory", ErrRepositoryUnavailable)
 	}
+	// create a temp dir to clone into and then atomically rename it to the expected destination
 	temporary, err := os.MkdirTemp(entryDir, ".content-")
-	if err == nil {
-		err = os.Remove(temporary)
-	}
 	if err == nil {
 		err = c.clone(context.Background(), key.repository, key.branch, temporary)
 	}
 	if err == nil {
-		err = os.Rename(temporary, entry.destination)
+		err = os.Rename(temporary, destination)
 	}
 	if err == nil {
-		return
+		return nil
 	}
 
 	_ = os.RemoveAll(temporary)
-	entry.err = fmt.Errorf("%w: clone failed", ErrRepositoryUnavailable)
-	c.mu.Lock()
-	delete(c.entries, key)
-	c.mu.Unlock()
+	return fmt.Errorf("%w: clone failed", ErrRepositoryUnavailable)
 }
 
 // Close waits for in-flight clones and preserves the cache root and snapshots.

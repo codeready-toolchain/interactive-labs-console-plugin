@@ -118,6 +118,37 @@ func TestCache_UsesHashedEntryWithContentSnapshot(t *testing.T) {
 	assert.NotContains(t, entry, repository)
 }
 
+func TestCache_ClonesIntoReservedEmptyTemporaryDirectory(t *testing.T) {
+	cache := newCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
+		entries, err := os.ReadDir(destination)
+		require.NoError(t, err)
+		assert.Empty(t, entries)
+		return writeSnapshotLab(destination, "lab")
+	})
+
+	_, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", "lab")
+	require.NoError(t, err)
+}
+
+func TestCache_FinishFailedEntryEvictsAndNotifiesWaiters(t *testing.T) {
+	cache := newCache(t.TempDir(), nil)
+	key := sourceKey{repository: "https://example.test/labs.git", branch: "main"}
+	entry := &cacheEntry{done: make(chan struct{})}
+	cache.entries[key] = entry
+	cloneErr := errors.New("clone failed")
+
+	cache.finish(key, entry, cloneErr)
+
+	select {
+	case <-entry.done:
+	default:
+		t.Fatal("finish did not notify waiters")
+	}
+	assert.ErrorIs(t, entry.err, cloneErr)
+	_, found := cache.entries[key]
+	assert.False(t, found)
+}
+
 func TestCache_ReusesExistingContentSnapshot(t *testing.T) {
 	root := t.TempDir()
 	const repository = "https://example.test/labs.git"
