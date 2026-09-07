@@ -1,4 +1,6 @@
 import * as React from "react";
+import { useNavigate } from "react-router-dom-v5-compat";
+import "./interactive-labs.css";
 import {
   Alert,
   Button,
@@ -23,26 +25,41 @@ import {
   TextInput,
   Title,
 } from "@patternfly/react-core";
-import { getNavigablePagePaths, listCatalog, loadLabBundle } from "./api/client";
+import { fetchResourceText, getNavigablePagePaths, listCatalog, loadLabBundle } from "./api/client";
+import { renderAsciiDoc, type RenderResult } from "./renderer";
+import { TimesIcon, WindowMinimizeIcon } from "@patternfly/react-icons";
 import type { CatalogEntry } from "./types/catalog";
 import type { LabError } from "./types/errors";
 import type { PersistedSession } from "./types/session";
+import type { LabPage } from "./types/manifest";
 
 type PageState =
   | { status: "loading" }
   | { status: "success"; items: CatalogEntry[] }
   | { status: "error"; message: string };
 
-type ActivePanel = PersistedSession & { catalogRef: string; displayName: string };
+type ActivePanel = PersistedSession & {
+  catalogRef: string;
+  displayName: string;
+  pages: LabPage[];
+  attributes: Record<string, string>;
+};
+
+type RenderState =
+  | { status: "loading" }
+  | { status: "success"; result: RenderResult }
+  | { status: "error"; message: string };
 
 type InteractiveLabsContextValue = {
-  launch: (catalogRef: string, trigger: HTMLButtonElement) => Promise<void>;
+  launch: (catalogRef: string, trigger: HTMLElement, requestedPageURL?: string) => Promise<void>;
   loadingCatalogRef?: string;
   launchError?: string;
   setupDeferred?: string;
 };
 
 const SESSION_PREFIX = "interactive-labs-console-plugin:session:";
+const PROXY_BASE = "/api/proxy/plugin/interactive-labs-console-plugin/backend";
+const LINK_WARNING = "Link is unavailable or unsafe.";
 const InteractiveLabsContext = React.createContext<InteractiveLabsContextValue | undefined>(undefined);
 
 const sessionKey = (catalogRef: string) => `${SESSION_PREFIX}${catalogRef}`;
@@ -101,29 +118,23 @@ const saveSession = (panel: ActivePanel): void => {
   }
 };
 
-const resetSessions = (): void => {
-  const storage = getStorage();
-  if (!storage) return;
-
-  try {
-    for (let index = storage.length - 1; index >= 0; index -= 1) {
-      const key = storage.key(index);
-      if (key?.startsWith(SESSION_PREFIX)) storage.removeItem(key);
-    }
-  } catch {
-    // Browser storage is optional.
-  }
-};
-
 const InteractiveLabsProvider: React.FC = ({ children }) => {
   const [activePanel, setActivePanel] = React.useState<ActivePanel | null>(null);
   const [loadingCatalogRef, setLoadingCatalogRef] = React.useState<string>();
   const [launchError, setLaunchError] = React.useState<string>();
   const [setupDeferred, setSetupDeferred] = React.useState<string>();
-  const launchTriggerRef = React.useRef<HTMLButtonElement | null>(null);
+  const [renderState, setRenderState] = React.useState<RenderState>({ status: "loading" });
+  const [renderRetry, setRenderRetry] = React.useState(0);
+  const launchTriggerRef = React.useRef<HTMLElement | null>(null);
   const drawerFocusRef = React.useRef<HTMLSpanElement | null>(null);
   const restoreFocusRef = React.useRef<HTMLButtonElement | null>(null);
+  const renderedContentRef = React.useRef<HTMLDivElement | null>(null);
+  const pendingFragmentRef = React.useRef<string>();
+  const [navigationWarning, setNavigationWarning] = React.useState<string>();
   const isOpen = activePanel?.panelMode === "open";
+  const navigate = useNavigate();
+  const pagePaths = activePanel ? getNavigablePagePaths(activePanel.pages) : [];
+  const currentPageIndex = activePanel ? pagePaths.indexOf(activePanel.currentPagePath) : -1;
 
   React.useEffect(() => {
     if (isOpen) drawerFocusRef.current?.focus();
@@ -131,7 +142,11 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
     else if (launchTriggerRef.current?.isConnected) launchTriggerRef.current.focus();
   }, [activePanel, isOpen]);
 
-  const launch = React.useCallback(async (catalogRef: string, trigger: HTMLButtonElement): Promise<void> => {
+  const launch = React.useCallback(async (
+    catalogRef: string,
+    trigger: HTMLElement,
+    requestedPageURL?: string,
+  ): Promise<void> => {
     launchTriggerRef.current = trigger;
     setActivePanel(null);
     setLoadingCatalogRef(catalogRef);
@@ -148,11 +163,25 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       const entryPage = pagePaths[0];
       if (!entryPage) throw new Error("Lab has no navigable pages.");
       const saved = readSession(catalogRef, pagePaths);
+      const requestedPage = requestedPageURL ? (() => {
+        const target = new URL(requestedPageURL, window.location.origin);
+        if (target.search) return undefined;
+        return bundle.pages.find((page) => {
+          const pageURL = new URL(page.url, window.location.origin);
+          return pageURL.origin === target.origin && pageURL.pathname === target.pathname;
+        });
+      })() : undefined;
+      if (requestedPageURL && !requestedPage) throw new Error("Lab page is unavailable.");
+      pendingFragmentRef.current = requestedPageURL
+        ? new URL(requestedPageURL, window.location.origin).hash.slice(1) || undefined
+        : undefined;
       const panel: ActivePanel = {
         catalogRef,
         displayName: bundle.manifest.metadata.displayName,
-        currentPagePath: saved?.currentPagePath ?? entryPage,
+        currentPagePath: requestedPage?.path ?? saved?.currentPagePath ?? entryPage,
         panelMode: saved?.panelMode ?? "open",
+        pages: bundle.pages,
+        attributes: bundle.manifest.spec.attributes ?? {},
       };
       setActivePanel(panel);
       saveSession(panel);
@@ -174,10 +203,107 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
 
   const closePanel = React.useCallback(() => setActivePanel(null), []);
 
-  const reset = React.useCallback((): void => {
-    resetSessions();
-    setActivePanel(null);
+  const selectPage = React.useCallback((path: string): void => {
+    setNavigationWarning(undefined);
+    setActivePanel((current) => {
+      if (!current || !current.pages.some((page) => page.path === path)) return current;
+      const panel = { ...current, currentPagePath: path };
+      saveSession(panel);
+      return panel;
+    });
   }, []);
+
+  const handleRenderedLink = React.useCallback((event: React.MouseEvent<HTMLDivElement>): void => {
+    if (event.defaultPrevented || event.button !== 0 || !activePanel) return;
+    const link = (event.target as Element).closest("a[href]") as HTMLAnchorElement | null;
+    const href = link?.getAttribute("href");
+    const currentPage = activePanel.pages.find((page) => page.path === activePanel.currentPagePath);
+    if (!href || !currentPage) return;
+
+    let target: URL;
+    try {
+      target = new URL(href, new URL(currentPage.url, window.location.origin));
+    } catch {
+      event.preventDefault();
+      setNavigationWarning(LINK_WARNING);
+      return;
+    }
+    const directPluginURL = href.startsWith("api/v1alpha1/labs/") || (target.pathname.startsWith(PROXY_BASE) &&
+      (href.startsWith("/") || href.startsWith("//") || /^[a-z][a-z0-9+.-]*:/i.test(href)));
+    if (directPluginURL) {
+      event.preventDefault();
+      setNavigationWarning(LINK_WARNING);
+      return;
+    }
+    if ((target.protocol === "http:" || target.protocol === "https:") && target.origin !== window.location.origin) {
+      event.preventDefault();
+      window.open(target.href, "_blank", "noopener,noreferrer");
+      return;
+    }
+
+    const targetPage = !target.search && activePanel.pages.find((page) => {
+      const pageURL = new URL(page.url, window.location.origin);
+      return pageURL.origin === target.origin && pageURL.pathname === target.pathname;
+    });
+    if (targetPage) {
+      if (targetPage.path === currentPage.path && href.startsWith("#")) return;
+      event.preventDefault();
+      pendingFragmentRef.current = target.hash ? decodeURIComponent(target.hash.slice(1)) : undefined;
+      selectPage(targetPage.path);
+      return;
+    }
+    if (!href.startsWith("/") && !href.startsWith("//") && !/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+      event.preventDefault();
+      setNavigationWarning(LINK_WARNING);
+      return;
+    }
+    if (target.origin === window.location.origin && !target.pathname.startsWith(PROXY_BASE)) {
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      navigate(`${target.pathname}${target.search}${target.hash}`);
+      return;
+    }
+    event.preventDefault();
+    setNavigationWarning(LINK_WARNING);
+  }, [activePanel, navigate, selectPage]);
+
+  React.useEffect(() => {
+    if (!activePanel || activePanel.panelMode !== "open") return undefined;
+    const page = activePanel.pages.find((candidate) => candidate.path === activePanel.currentPagePath);
+    if (!page) {
+      setRenderState({ status: "error", message: "Lab page is unavailable." });
+      return undefined;
+    }
+    const controller = new AbortController();
+    setRenderState({ status: "loading" });
+    void fetchResourceText(page.url, controller.signal)
+      .then((source) => renderAsciiDoc({
+        source,
+        sourceURL: page.url,
+        attributes: activePanel.attributes,
+        loadResource: fetchResourceText,
+        pageURLs: activePanel.pages.map((candidate) => candidate.url),
+        signal: controller.signal,
+      }))
+      .then((result) => {
+        if (!controller.signal.aborted) setRenderState({ status: "success", result });
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setRenderState({ status: "error", message: (error as Error).message || "Unable to render lab page." });
+        }
+      });
+    return () => controller.abort();
+  }, [activePanel, renderRetry]);
+
+  React.useEffect(() => {
+    if (renderState.status !== "success" || !pendingFragmentRef.current) return;
+    const fragment = pendingFragmentRef.current;
+    pendingFragmentRef.current = undefined;
+    Array.from(renderedContentRef.current?.querySelectorAll<HTMLElement>("[id]") ?? [])
+      .find((element) => element.id === fragment)
+      ?.scrollIntoView?.();
+  }, [renderState]);
 
   const value = React.useMemo(
     () => ({ launch, loadingCatalogRef, launchError, setupDeferred }),
@@ -194,39 +320,80 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
           style={{ position: "fixed", inset: 0, zIndex: 1000, pointerEvents: "none" }}
         >
           <DrawerContent
-            panelContent={
-              <DrawerPanelContent style={{ pointerEvents: "auto" }}>
+            panelContent={isOpen ? (
+              <DrawerPanelContent
+                isResizable
+                minSize="20rem"
+                defaultSize="40%"
+                resizeAriaLabel="Resize lab drawer"
+                style={{ pointerEvents: "auto" }}
+              >
                 <DrawerHead>
-                  <span ref={drawerFocusRef} tabIndex={-1}>
-                    {activePanel.displayName}
-                  </span>
+                  <div>
+                    <span ref={drawerFocusRef} tabIndex={-1}>
+                      <strong>{activePanel.displayName}</strong>
+                    </span>
+                    <div style={{ display: "flex", alignItems: "center", gap: "var(--pf-t--global--spacer--sm)" }}>
+                      <Button
+                        variant="secondary"
+                        aria-label="Previous page"
+                        isDisabled={currentPageIndex <= 0}
+                        onClick={() => selectPage(pagePaths[currentPageIndex - 1])}
+                      >
+                        Previous
+                      </Button>
+                      <span aria-live="polite">Page {currentPageIndex + 1} of {pagePaths.length}</span>
+                      <Button
+                        variant="secondary"
+                        aria-label="Next page"
+                        isDisabled={currentPageIndex < 0 || currentPageIndex >= pagePaths.length - 1}
+                        onClick={() => selectPage(pagePaths[currentPageIndex + 1])}
+                      >
+                        Next
+                      </Button>
+                    </div>
+                  </div>
                   <DrawerActions>
-                    <Button
-                      variant="plain"
-                      onClick={() => setPanelMode("minimized")}
-                      aria-label={isOpen ? "Minimize lab" : "Lab panel minimized"}
-                    >
-                      Minimize
+                    <Button variant="plain" onClick={() => setPanelMode("minimized")} aria-label="Minimize lab">
+                      <WindowMinimizeIcon />
                     </Button>
-                    <Button
-                      variant="plain"
-                      onClick={closePanel}
-                      aria-label={isOpen ? "Close lab" : "Lab panel closed"}
-                    >
-                      Close
+                    <Button variant="plain" onClick={closePanel} aria-label="Close lab">
+                      <TimesIcon />
                     </Button>
                   </DrawerActions>
                 </DrawerHead>
-                {isOpen && (
-                  <DrawerPanelBody>
-                    <p>{activePanel.currentPagePath}</p>
-                    <Button variant="link" onClick={reset}>
-                      Reset lab
-                    </Button>
-                  </DrawerPanelBody>
-                )}
+                <DrawerPanelBody>
+                    <Title headingLevel="h2">
+                      <span dangerouslySetInnerHTML={{
+                        __html: renderState.status === "success"
+                          ? renderState.result.title ?? activePanel.currentPagePath
+                          : "",
+                      }} />
+                    </Title>
+                    {navigationWarning && <Alert variant="warning" title={navigationWarning} isInline />}
+                    {renderState.status === "loading" && <Spinner aria-label="Loading lab page" />}
+                    {renderState.status === "error" && (
+                      <>
+                        <Alert variant="danger" title={renderState.message} isInline isLiveRegion />
+                        <Button variant="link" onClick={() => setRenderRetry((count) => count + 1)}>Retry</Button>
+                      </>
+                    )}
+                    {renderState.status === "success" && (
+                      <>
+                        {renderState.result.warnings.map((warning, index) => (
+                          <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
+                        ))}
+                        <div
+                          ref={renderedContentRef}
+                          className="interactive-labs-content doc"
+                          onClick={handleRenderedLink}
+                          dangerouslySetInnerHTML={{ __html: renderState.result.html }}
+                        />
+                      </>
+                    )}
+                </DrawerPanelBody>
               </DrawerPanelContent>
-            }
+            ) : null}
           >
             <div />
           </DrawerContent>
@@ -246,6 +413,10 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
             minWidth: 0,
             height: "5rem",
             padding: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            borderRadius: "5rem 0 0 5rem",
             transform: "translateY(-50%)",
           }}
         >
@@ -260,6 +431,78 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
 
 const useInteractiveLabs = (): InteractiveLabsContextValue | undefined =>
   React.useContext(InteractiveLabsContext);
+
+const CatalogDescription: React.FC<{ item: CatalogEntry }> = ({ item }) => {
+  const [state, setState] = React.useState<RenderState>({ status: "loading" });
+  const [linkWarning, setLinkWarning] = React.useState<string>();
+  const interactiveLabs = useInteractiveLabs();
+  const sourceURL = `${PROXY_BASE}/api/v1alpha1/labs/${item.catalogRef}/resources/${item.labPath}/lab.yaml`;
+
+  const handleLink = React.useCallback((event: React.MouseEvent<HTMLDivElement>): void => {
+    if (event.defaultPrevented || event.button !== 0) return;
+    const link = (event.target as Element).closest("a[href]") as HTMLAnchorElement | null;
+    const href = link?.getAttribute("href");
+    if (!link || !href) return;
+    let target: URL;
+    try {
+      target = new URL(href, new URL(sourceURL, window.location.origin));
+    } catch {
+      event.preventDefault();
+      setLinkWarning(LINK_WARNING);
+      return;
+    }
+    const pageRoot = `${PROXY_BASE}/api/v1alpha1/labs/${item.catalogRef}/resources/${item.labPath}/content/`;
+    if (target.origin === window.location.origin && target.pathname.startsWith(pageRoot)) {
+      event.preventDefault();
+      void interactiveLabs?.launch(item.catalogRef, link, target.href);
+      return;
+    }
+    if ((target.protocol === "http:" || target.protocol === "https:") && target.origin !== window.location.origin) {
+      event.preventDefault();
+      window.open(target.href, "_blank", "noopener,noreferrer");
+      return;
+    }
+    if (target.origin === window.location.origin && !target.pathname.startsWith(PROXY_BASE)) return;
+    event.preventDefault();
+    setLinkWarning(LINK_WARNING);
+  }, [interactiveLabs, item.catalogRef, item.labPath, sourceURL]);
+
+  React.useEffect(() => {
+    if (!item.description) return undefined;
+    const controller = new AbortController();
+    void renderAsciiDoc({
+      source: item.description,
+      sourceURL,
+      attributes: {},
+      loadResource: fetchResourceText,
+      signal: controller.signal,
+    }).then(
+      (result) => {
+        if (!controller.signal.aborted) setState({ status: "success", result });
+      },
+      (error: unknown) => {
+        if (!controller.signal.aborted) {
+          setState({ status: "error", message: (error as Error).message || "Unable to render description." });
+        }
+      },
+    );
+    return () => controller.abort();
+  }, [item]);
+
+  if (state.status === "loading") return <Spinner aria-label={`Loading description for ${item.displayName}`} />;
+  if (state.status === "error") return <Alert variant="warning" title={state.message} isInline />;
+  return (
+    <>
+      {linkWarning && <Alert variant="warning" title={linkWarning} isInline />}
+      {state.result.warnings.map((warning, index) => <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />)}
+      <div
+        className="interactive-labs-content doc"
+        onClick={handleLink}
+        dangerouslySetInnerHTML={{ __html: state.result.html }}
+      />
+    </>
+  );
+};
 
 const InteractiveLabsPage: React.FC = () => {
   const [state, setState] = React.useState<PageState>({ status: "loading" });
@@ -392,7 +635,7 @@ const InteractiveLabsPage: React.FC = () => {
                         aria-label={`Description for ${item.displayName}`}
                         isHidden={!isExpanded}
                       >
-                        {item.description}
+                        <CatalogDescription item={item} />
                       </DataListContent>
                     )}
                   </DataListItem>

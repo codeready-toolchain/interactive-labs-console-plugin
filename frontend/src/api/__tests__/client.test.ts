@@ -2,7 +2,7 @@
 // consoleFetch is stubbed via moduleNameMapper → src/__mocks__/dynamic-plugin-sdk.ts
 
 import { consoleFetch } from "@openshift-console/dynamic-plugin-sdk";
-import { listCatalog, loadLabBundle, setupLab } from "../client";
+import { fetchResourceText, listCatalog, loadLabBundle, setupLab } from "../client";
 
 const mockFetch = consoleFetch as jest.MockedFunction<typeof consoleFetch>;
 
@@ -27,7 +27,7 @@ function validBundle() {
       metadata: { name: "l1", displayName: "L" },
       spec: {},
     },
-    pages: { "010-intro.adoc": "= Intro" },
+    pages: [{ path: "010-intro.adoc", url: "api/v1alpha1/labs/l1/resources/lab/content/010-intro.adoc" }],
     runtimeContext: { catalogRef: "l1", branch: "main", helmChartAvailable: false },
   };
 }
@@ -55,6 +55,18 @@ describe("listCatalog", () => {
     expect(result).toEqual(catalogBody);
   });
 
+  it("rejects catalog entries without normalized labPath", async () => {
+    mockFetch.mockResolvedValueOnce(
+      makeJsonResponse({
+        apiVersion: "v1alpha1",
+        kind: "CatalogList",
+        items: [{ catalogRef: "l1", displayName: "Lab", labPath: "labs/../escape" }],
+      }),
+    );
+
+    await expect(listCatalog()).rejects.toThrow("catalog_invalid");
+  });
+
   it("parses non-2xx as LabError", async () => {
     const errBody = { apiVersion: "v1alpha1", kind: "Error", type: "catalog_unavailable", message: "down" };
     mockFetch.mockResolvedValueOnce(makeJsonResponse(errBody, 503));
@@ -72,6 +84,12 @@ describe("loadLabBundle", () => {
     const [url] = mockFetch.mock.calls[0];
     expect(url).toBe(`${PROXY_BASE}/api/v1alpha1/labs/l1/bundle`);
     expect(result.manifest.metadata.name).toBe("l1");
+    expect(result.pages).toEqual([
+      {
+        path: "010-intro.adoc",
+        url: `${PROXY_BASE}/api/v1alpha1/labs/l1/resources/lab/content/010-intro.adoc`,
+      },
+    ]);
   });
 
   it("parses lab_not_found error on 404", async () => {
@@ -115,16 +133,49 @@ describe("loadLabBundle", () => {
     });
   });
 
-  it("rejects missing pages and non-string page source", async () => {
+  it("rejects missing pages and malformed page descriptors", async () => {
     await expectBundleValidationFailure({ ...validBundle(), pages: undefined });
-    await expectBundleValidationFailure({ ...validBundle(), pages: { "010-intro.adoc": 42 } });
+    await expectBundleValidationFailure({ ...validBundle(), pages: [{ path: "010-intro.adoc", url: 42 }] });
+    await expectBundleValidationFailure({ ...validBundle(), pages: [{ path: "../escape.adoc", url: "api/v1alpha1/labs/l1/resources/escape.adoc" }] });
   });
 
-  it("rejects a bundle with no navigable page", async () => {
+  it("rejects duplicate, include-only, and proxy-escaping descriptors", async () => {
+    const page = validBundle().pages[0];
+    await expectBundleValidationFailure({ ...validBundle(), pages: [page, page] });
     await expectBundleValidationFailure({
       ...validBundle(),
-      pages: { "_shared/notice.adoc": "include", "chapter/_shared/tip.adoc": "include" },
+      pages: [{ path: "_shared/notice.adoc", url: "api/v1alpha1/labs/l1/resources/lab/content/_shared/notice.adoc" }],
     });
+    await expectBundleValidationFailure({
+      ...validBundle(),
+      pages: [{ path: "010-intro.adoc", url: "https://untrusted.example/intro.adoc" }],
+    });
+    await expectBundleValidationFailure({
+      ...validBundle(),
+      pages: [{ path: "010-intro.adoc", url: "../escape.adoc" }],
+    });
+  });
+});
+
+describe("fetchResourceText", () => {
+  it("fetches only a proxy-resolved approved resource and preserves cancellation", async () => {
+    const controller = new AbortController();
+    mockFetch.mockResolvedValueOnce({ ok: true, text: () => Promise.resolve("= Safe page") } as Response);
+
+    await expect(
+      fetchResourceText(`${PROXY_BASE}/api/v1alpha1/labs/l1/resources/lab/content/intro.adoc`, controller.signal),
+    ).resolves.toBe("= Safe page");
+    expect(mockFetch).toHaveBeenCalledWith(
+      `${PROXY_BASE}/api/v1alpha1/labs/l1/resources/lab/content/intro.adoc`,
+      { signal: controller.signal },
+    );
+  });
+
+  it("rejects a resource URL outside its Console proxy boundary", async () => {
+    await expect(fetchResourceText("https://evil.example/intro.adoc", new AbortController().signal)).rejects.toThrow(
+      "resource_invalid",
+    );
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 });
 

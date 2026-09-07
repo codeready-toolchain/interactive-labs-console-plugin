@@ -11,6 +11,7 @@ export type LabErrorType =
   | "rbac_denied"
   | "chart_not_found"
   | "setup_conflict"
+  | "runtime_attributes_unavailable"
   | "unknown_error";
 
 const KNOWN_ERROR_TYPES = new Set<string>([
@@ -26,6 +27,7 @@ const KNOWN_ERROR_TYPES = new Set<string>([
   "rbac_denied",
   "chart_not_found",
   "setup_conflict",
+  "runtime_attributes_unavailable",
   "unknown_error",
 ]);
 

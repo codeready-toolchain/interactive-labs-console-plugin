@@ -9,16 +9,16 @@ import type { LabError, LabErrorType } from "../errors";
 
 describe("CatalogEntry shape", () => {
   it("requires catalogRef and displayName; description is optional", () => {
-    const e: CatalogEntry = { catalogRef: "x", displayName: "X" };
+    const e: CatalogEntry = { catalogRef: "x", displayName: "X", labPath: "lab" };
     expect(e.catalogRef).toBe("x");
-    const withDesc: CatalogEntry = { catalogRef: "y", displayName: "Y", description: "d" };
+    const withDesc: CatalogEntry = { catalogRef: "y", displayName: "Y", description: "d", labPath: "lab" };
     expect(withDesc.description).toBe("d");
   });
 });
 
 describe("CatalogList shape", () => {
   it("has correct apiVersion and kind literals", () => {
-    const entry: CatalogEntry = { catalogRef: "a", displayName: "A" };
+    const entry: CatalogEntry = { catalogRef: "a", displayName: "A", labPath: "lab" };
     const list: CatalogList = { apiVersion: "v1alpha1", kind: "CatalogList", items: [entry] };
     expect(list.kind).toBe("CatalogList");
     expect(list.apiVersion).toBe("v1alpha1");
@@ -52,7 +52,7 @@ describe("LabManifest shape", () => {
 });
 
 describe("LabBundle shape", () => {
-  it("has manifest, pages map, and runtimeContext", () => {
+  it("has manifest, page descriptors, and runtimeContext", () => {
     const ctx: RuntimeContext = { catalogRef: "l1", branch: "main", helmChartAvailable: false };
     const manifest: LabManifest = {
       apiVersion: "v1alpha1",
@@ -64,7 +64,7 @@ describe("LabBundle shape", () => {
       apiVersion: "v1alpha1",
       kind: "LabBundle",
       manifest,
-      pages: { "010-intro.adoc": "= Intro\n\nHello." },
+      pages: [{ path: "010-intro.adoc", url: "/api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/labs/l1/resources/lab/content/010-intro.adoc" }],
       runtimeContext: ctx,
     };
     expect(bundle.kind).toBe("LabBundle");

@@ -45,7 +45,7 @@ Users need to launch a selected supported lab beside Console work with predictab
 
 **Dependencies:** STORY-1, STORY-2.
 
-## ☐ STORY-4: Render restricted AsciiDoc and navigate lab pages
+## ☑ STORY-4: Render restricted AsciiDoc and navigate lab pages
 
 Lab authors need inter-linked instructions without content executing code, escaping its bundle, or injecting unsafe Console DOM.
 
