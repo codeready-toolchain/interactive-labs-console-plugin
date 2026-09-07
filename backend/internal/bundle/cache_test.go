@@ -43,11 +43,19 @@ spec: {}`), 0o600); err != nil {
 	return os.WriteFile(filepath.Join(lab, "content", "intro.adoc"), []byte("= Test"), 0o600)
 }
 
+func testCache(root string, clone func(context.Context, string, string, string) error) *Cache {
+	cache := newCache(root, clone)
+	cache.getRepoRevision = func(string) (string, error) {
+		return "0000000000000000000000000000000000000000", nil
+	}
+	return cache
+}
+
 func TestCache_ReusesSuccessfulSnapshotByRepositoryAndBranch(t *testing.T) {
 	root := t.TempDir()
 	var mu sync.Mutex
 	clones := 0
-	cache := newCache(root, func(_ context.Context, _, _, destination string) error {
+	cache := testCache(root, func(_ context.Context, _, _, destination string) error {
 		mu.Lock()
 		clones++
 		mu.Unlock()
@@ -67,9 +75,66 @@ func TestCache_ReusesSuccessfulSnapshotByRepositoryAndBranch(t *testing.T) {
 	mu.Unlock()
 }
 
+func TestCache_CachesRevisionInMemoryWithoutSnapshotMetadata(t *testing.T) {
+	const (
+		repository = "https://example.test/labs.git"
+		branch     = "main"
+		etag       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	)
+	clones, revisions := 0, 0
+	cache := newCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
+		clones++
+		return writeSnapshotLab(destination, "lab")
+	})
+	cache.getRepoRevision = func(string) (string, error) {
+		revisions++
+		return etag, nil
+	}
+
+	for range 2 {
+		resource, err := cache.Read(context.Background(), repository, branch, "lab", "lab/content/intro.adoc")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("= Test"), resource.Bytes)
+	}
+	assert.Equal(t, 1, clones)
+	assert.Equal(t, 1, revisions)
+	_, err := os.Stat(filepath.Join(cache.root, snapshotID(repository, branch), "snapshot.json"))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestCache_ResolvesRevisionOnceForExistingCheckout(t *testing.T) {
+	const (
+		repository = "https://example.test/labs.git"
+		branch     = "main"
+		etag       = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	root := t.TempDir()
+	destination := filepath.Join(root, snapshotID(repository, branch), "content")
+	require.NoError(t, writeSnapshotLab(destination, "lab"))
+
+	revisions := 0
+	cache := newCache(root, func(context.Context, string, string, string) error {
+		return errors.New("must not clone")
+	})
+	cache.getRepoRevision = func(gotDestination string) (string, error) {
+		assert.Equal(t, destination, gotDestination)
+		revisions++
+		return etag, nil
+	}
+
+	_, err := cache.Load(context.Background(), repository, branch, "lab")
+	require.NoError(t, err)
+	for range 2 {
+		resource, err := cache.Read(context.Background(), repository, branch, "lab", "lab/content/intro.adoc")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("= Test"), resource.Bytes)
+	}
+	assert.Equal(t, 1, revisions)
+}
+
 func TestCache_SeparatesRepositoryAndBranch(t *testing.T) {
 	clones := 0
-	cache := newCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
+	cache := testCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
 		clones++
 		return writeSnapshotLab(destination, "lab")
 	})
@@ -85,7 +150,7 @@ func TestCache_ConcurrentSameSourceClonesOnce(t *testing.T) {
 	release := make(chan struct{})
 	var mu sync.Mutex
 	clones := 0
-	cache := newCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
+	cache := testCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
 		mu.Lock()
 		clones++
 		mu.Unlock()
@@ -144,14 +209,14 @@ func TestCache_UsesHashedEntryWithContentSnapshot(t *testing.T) {
 	root := t.TempDir()
 	const repository = "https://example.test/labs.git"
 	const branch = "main"
-	cache := newCache(root, func(_ context.Context, _, _, destination string) error {
+	cache := testCache(root, func(_ context.Context, _, _, destination string) error {
 		return writeSnapshotLab(destination, "lab")
 	})
 
 	_, err := cache.Load(context.Background(), repository, branch, "lab")
 	require.NoError(t, err)
 
-	sum := sha256.Sum256([]byte(`{"branch":"main","repository":"https://example.test/labs.git"}`))
+	sum := sha256.Sum256([]byte("https://example.test/labs.git|main"))
 	entry := filepath.Join(root, fmt.Sprintf("%x", sum))
 	_, err = os.Stat(filepath.Join(entry, "content"))
 	require.NoError(t, err)
@@ -159,7 +224,7 @@ func TestCache_UsesHashedEntryWithContentSnapshot(t *testing.T) {
 }
 
 func TestCache_ClonesIntoReservedEmptyTemporaryDirectory(t *testing.T) {
-	cache := newCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
+	cache := testCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
 		entries, err := os.ReadDir(destination)
 		require.NoError(t, err)
 		assert.Empty(t, entries)
@@ -193,11 +258,11 @@ func TestCache_ReusesExistingContentSnapshot(t *testing.T) {
 	root := t.TempDir()
 	const repository = "https://example.test/labs.git"
 	const branch = "main"
-	sum := sha256.Sum256([]byte(`{"branch":"main","repository":"https://example.test/labs.git"}`))
+	sum := sha256.Sum256([]byte("https://example.test/labs.git|main"))
 	require.NoError(t, writeSnapshotLab(filepath.Join(root, fmt.Sprintf("%x", sum), "content"), "lab"))
 
 	cloned := false
-	cache := newCache(root, func(context.Context, string, string, string) error {
+	cache := testCache(root, func(context.Context, string, string, string) error {
 		cloned = true
 		return errors.New("must not clone")
 	})
@@ -209,7 +274,7 @@ func TestCache_ReusesExistingContentSnapshot(t *testing.T) {
 func TestCache_RetriesFailedCloneAfterRemovingTemporarySibling(t *testing.T) {
 	root := t.TempDir()
 	attempts := 0
-	cache := newCache(root, func(_ context.Context, _, _, destination string) error {
+	cache := testCache(root, func(_ context.Context, _, _, destination string) error {
 		attempts++
 		if err := writeSnapshotLab(destination, "lab"); err != nil {
 			return err
@@ -222,7 +287,7 @@ func TestCache_RetriesFailedCloneAfterRemovingTemporarySibling(t *testing.T) {
 
 	_, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", "lab")
 	require.ErrorIs(t, err, ErrRepositoryUnavailable)
-	sum := sha256.Sum256([]byte(`{"branch":"main","repository":"https://example.test/labs.git"}`))
+	sum := sha256.Sum256([]byte("https://example.test/labs.git|main"))
 	entry := filepath.Join(root, fmt.Sprintf("%x", sum))
 	entries, err := os.ReadDir(entry)
 	require.NoError(t, err)
@@ -237,7 +302,7 @@ func TestCache_PublishesContentOnlyAfterCloneCompletes(t *testing.T) {
 	root := t.TempDir()
 	started := make(chan struct{})
 	release := make(chan struct{})
-	cache := newCache(root, func(_ context.Context, _, _, destination string) error {
+	cache := testCache(root, func(_ context.Context, _, _, destination string) error {
 		if err := writeSnapshotLab(destination, "lab"); err != nil {
 			return err
 		}
@@ -263,7 +328,7 @@ func TestCache_CloseWaitsAndPreservesSuccessfulContent(t *testing.T) {
 	root := t.TempDir()
 	started := make(chan struct{})
 	release := make(chan struct{})
-	cache := newCache(root, func(_ context.Context, _, _, destination string) error {
+	cache := testCache(root, func(_ context.Context, _, _, destination string) error {
 		close(started)
 		<-release
 		return writeSnapshotLab(destination, "lab")
@@ -289,14 +354,14 @@ func TestCache_CloseWaitsAndPreservesSuccessfulContent(t *testing.T) {
 	close(release)
 	require.NoError(t, <-loadDone)
 	require.NoError(t, <-closeDone)
-	sum := sha256.Sum256([]byte(`{"branch":"main","repository":"https://example.test/labs.git"}`))
+	sum := sha256.Sum256([]byte("https://example.test/labs.git|main"))
 	_, err := os.Stat(filepath.Join(root, fmt.Sprintf("%x", sum), "content"))
 	require.NoError(t, err)
 }
 
 func TestCache_RejectsUnsafeLabPathBeforeClone(t *testing.T) {
 	called := false
-	cache := newCache(t.TempDir(), func(context.Context, string, string, string) error { called = true; return nil })
+	cache := testCache(t.TempDir(), func(context.Context, string, string, string) error { called = true; return nil })
 	_, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", "../lab")
 	require.ErrorIs(t, err, ErrLabInvalid)
 	assert.False(t, called)

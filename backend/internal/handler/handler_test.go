@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -48,7 +50,12 @@ func newRouter(t *testing.T) http.Handler {
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Manifest Lab", Description: "Manifest description"}},
-				Pages:    map[string]string{"intro.adoc": "= Intro"},
+				Pages:    []string{"intro.adoc"},
+			}, nil
+		},
+		RuntimeAttributes: func(_ *http.Request, subject string) (map[string]string, error) {
+			return map[string]string{
+				"user": subject, "openshift_api_url": "https://api.example.test", "openshift_console_url": "https://console.example.test", "openshift_cluster_ingress_domain": "apps.example.test",
 			}, nil
 		},
 	})
@@ -87,7 +94,7 @@ func TestCatalogHandler_ReturnsItemsInDeclaredOrder(t *testing.T) {
 			if strings.Contains(repository, "lab-z") {
 				name = "Lab Z"
 			}
-			return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: name, DisplayName: name}}, Pages: map[string]string{"intro.adoc": "= Intro"}}, nil
+			return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: name, DisplayName: name}}, Pages: []string{"intro.adoc"}}, nil
 		},
 	})
 	rw := httptest.NewRecorder()
@@ -104,6 +111,19 @@ func TestCatalogHandler_ReturnsItemsInDeclaredOrder(t *testing.T) {
 	// catalogRef must be present, id must not
 	assert.Contains(t, items[0].(map[string]any), "catalogRef")
 	assert.NotContains(t, items[0].(map[string]any), "id")
+}
+
+func TestCatalogHandler_ExposesNormalizedLabPathWithoutDescriptionURL(t *testing.T) {
+	rw := httptest.NewRecorder()
+	newRouter(t).ServeHTTP(rw, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil))
+
+	require.Equal(t, http.StatusOK, rw.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+	item := body["items"].([]any)[0].(map[string]any)
+	assert.Equal(t, "lab", item["labPath"])
+	assert.Equal(t, "Manifest description", item["description"])
+	assert.NotContains(t, item, "descriptionUrl")
 }
 
 func TestCatalogHandler_NoAuthorizationEchoed(t *testing.T) {
@@ -316,6 +336,30 @@ func TestCatalogHandler_ExposesCatalogRef(t *testing.T) {
 	assert.NotContains(t, item, "attributeOverrides", "attributeOverrides must not be exposed to browser")
 }
 
+func TestBundleHandler_ReturnsSortedNavigablePageDescriptors(t *testing.T) {
+	ref := goodCatalogRef()
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
+	req.Header.Set("Authorization", "Bearer user1")
+	newRouter(t).ServeHTTP(rw, req)
+
+	require.Equal(t, http.StatusOK, rw.Code)
+	var body struct {
+		Pages []struct {
+			Path string `json:"path"`
+			URL  string `json:"url"`
+		} `json:"pages"`
+	}
+	require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+	assert.Equal(t, []struct {
+		Path string `json:"path"`
+		URL  string `json:"url"`
+	}{
+		{Path: "intro.adoc", URL: "api/v1alpha1/labs/" + ref + "/resources/lab/content/intro.adoc"},
+	}, body.Pages)
+	assert.NotContains(t, rw.Body.String(), "= Intro")
+}
+
 func TestBundleHandler_RequiresAuth(t *testing.T) {
 	ref := goodCatalogRef()
 	rw := httptest.NewRecorder()
@@ -342,8 +386,8 @@ func TestBundleHandler_RuntimeContextUsesCatalogRef(t *testing.T) {
 }
 
 func TestBundleHandler_AttributeMergeOrder(t *testing.T) {
-	// Build a catalog entry with attributeOverrides
-	overrides := map[string]string{"k": "catalog-val", "catalog-only": "yes"}
+	// Build a catalog entry with attributeOverrides.
+	overrides := map[string]string{"user": "catalog-val", "catalog-only": "yes"}
 	ref := catalog.DeriveRef("https://github.com/redhat/lab", "main", ".", overrides)
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: stubCatalogCM(map[string]string{
@@ -352,7 +396,7 @@ func TestBundleHandler_AttributeMergeOrder(t *testing.T) {
   branch: "main"
   labPath: "."
   attributeOverrides:
-    k: catalog-val
+    user: catalog-val
     catalog-only: yes`,
 		}),
 		Authenticate: func(_ context.Context, token string) (string, error) { return token, nil },
@@ -362,13 +406,15 @@ func TestBundleHandler_AttributeMergeOrder(t *testing.T) {
 					APIVersion: "v1alpha1",
 					Kind:       "Lab",
 					Metadata:   manifest.Metadata{Name: "lab", DisplayName: "Lab"},
-					Spec:       manifest.Spec{Attributes: map[string]string{"k": "manifest-val", "manifest-only": "yes"}},
+					Spec:       manifest.Spec{Attributes: map[string]string{"user": "manifest-val", "manifest-only": "yes"}},
 				},
-				Pages: map[string]string{"intro.adoc": "= Intro"},
+				Pages: []string{"intro.adoc"},
 			}, nil
 		},
-		RuntimeAttributes: func(_ *http.Request, _ string) map[string]string {
-			return map[string]string{"k": "runtime-val", "runtime-only": "yes"}
+		RuntimeAttributes: func(_ *http.Request, _ string) (map[string]string, error) {
+			return map[string]string{
+				"user": "runtime-val", "openshift_api_url": "https://api.example.test", "openshift_console_url": "https://console.example.test", "openshift_cluster_ingress_domain": "apps.example.test",
+			}, nil
 		},
 	})
 	rw := httptest.NewRecorder()
@@ -381,10 +427,46 @@ func TestBundleHandler_AttributeMergeOrder(t *testing.T) {
 	m := body["manifest"].(map[string]any)
 	spec := m["spec"].(map[string]any)
 	attrs := spec["attributes"].(map[string]any)
-	assert.Equal(t, "runtime-val", attrs["k"], "runtime must win over catalog and manifest")
+	assert.Equal(t, "runtime-val", attrs["user"], "runtime must win over catalog and manifest")
 	assert.Equal(t, "yes", attrs["manifest-only"], "manifest-only key must be present")
 	assert.Equal(t, "yes", attrs["catalog-only"], "catalog-only key must be present")
-	assert.Equal(t, "yes", attrs["runtime-only"], "runtime-only key must be present")
+	assert.Equal(t, "https://api.example.test", attrs["openshift_api_url"], "runtime values must be present")
+}
+
+func TestBundleHandler_RuntimeAttributesAreAllOrSafeFailure(t *testing.T) {
+	ref := goodCatalogRef()
+	for _, tc := range []struct {
+		name  string
+		attrs map[string]string
+		err   error
+	}{
+		{name: "callback failure", err: errors.New("cluster config unavailable")},
+		{name: "incomplete values", attrs: map[string]string{
+			"user": "user1", "openshift_api_url": "https://api.example.test", "openshift_console_url": "https://console.example.test",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router := handler.NewRouter(handler.Config{
+				CatalogSource: goodCatalogCM,
+				Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+				BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
+					return &bundle.Result{Manifest: &manifest.LabManifest{}, Pages: []string{"intro.adoc"}}, nil
+				},
+				RuntimeAttributes: func(_ *http.Request, _ string) (map[string]string, error) {
+					return tc.attrs, tc.err
+				},
+			})
+			rw := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
+			req.Header.Set("Authorization", "Bearer user1")
+			router.ServeHTTP(rw, req)
+
+			require.Equal(t, http.StatusServiceUnavailable, rw.Code)
+			var body map[string]any
+			require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+			assert.Equal(t, "runtime_attributes_unavailable", body["type"])
+		})
+	}
 }
 
 func TestSetupHandler_ReleaseNameExcludesRuntimeAttrs(t *testing.T) {
@@ -395,7 +477,9 @@ func TestSetupHandler_ReleaseNameExcludesRuntimeAttrs(t *testing.T) {
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{Manifest: &manifest.LabManifest{}}, nil
 			},
-			RuntimeAttributes: func(_ *http.Request, _ string) map[string]string { return runtimeAttrs },
+			RuntimeAttributes: func(_ *http.Request, _ string) (map[string]string, error) {
+				return runtimeAttrs, nil
+			},
 		})
 	}
 	ref := goodCatalogRef()
@@ -431,7 +515,7 @@ func TestCatalogHandler_UsesManifestMetadataAndOmitsOnlyClassifiedFailures(t *te
 			if strings.Contains(repository, "missing") {
 				return nil, fmt.Errorf("%w: private details", bundle.ErrManifestMissing)
 			}
-			return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: "good", DisplayName: "Manifest name", Description: "Manifest description"}}, Pages: map[string]string{"intro.adoc": "= Intro"}}, nil
+			return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: "good", DisplayName: "Manifest name", Description: "Manifest description"}}, Pages: []string{"intro.adoc"}}, nil
 		},
 		Logger:            slog.New(slog.NewJSONHandler(&logs, nil)),
 		CatalogLabOmitted: func(_ context.Context, ref, reason string) { warnings = append(warnings, ref+":"+reason) },
@@ -469,6 +553,216 @@ func TestCatalogHandler_UnexpectedLoaderFailureIsNotOmitted(t *testing.T) {
 	rw := httptest.NewRecorder()
 	router.ServeHTTP(rw, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil))
 	assert.Equal(t, http.StatusBadGateway, rw.Code)
+}
+
+// --- GET /api/v1alpha1/labs/{catalogRef}/resources/{repositoryRelativePath...} ---
+
+func TestResourceHandler_ServesApprovedResourcesWithSafeHeaders(t *testing.T) {
+	root := resourceFixture(t)
+	ref := goodCatalogRef()
+	router := resourceRouter(t, goodCatalogCM, root, "abc123")
+
+	for _, tc := range []struct {
+		name        string
+		resource    string
+		wantBody    []byte
+		contentType string
+	}{
+		{name: "page", resource: "lab/content/intro.adoc", wantBody: []byte("= Intro\n"), contentType: "text/plain; charset=utf-8"},
+		{name: "partial", resource: "lab/partials/_shared.adoc", wantBody: []byte("Shared\n"), contentType: "text/plain; charset=utf-8"},
+		{name: "raster", resource: "lab/images/pixel.png", wantBody: pngBytes(), contentType: "image/png"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rw := resourceRequest(t, router, ref, tc.resource)
+			require.Equal(t, http.StatusOK, rw.Code)
+			assert.Equal(t, tc.wantBody, rw.Body.Bytes())
+			assert.Equal(t, tc.contentType, rw.Header().Get("Content-Type"))
+			assert.Equal(t, "nosniff", rw.Header().Get("X-Content-Type-Options"))
+			assert.Equal(t, "private, no-cache", rw.Header().Get("Cache-Control"))
+			assert.Equal(t, `"abc123"`, rw.Header().Get("ETag"))
+		})
+	}
+}
+
+func TestResourceHandler_SniffsContentTypeAfterLoading(t *testing.T) {
+	ref := goodCatalogRef()
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
+			return "abc123", nil
+		},
+		ResourceLoader: func(context.Context, string, string, string, string) (*bundle.Resource, error) {
+			return &bundle.Resource{Bytes: []byte("= Intro\n")}, nil
+		},
+	})
+
+	rw := resourceRequest(t, router, ref, "lab/content/intro.adoc")
+
+	require.Equal(t, http.StatusOK, rw.Code)
+	assert.Equal(t, "text/plain; charset=utf-8", rw.Header().Get("Content-Type"))
+}
+
+func TestResourceHandler_ReturnsNotModifiedBeforeLoadingResource(t *testing.T) {
+	loads := 0
+	ref := goodCatalogRef()
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
+			return "abc123", nil
+		},
+		ResourceLoader: func(context.Context, string, string, string, string) (*bundle.Resource, error) {
+			loads++
+			return nil, errors.New("resource loader must not run")
+		},
+	})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/labs/"+ref+"/resources/lab/content/intro.adoc", nil)
+	request.Header.Set("Authorization", "Bearer user1")
+	request.Header.Set("If-None-Match", `"abc123"`)
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, request)
+
+	assert.Equal(t, http.StatusNotModified, recorder.Code)
+	assert.Zero(t, loads)
+	assert.Equal(t, `"abc123"`, recorder.Header().Get("ETag"))
+	assert.Equal(t, "private, no-cache", recorder.Header().Get("Cache-Control"))
+}
+
+func TestResourceHandler_HonorsQuotedETagForConditionalGET(t *testing.T) {
+	root := resourceFixture(t)
+	ref := goodCatalogRef()
+	router := resourceRouter(t, goodCatalogCM, root, "abc123")
+
+	for _, tc := range []struct {
+		name        string
+		ifNoneMatch string
+		wantStatus  int
+		wantBody    []byte
+	}{
+		{name: "mismatch", ifNoneMatch: `"other"`, wantStatus: http.StatusOK, wantBody: []byte("= Intro\n")},
+		{name: "quoted exact match", ifNoneMatch: `"abc123"`, wantStatus: http.StatusNotModified},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rw := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+				"/api/v1alpha1/labs/"+ref+"/resources/lab/content/intro.adoc", nil)
+			req.Header.Set("Authorization", "Bearer user1")
+			req.Header.Set("If-None-Match", tc.ifNoneMatch)
+			router.ServeHTTP(rw, req)
+
+			assert.Equal(t, tc.wantStatus, rw.Code)
+			assert.Equal(t, `"abc123"`, rw.Header().Get("ETag"))
+			assert.Equal(t, tc.wantBody, rw.Body.Bytes())
+		})
+	}
+}
+
+func TestResourceHandler_RejectsInvalidResources(t *testing.T) {
+	root := resourceFixture(t)
+	outside := filepath.Join(t.TempDir(), "outside.adoc")
+	require.NoError(t, os.WriteFile(outside, []byte("outside"), 0o600))
+	require.NoError(t, os.Symlink(outside, filepath.Join(root, "lab", "content", "escape.adoc")))
+	require.NoError(t, os.Symlink("intro.adoc", filepath.Join(root, "lab", "content", "link.adoc")))
+
+	ref := goodCatalogRef()
+	router := resourceRouter(t, goodCatalogCM, root, "abc123")
+	for _, tc := range []struct {
+		name       string
+		resource   string
+		wantStatus int
+		wantType   string
+	}{
+		{name: "missing", resource: "lab/content/missing.adoc", wantStatus: http.StatusNotFound, wantType: "content_error"},
+		{name: "remote", resource: "https:%2F%2Fexample.test%2Foutside.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+		{name: "absolute", resource: "%2Fetc%2Fpasswd", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+		{name: "repository escape", resource: "lab%2Fcontent%2F..%2F..%2Foutside.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+		{name: "directory", resource: "lab/content", wantStatus: http.StatusUnprocessableEntity, wantType: "content_error"},
+		{name: "symlink escape", resource: "lab/content/escape.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+		{name: "symlink", resource: "lab/content/link.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rw := resourceRequest(t, router, ref, tc.resource)
+			require.Equal(t, tc.wantStatus, rw.Code)
+			var body map[string]any
+			require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+			assert.Equal(t, tc.wantType, body["type"])
+		})
+	}
+}
+
+func TestResourceHandler_DerivesSourceOnlyFromCatalogRef(t *testing.T) {
+	const (
+		repository = "https://github.com/redhat/selected"
+		branch     = "stable"
+		labPath    = "selected-lab"
+	)
+	ref := catalog.DeriveRef(repository, branch, labPath, nil)
+	var gotRepository, gotBranch, gotLabPath string
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: stubCatalogCM(map[string]string{"catalog.yaml": `- repository: https://github.com/redhat/other
+  branch: main
+  labPath: other-lab
+- repository: https://github.com/redhat/selected
+  branch: stable
+  labPath: selected-lab`}),
+		Authenticate: func(_ context.Context, token string) (string, error) { return token, nil },
+		SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
+			return "abc123", nil
+		},
+		ResourceLoader: func(_ context.Context, repository, branch, labPath, resourcePath string) (*bundle.Resource, error) {
+			gotRepository, gotBranch, gotLabPath = repository, branch, labPath
+			assert.Equal(t, "selected-lab/content/intro.adoc", resourcePath)
+			return &bundle.Resource{Bytes: []byte("= Intro\n")}, nil
+		},
+	})
+
+	rw := resourceRequest(t, router, ref, "selected-lab/content/intro.adoc")
+	require.Equal(t, http.StatusOK, rw.Code)
+	assert.Equal(t, repository, gotRepository)
+	assert.Equal(t, branch, gotBranch)
+	assert.Equal(t, labPath, gotLabPath)
+}
+
+func resourceRouter(t *testing.T, catalogSource func(context.Context) (*corev1.ConfigMap, error), root, etag string) http.Handler {
+	t.Helper()
+	return handler.NewRouter(handler.Config{
+		CatalogSource: catalogSource,
+		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
+			return etag, nil
+		},
+		ResourceLoader: func(_ context.Context, _, _, _, resourcePath string) (*bundle.Resource, error) {
+			return bundle.ReadResource(root, resourcePath)
+		},
+	})
+}
+
+func resourceRequest(t *testing.T, router http.Handler, catalogRef, resourcePath string) *httptest.ResponseRecorder {
+	t.Helper()
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		"/api/v1alpha1/labs/"+catalogRef+"/resources/"+resourcePath, nil)
+	req.Header.Set("Authorization", "Bearer user1")
+	router.ServeHTTP(rw, req)
+	return rw
+}
+
+func resourceFixture(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, dir := range []string{"lab/content", "lab/partials", "lab/images"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, dir), 0o755))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(root, "lab", "content", "intro.adoc"), []byte("= Intro\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "lab", "partials", "_shared.adoc"), []byte("Shared\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "lab", "images", "pixel.png"), pngBytes(), 0o600))
+	return root
+}
+
+func pngBytes() []byte {
+	return []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
 }
 
 // helpers

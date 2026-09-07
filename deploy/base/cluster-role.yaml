@@ -1,0 +1,22 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: interactive-labs-runtime-config-reader
+rules:
+  - apiGroups: ["config.openshift.io"]
+    resources: ["infrastructures", "ingresses", "consoles"]
+    resourceNames: ["cluster"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: interactive-labs-runtime-config-reader
+subjects:
+  - kind: ServiceAccount
+    name: interactive-labs-backend
+    namespace: interactive-labs-console-plugin
+roleRef:
+  kind: ClusterRole
+  name: interactive-labs-runtime-config-reader
+  apiGroup: rbac.authorization.k8s.io

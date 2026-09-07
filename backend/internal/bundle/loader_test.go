@@ -1,6 +1,7 @@
 package bundle_test
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -36,8 +37,7 @@ spec: {}`), 0o600))
 	assert.Equal(t, "lab1", result.Manifest.Metadata.Name)
 	assert.Equal(t, "Lab 1", result.Manifest.Metadata.DisplayName)
 	assert.Equal(t, "Manifest description", result.Manifest.Metadata.Description)
-	assert.Contains(t, result.Pages, "010-intro.adoc")
-	assert.Contains(t, result.Pages, "_shared.adoc")
+	assert.Equal(t, []string{"010-intro.adoc"}, result.Pages)
 	assert.True(t, result.HelmChartAvailable)
 }
 
@@ -104,4 +104,15 @@ spec: {}`), 0o600))
 
 func TestValidateCloneArgs_Valid(t *testing.T) {
 	require.NoError(t, bundle.ValidateCloneArgs("https://github.com/redhat-scholars/lab", "main"))
+}
+
+func TestReadResource_LoadsArbitrarySizeAndBytes(t *testing.T) {
+	root := t.TempDir()
+	content := bytes.Repeat([]byte{0xff}, 10*1024*1024+1)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "binary"), content, 0o600))
+
+	resource, err := bundle.ReadResource(root, "binary")
+
+	require.NoError(t, err)
+	assert.Equal(t, content, resource.Bytes)
 }

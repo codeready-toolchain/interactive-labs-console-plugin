@@ -1,6 +1,6 @@
 # Lab content contract
 
-This document separates current bundle validation from planned renderer/setup semantics. Author only against **implemented and verified** behavior unless explicitly testing an agreed planned story.
+This document distinguishes current implementation from deferred setup semantics. Author only against **implemented and verified** behavior unless explicitly testing an agreed planned story.
 
 ## Catalog entry
 
@@ -14,7 +14,7 @@ Lab is selected by administrator-managed `interactive-labs-catalog` ConfigMap. R
 
 **Implemented and verified:** ConfigMap display fields are ignored. Backend derives catalog `displayName` and optional `description` from validated `lab.yaml` `metadata`, and shallow-clones each `(repository, branch)` into `/var/lib/interactive-labs/cache/<sha256 canonical repository+branch>/content` on first use. Entry directory is reserved for future metadata and does not expose source URLs. `Close` preserves snapshots while cache storage remains; no PVC is mounted today, so pod/container replacement loses them. A future PVC mounts this fixed path. A safely configured lab with an unavailable repository, missing manifest, or invalid bundle is omitted from the catalog; unsafe source configuration fails the whole catalog with `configuration_error`. Optional `attributeOverrides` is static string map. Catalog identity is opaque SHA-256 (`catalogRef`) over repository, branch, lab path, and overrides; duplicate stable identities are configuration errors.
 
-**Decided target / planned STORY-4:** Description is AsciiDoc rendered through the restricted, sanitised path, with `lab.yaml` as its relative-resource base. No browser resource endpoint exists yet.
+**Implemented and verified:** Catalog response exposes normalized `labPath`; description is AsciiDoc rendered through the restricted, sanitised path with client-derived `lab.yaml` relative-resource base. Browser resources use the approved backend resource endpoint.
 
 See [catalog ConfigMap contract](../efforts/interactive-labs/contract/catalog-configmap.md).
 
@@ -44,7 +44,7 @@ spec:
   checkpoints: []
 ```
 
-Backend recursively collects `.adoc` files under `content/`. Bundle key must not escape content root. At least one page must be navigable. Any path segment beginning `_` is include-only, so it cannot be navigation entry. Backend returns page source from its immutable snapshot; it does not currently render, sort/navigation-resolve, or process AsciiDoc includes.
+Backend recursively collects `.adoc` files under `content/`. Bundle key must not escape content root. At least one page must be navigable. Any path segment beginning `_` is include-only, so it cannot be navigation entry. Backend returns sorted navigable page descriptors with backend-relative resource paths; browser fetches page source and approved supporting resources on demand. Backend does not render or process AsciiDoc includes.
 
 ## Attributes
 
@@ -54,14 +54,23 @@ Effective attributes merge in this order; later layer wins:
 manifest spec.attributes -> catalog attributeOverrides -> backend runtime attributes
 ```
 
-Runtime attributes are backend-only, request-scoped, excluded from `CatalogList`, `catalogRef`, and Helm release-name derivation.
+Runtime attributes are backend-only, request-scoped, excluded from `CatalogList`, `catalogRef`, and Helm release-name derivation. Bundle responses are all-or-nothing: backend returns `503 runtime_attributes_unavailable` rather than exposing a bundle if any required value is unavailable or empty.
 
-## Decided target / planned authoring rules
+| Attribute | Source value |
+| --- | --- |
+| `user` | Authenticated current user's OpenShift `User.metadata.name` from `GET /apis/user.openshift.io/v1/users/~` through Console `UserToken` proxy. |
+| `openshift_api_url` | `Infrastructure.status.apiServerURL` from `GET /apis/config.openshift.io/v1/infrastructures/cluster`. |
+| `openshift_console_url` | `Console.status.consoleURL` from `GET /apis/config.openshift.io/v1/consoles/cluster`. |
+| `openshift_cluster_ingress_domain` | `Ingress.spec.domain` from `GET /apis/config.openshift.io/v1/ingresses/cluster`. |
 
-- Bundle lists normalized navigable paths under `labPath/content/` with backend-approved source URLs. Includes and images may resolve outside `labPath` only within same approved repository through backend-validated resource URLs. Relative image targets use Asciidoctor's default flattened-document base: rendered top-level page URL, even when declared in a partial.
-- Navigable pages sort lexically; first is entry page; `_` paths remain include-only. Ordinary links navigate only to known normalized lab-page paths in drawer; same-page fragments remain anchors, while unknown/external targets show inline warning. A validated page link activated in catalog description is explicit Launch intent: it validates bundle then opens drawer at target, without bypassing chart setup policy.
-- Render only documented restricted AsciiDoc subset, including syntax-highlighted source blocks and Mermaid diagrams. Highlight source from text content; Mermaid runs with strict security, no auto-start or click/callback binding; sanitize generated Mermaid SVG, then sanitize final DOM output.
-- Recoverable rejected content/resources and Mermaid/highlighter failures render explicit inline warnings. Page fetch, conversion, or sanitizer failures render safe actionable page error. Remote includes, arbitrary executable extensions, arbitrary filesystem access, unsupported raw HTML or author-supplied SVG, external navigation directives, and arbitrary DOM selectors never execute.
+Backend reads cluster configuration with its service account on each bundle request. Its ClusterRole permits only `get` on those three named `config.openshift.io` `cluster` objects; it never uses forwarded user token for those reads. On failure, backend logs only failed runtime attribute/category, never tokens or attribute values.
+
+## Implemented authoring rules
+
+- Bundle lists normalized navigable paths under `labPath/content/` with backend-relative approved resource paths. Client resolves each only through Console proxy. Backend serves `GET /api/v1alpha1/labs/{catalogRef}/resources/{repositoryRelativePath...}` from cached snapshot, permitting same-repository includes/images outside `labPath`. A quoted snapshot Git `HEAD` SHA is shared resource `ETag`, with `Cache-Control: private, no-cache`; resource-size caps are not yet enforced.
+- Navigable pages sort lexically; first is entry page; `_` paths remain include-only. Relative links resolve from active source and navigate drawer only when result matches known page descriptor; same-page fragments remain anchors. Absolute external HTTP(S) links open safe new tab. Same-origin non-plugin-proxy links use Console navigation while drawer stays open. Plugin backend resource URLs and unknown relative links warn. A validated description page link explicitly launches target after bundle validation.
+- Render documented restricted AsciiDoc subset with exact pinned dependencies. Backend-final attributes are hard-set in Asciidoctor. DOMPurify's final AsciiDoc pass uses its default allowlist (HTML, SVG, SVG filters, and MathML) and forbids `style`/`form` elements and `style` attributes; it runs before Mermaid insertion. No custom allowlist or hook is configured. Highlight source from text content; Mermaid runs strict with no auto-start or click/callback binding and native SVG labels (`htmlLabels: false`). Its separate DOMPurify SVG/SVG-filter-profile pass forbids `form` and retains allowed `style` elements, `style` attributes, and SVG filter elements. Renderer enforces include depth 64; it adds no include-count or aggregate-content limit.
+- Recoverable rejected content/resources and Mermaid/highlighter failures render explicit inline warnings. Page fetch, conversion, or sanitizer failures render safe actionable page error. Remote includes, arbitrary executable extensions, arbitrary filesystem access, unsupported raw HTML or author-supplied SVG, and arbitrary DOM selectors never execute.
 - Guidance links use typed Quick Start-compatible same-Console route plus optional symbolic target ID. Missing/unsupported targets fall back to route-only navigation.
 - **Provisional:** `type: manual` browser-local checkpoint is current candidate for user attestation. Evidence/checkpoint rules and section-solver behavior remain open; confirmation is not automated evidence.
 
@@ -80,6 +89,6 @@ x-interactive-labs:
 
 ## Not supported or deferred
 
-No author validation tool, browser page/include/image resource endpoint, resolved namespace policy, resolved evidence/checkpoint rules, section solver, renderer implementation, namespace discovery UI, Helm execution, revision pinning, migration, rollback, or offline content delivery exists today.
+No author validation tool, resolved namespace policy, resolved evidence/checkpoint rules, section solver, namespace discovery UI, Helm execution, revision pinning, migration, rollback, or offline content delivery exists today.
 
 Authoring policy and rationale: [design decisions](design-decisions.md); full target detail: [architect notes](../efforts/interactive-labs/architect-notes.md).

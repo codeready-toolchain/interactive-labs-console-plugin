@@ -39,8 +39,8 @@ Evidence: [Containerfile](../../Containerfile), [server](../../backend/cmd/serve
 
 1. Browser requests `GET /api/v1alpha1/labs/{catalogRef}/bundle` through same proxy.
 2. Backend requires bearer token, resolves authenticated subject, then resolves `catalogRef` from live catalog.
-3. **Implemented and verified:** On first use, backend shallow-clones one configured HTTPS repository/branch into `/var/lib/interactive-labs/cache/<sha256 canonical repository+branch>/content` and reuses that snapshot for catalog, bundle, and setup loading while cache storage remains. Entry directory is reserved for future metadata. `Close` preserves snapshots; current deployment has no PVC, so pod/container replacement loses cache. Future PVCs mount this fixed path. It loads `lab.yaml`, `.adoc` files below `content/`, and optional `setup/helm/Chart.yaml`; it returns the current embedded page-source map.
-4. **Decided target / planned STORY-4:** Backend returns normalized navigable paths and server-approved source URLs from that cached repository snapshot; it serves page, include, and image resources on demand with repository-root validation.
+3. **Implemented and verified:** On first use, backend shallow-clones one configured HTTPS repository/branch into `/var/lib/interactive-labs/cache/<sha256 canonical repository+branch>/content` and reuses that snapshot for catalog, bundle, setup, and resource loading while cache storage remains. Entry directory is reserved for future metadata. `Close` preserves snapshots; current deployment has no PVC, so pod/container replacement loses cache. Future PVCs mount this fixed path. It loads `lab.yaml`, `.adoc` files below `content/`, and optional `setup/helm/Chart.yaml`; bundle returns normalized navigable page descriptors with backend-relative resource paths.
+4. **Implemented and verified:** Catalog returns normalized `labPath`; browser resolves backend-relative page paths through its fixed Console proxy base. `GET /api/v1alpha1/labs/{catalogRef}/resources/{repositoryRelativePath...}` serves approved page/include/image bytes on demand with repository-root validation. Responses use a quoted snapshot Git `HEAD` SHA as shared `ETag` and `Cache-Control: private, no-cache`; resource-size caps are not yet enforced.
 
 ### Setup
 
@@ -58,6 +58,7 @@ Evidence: [frontend client](../../frontend/src/api/client.ts), [router](../../ba
 | --- | --- | --- |
 | List catalog | `GET /api/v1alpha1/catalog` | `v1alpha1/CatalogList` |
 | Load bundle | `GET /api/v1alpha1/labs/{catalogRef}/bundle` | `v1alpha1/LabBundle` |
+| Read resource | `GET /api/v1alpha1/labs/{catalogRef}/resources/{repositoryRelativePath...}` | Raw supported text or raster bytes; `v1alpha1/Error` on failure |
 | Setup lab | `POST /api/v1alpha1/labs/{catalogRef}/setup` | `v1alpha1/SetupResult` |
 
 All non-success API responses use `v1alpha1/Error`. Unknown client error types normalize to `unknown_error`.
@@ -68,14 +69,14 @@ All non-success API responses use `v1alpha1/Error`. Unknown client error types n
 - Service requests OpenShift serving certificate and backend mounts its TLS secret.
 - ConsolePlugin defines `backend` proxy alias with mandatory `UserToken` authorization.
 - One backend replica runs as non-root with all Linux capabilities dropped, privilege escalation disabled, and RuntimeDefault seccomp.
-- Backend service account has only `get` access to named catalog ConfigMap and `create` access to namespaced Events.
+- Backend service account has only `get` access to named catalog ConfigMap, `create` access to namespaced Events, and `get` access to named `config.openshift.io` `cluster` infrastructure, ingress, and console configuration objects for runtime attributes.
 
 See [administrator guide](administrator-guide.md).
 
-## Decided target / planned flows
+## Current and planned flows
 
 - Enabled launch opens accessible, minimizable drawer and restores browser-local session state only after explicit user activation.
-- Restricted, sanitized AsciiDoc rendering navigates only pages under `labPath/content` using backend-approved source URLs. Includes and images may come from same approved repository through backend-validated resource URLs. Underscore-prefixed paths are include-only.
+- **Implemented and verified:** Restricted AsciiDoc uses exact pinned renderer dependencies. DOMPurify's final AsciiDoc pass uses its default allowlist and forbids `style`/`form` elements and `style` attributes; Mermaid SVG receives a separate SVG/SVG-filter-profile pass that retains allowed styling and is inserted afterward. Renderer passes backend-final attributes hard-set to Asciidoctor. Relative links resolve from source URL and navigate only known pages under `labPath/content`; external HTTP(S) links open safe new tab, same-origin Console links retain drawer, and plugin backend resource URLs warn. Includes/images may come from same approved repository through backend-validated resource URLs. Underscore-prefixed paths are include-only.
 - **Provisional:** explicit selection of existing release namespace and schema-annotated additional inputs; namespace selection/lifecycle policy remains open.
 - Backend runs synchronous, bounded Helm setup with current-user RBAC and returns terminal success, failure, or timeout.
 - Typed Quick Start-compatible guidance links navigate to supported routes and optionally spotlight `data-quickstart-id`; missing targets fall back to route-only navigation.

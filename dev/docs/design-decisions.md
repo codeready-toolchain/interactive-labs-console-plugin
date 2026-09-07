@@ -22,9 +22,9 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 **Decision:** restricted AsciiDoc authoring subset plus DOM sanitization.
 
-**Why:** trusted repository delivery does not make generated HTML safe for Console. Remote includes, executable extensions, arbitrary filesystem access, unsupported raw HTML, external navigation, and arbitrary selectors are prohibited.
+**Why:** trusted repository delivery does not make generated HTML safe for Console. Remote includes, executable extensions, arbitrary filesystem access, unsupported raw HTML, plugin backend-resource navigation, and arbitrary selectors are prohibited. Ordinary external HTTP(S) links open a safe new tab; same-origin Console links use same-tab Console navigation while drawer remains open.
 
-**Deferred:** renderer and sanitizer implementation; author capability expands only after security review.
+**Implemented and verified:** renderer and sanitizer implementation. Author capability expands only after security review.
 
 ## Q4 — Console guidance links
 
@@ -62,11 +62,11 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 ## Q9 — Lab-content delivery
 
-**Decision:** catalog references approved Red Hat HTTPS repository branches; backend loads complete bundle at launch. Optional chart dependencies may resolve from sources declared by approved chart.
+**Decision:** catalog references approved Red Hat HTTPS repository branches; backend loads manifest and page descriptors at launch, then browser fetches approved resources on demand. Optional chart dependencies may resolve from sources declared by approved chart.
 
 **Why:** centrally maintained branches avoid customer ConfigMap changes for each content update.
 
-**Tradeoff:** MVP exposes no resolved revision and has no update notification, migration, rollback, or running-session reconciliation.
+**Tradeoff:** Cached-resource responses expose snapshot Git `HEAD` as HTTP `ETag`, but MVP has no revision identity in catalog, bundle, or session data; it also has no update notification, migration, rollback, or running-session reconciliation.
 
 ## Cross-cutting decisions
 

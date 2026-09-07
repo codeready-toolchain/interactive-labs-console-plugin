@@ -37,11 +37,14 @@ func main() {
 	}
 
 	cfg := handler.Config{
-		CatalogSource:     inClusterCatalogSource(),
-		BundleLoader:      cache.Load,
-		CatalogLabOmitted: inClusterCatalogEventPoster(log),
-		Logger:            log,
-		Authenticate:      inClusterIdentityResolver(),
+		CatalogSource:      inClusterCatalogSource(),
+		BundleLoader:       cache.Load,
+		SnapshotCommitHash: cache.CommitHash,
+		ResourceLoader:     cache.Read,
+		CatalogLabOmitted:  inClusterCatalogEventPoster(log),
+		Logger:             log,
+		Authenticate:       inClusterIdentityResolver(),
+		RuntimeAttributes:  inClusterRuntimeAttributes(log),
 	}
 
 	backend := &http.Server{
@@ -123,6 +126,99 @@ func inClusterIdentityResolver() func(context.Context, string) (string, error) {
 		}
 		return user.Metadata.Name, nil
 	}
+}
+
+// inClusterRuntimeAttributes reads cluster values through service-account-authenticated API calls.
+// Returned values are request-scoped and only become effective manifest attributes.
+func inClusterRuntimeAttributes(log *slog.Logger) func(*http.Request, string) (map[string]string, error) {
+	client, err := tlsClientWithCA("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+	if err != nil {
+		log.Warn("runtime attributes unavailable", "category", "runtime_client")
+		return func(*http.Request, string) (map[string]string, error) {
+			return nil, fmt.Errorf("runtime attributes unavailable")
+		}
+	}
+	return newClusterRuntimeAttributes(
+		fmt.Sprintf("https://%s", os.Getenv("KUBERNETES_SERVICE_HOST")+":"+os.Getenv("KUBERNETES_SERVICE_PORT")),
+		func() (string, error) {
+			value, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token") //nolint:gosec
+			return string(value), err
+		},
+		client,
+		log,
+	)
+}
+
+func newClusterRuntimeAttributes(apiHost string, token func() (string, error), client *http.Client, log *slog.Logger) func(*http.Request, string) (map[string]string, error) {
+	return func(r *http.Request, subject string) (map[string]string, error) {
+		fail := func(category string) (map[string]string, error) {
+			if log != nil {
+				log.Warn("runtime attributes unavailable", "attribute", category)
+			}
+			return nil, fmt.Errorf("runtime attributes unavailable")
+		}
+		if subject == "" {
+			return fail("user")
+		}
+		if token == nil || client == nil {
+			return fail("runtime_client")
+		}
+		serviceAccountToken, err := token()
+		if err != nil || serviceAccountToken == "" {
+			return fail("service_account_token")
+		}
+
+		var infrastructure struct {
+			Status struct {
+				APIServerURL string `json:"apiServerURL"`
+			} `json:"status"`
+		}
+		if getClusterConfig(r.Context(), apiHost, serviceAccountToken, "/apis/config.openshift.io/v1/infrastructures/cluster", client, &infrastructure) != nil || infrastructure.Status.APIServerURL == "" {
+			return fail("openshift_api_url")
+		}
+
+		var console struct {
+			Status struct {
+				ConsoleURL string `json:"consoleURL"`
+			} `json:"status"`
+		}
+		if getClusterConfig(r.Context(), apiHost, serviceAccountToken, "/apis/config.openshift.io/v1/consoles/cluster", client, &console) != nil || console.Status.ConsoleURL == "" {
+			return fail("openshift_console_url")
+		}
+
+		var ingress struct {
+			Spec struct {
+				Domain string `json:"domain"`
+			} `json:"spec"`
+		}
+		if getClusterConfig(r.Context(), apiHost, serviceAccountToken, "/apis/config.openshift.io/v1/ingresses/cluster", client, &ingress) != nil || ingress.Spec.Domain == "" {
+			return fail("openshift_cluster_ingress_domain")
+		}
+
+		return map[string]string{
+			"user":                             subject,
+			"openshift_api_url":                infrastructure.Status.APIServerURL,
+			"openshift_console_url":            console.Status.ConsoleURL,
+			"openshift_cluster_ingress_domain": ingress.Spec.Domain,
+		}, nil
+	}
+}
+
+func getClusterConfig(ctx context.Context, apiHost, token, path string, client *http.Client, destination any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiHost+path, nil) //nolint:gosec
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req) //nolint:gosec
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("cluster configuration request status %d", resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(destination)
 }
 
 // inClusterCatalogSource returns a function that reads the catalog ConfigMap from the cluster.
