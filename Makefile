@@ -6,6 +6,8 @@ NAMESPACE ?= interactive-labs-console-plugin
 REGISTRY ?= $(shell $(OC) get route default-route -n openshift-image-registry --template='{{ .spec.host }}' 2>/dev/null)
 DEV_IMAGE ?= $(REGISTRY)/$(NAMESPACE)/interactive-labs-console-plugin:latest
 PLATFORM ?= linux/amd64
+COMMIT ?= $(shell git rev-parse --short HEAD)$(shell git diff --quiet HEAD 2>/dev/null || echo '-dirty')
+BUILDTIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 .PHONY: all build test frontend-build frontend-test backend-build backend-test image push-image validate-frontend-bundle validate-deploy validate-demo-catalog validate-catalog-namespace deploy check-registry create-namespace dev-image push-dev-image dev-deploy dev-deploy-with-demo-catalog help
 
@@ -39,7 +41,7 @@ backend-lint:
 	cd backend && golangci-lint run
 
 backend-build: ## Build backend server
-	cd backend && go build ./cmd/server
+	cd backend && go build -ldflags "-X main.commit=$(git rev-parse --short HEAD) -X main.buildtime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" ./cmd/server
 
 backend-test: ## Test and vet backend
 	cd backend && go test ./...
@@ -50,7 +52,10 @@ validate-frontend-bundle: ## Validate exposed page module initialization
 	@! grep -Fq 'reexport safe' frontend/dist/exposed-main.js
 
 image: ## Build container image
-	$(CONTAINER_TOOL) build --platform=${PLATFORM} -f Containerfile -t $(IMAGE) .
+	$(CONTAINER_TOOL) build --no-cache --platform=${PLATFORM} \
+	  --build-arg COMMIT=$(COMMIT) \
+      --build-arg BUILDTIME=$(BUILDTIME) \
+	  -f Containerfile -t $(IMAGE) .
 
 push-image: image ## Build and push default image
 	$(CONTAINER_TOOL) push $(IMAGE)
@@ -79,7 +84,10 @@ create-namespace: ## Create plugin namespace
 	$(OC) apply -f deploy/base/namespace.yaml
 
 dev-image: create-namespace ## Build development image
-	$(CONTAINER_TOOL) build --platform=${PLATFORM} -f Containerfile -t $(DEV_IMAGE) .
+	$(CONTAINER_TOOL) build --no-cache --platform=${PLATFORM} \
+	  --build-arg COMMIT=$(COMMIT) \
+      --build-arg BUILDTIME=$(BUILDTIME) \
+      -f Containerfile -t $(DEV_IMAGE) .
 
 push-dev-image: check-registry dev-image ## Build and push development image
 	$(CONTAINER_TOOL) push $(DEV_IMAGE) --creds="unused:$$( $(OC) whoami --show-token )" --tls-verify=false

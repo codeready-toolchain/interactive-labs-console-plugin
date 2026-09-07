@@ -18,6 +18,7 @@ import (
 
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/bundle"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/handler"
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/setup"
 )
 
 const (
@@ -26,6 +27,11 @@ const (
 	backendTLSKey     = "/etc/tls/backend/tls.key"
 	pluginAssets      = "/app/frontend"
 	snapshotCacheRoot = "/var/lib/interactive-labs/cache"
+)
+
+var (
+	commit    = "dev"
+	buildtime = "unknown"
 )
 
 func main() {
@@ -37,11 +43,13 @@ func main() {
 	}
 
 	cfg := handler.Config{
-		CatalogSource:     inClusterCatalogSource(),
-		BundleLoader:      cache.Load,
-		CatalogLabOmitted: inClusterCatalogEventPoster(log),
-		Logger:            log,
-		Authenticate:      inClusterIdentityResolver(),
+		CatalogSource:        inClusterCatalogSource(),
+		BundleLoader:         cache.Load,
+		CatalogLabOmitted:    inClusterCatalogEventPoster(log),
+		Logger:               log,
+		Authenticate:         inClusterIdentityResolver(),
+		SetupClient:          inClusterSetupClient(log),
+		SpaceRequestTierName: "base1ns",
 	}
 
 	backend := &http.Server{
@@ -65,7 +73,7 @@ func main() {
 }
 
 func serveTLS(log *slog.Logger, name string, server *http.Server, cert, key string) {
-	log.Info("interactive-labs server starting", "name", name, "addr", server.Addr)
+	log.Info("interactive-labs server starting", "name", name, "addr", server.Addr, "commit", commit, "buildtime", buildtime)
 	if err := server.ListenAndServeTLS(cert, key); err != nil && err != http.ErrServerClosed {
 		log.Error("server error", "name", name, "err", err)
 	}
@@ -172,4 +180,15 @@ func inClusterCatalogSource() func(ctx context.Context) (*corev1.ConfigMap, erro
 		}
 		return &cm, nil
 	}
+}
+
+func inClusterSetupClient(log *slog.Logger) *setup.SpaceRequestClient {
+	caPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	apiHost := fmt.Sprintf("https://%s", os.Getenv("KUBERNETES_SERVICE_HOST")+":"+os.Getenv("KUBERNETES_SERVICE_PORT"))
+	client, err := tlsClientWithCA(caPath)
+	if err != nil {
+		log.Warn("setup client unavailable", "err", err)
+		return nil
+	}
+	return &setup.SpaceRequestClient{HTTPClient: client, APIHost: apiHost}
 }
