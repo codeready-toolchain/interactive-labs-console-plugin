@@ -5,6 +5,7 @@ KUSTOMIZE ?= kustomize
 NAMESPACE ?= interactive-labs-console-plugin
 REGISTRY ?= $(shell $(OC) get route default-route -n openshift-image-registry --template='{{ .spec.host }}' 2>/dev/null)
 DEV_IMAGE ?= $(REGISTRY)/$(NAMESPACE)/interactive-labs-console-plugin:latest
+PLATFORM ?= linux/amd64
 
 .PHONY: all build test frontend-build frontend-test backend-build backend-test image push-image validate-frontend-bundle validate-deploy validate-demo-catalog validate-catalog-namespace deploy check-registry create-namespace dev-image push-dev-image dev-deploy dev-deploy-with-demo-catalog help
 
@@ -49,7 +50,7 @@ validate-frontend-bundle: ## Validate exposed page module initialization
 	@! grep -Fq 'reexport safe' frontend/dist/exposed-main.js
 
 image: ## Build container image
-	$(CONTAINER_TOOL) build -f Containerfile -t $(IMAGE) .
+	$(CONTAINER_TOOL) build --platform=${PLATFORM} -f Containerfile -t $(IMAGE) .
 
 push-image: image ## Build and push default image
 	$(CONTAINER_TOOL) push $(IMAGE)
@@ -66,6 +67,8 @@ validate-catalog-namespace: ## Validate catalog ConfigMap namespace
 deploy: ## Apply deployment manifests
 	$(OC) apply -k deploy/base
 
+expose-registry: ## Expose OpenShift registry
+	$(OC) patch configs.imageregistry.operator.openshift.io/cluster --patch '{"spec":{"defaultRoute":true}}' --type=merge
 
 check-registry: ## Verify OpenShift registry access
 	@test -n "$(REGISTRY)" || { echo "OpenShift image registry route unavailable."; exit 1; }
@@ -76,10 +79,10 @@ create-namespace: ## Create plugin namespace
 	$(OC) apply -f deploy/base/namespace.yaml
 
 dev-image: create-namespace ## Build development image
-	$(CONTAINER_TOOL) build -f Containerfile -t $(DEV_IMAGE) .
+	$(CONTAINER_TOOL) build --platform=${PLATFORM} -f Containerfile -t $(DEV_IMAGE) .
 
 push-dev-image: check-registry dev-image ## Build and push development image
-	$(CONTAINER_TOOL) push $(DEV_IMAGE) --creds="$$( $(OC) whoami ):$$( $(OC) whoami --show-token )" --tls-verify=false
+	$(CONTAINER_TOOL) push $(DEV_IMAGE) --creds="unused:$$( $(OC) whoami --show-token )" --tls-verify=false
 
 dev-deploy: push-dev-image ## Build, push, and deploy development image
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
@@ -89,6 +92,7 @@ dev-deploy: push-dev-image ## Build, push, and deploy development image
 	$(KUSTOMIZE) build . | $(OC) apply -f - && \
 	$(OC) rollout restart deployment/interactive-labs -n $(NAMESPACE) && \
 	$(OC) rollout status deployment/interactive-labs -n $(NAMESPACE)
+	$(OC) patch consoles.operator.openshift.io cluster --type=json --patch '[{"op":"add","path":"/spec/plugins/-","value":"interactive-labs-console-plugin"}]'
 
 dev-deploy-with-demo-catalog: push-dev-image ## Build, push, and deploy development image with demo catalog
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
@@ -99,3 +103,4 @@ dev-deploy-with-demo-catalog: push-dev-image ## Build, push, and deploy developm
 	$(KUSTOMIZE) build . | $(OC) apply -f - && \
 	$(OC) rollout restart deployment/interactive-labs -n $(NAMESPACE) && \
 	$(OC) rollout status deployment/interactive-labs -n $(NAMESPACE)
+	$(OC) patch consoles.operator.openshift.io cluster --type=json --patch '[{"op":"add","path":"/spec/plugins/-","value":"interactive-labs-console-plugin"}]'
