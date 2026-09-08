@@ -11,5 +11,5 @@ resources:
   - catalog.yaml
 images:
   - name: interactive-labs-console-plugin
-    newName: image-registry.openshift-image-registry.svc:5000/interactive-labs-console-plugin/interactive-labs-console-plugin
+    newName: quay.io/codeready-toolchain/interactive-labs-console-plugin
     newTag: latest
