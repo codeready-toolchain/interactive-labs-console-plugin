@@ -201,6 +201,7 @@ func snapshotID(repository, branch string) string {
 	hasher.Write([]byte(repository))
 	hasher.Write([]byte("|"))
 	hasher.Write([]byte(branch))
+	// this approach borrowed from sha256.Sum256()
 	var sum [sha256.Size]byte
 	hasher.Sum(sum[:0])
 	return fmt.Sprintf("%x", sum)
