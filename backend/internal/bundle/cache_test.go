@@ -79,7 +79,7 @@ func TestCache_CachesRevisionInMemoryWithoutSnapshotMetadata(t *testing.T) {
 	const (
 		repository = "https://example.test/labs.git"
 		branch     = "main"
-		etag       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		commitHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	)
 	clones, revisions := 0, 0
 	cache := newCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
@@ -88,7 +88,7 @@ func TestCache_CachesRevisionInMemoryWithoutSnapshotMetadata(t *testing.T) {
 	})
 	cache.getRepoRevision = func(string) (string, error) {
 		revisions++
-		return etag, nil
+		return commitHash, nil
 	}
 
 	for range 2 {
@@ -106,7 +106,7 @@ func TestCache_ResolvesRevisionOnceForExistingCheckout(t *testing.T) {
 	const (
 		repository = "https://example.test/labs.git"
 		branch     = "main"
-		etag       = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		commitHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	)
 	root := t.TempDir()
 	destination := filepath.Join(root, snapshotID(repository, branch), "content")
@@ -119,7 +119,7 @@ func TestCache_ResolvesRevisionOnceForExistingCheckout(t *testing.T) {
 	cache.getRepoRevision = func(gotDestination string) (string, error) {
 		assert.Equal(t, destination, gotDestination)
 		revisions++
-		return etag, nil
+		return commitHash, nil
 	}
 
 	_, err := cache.Load(context.Background(), repository, branch, "lab")
