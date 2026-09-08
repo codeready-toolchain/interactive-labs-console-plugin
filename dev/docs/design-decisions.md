@@ -74,7 +74,7 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 - Attribute precedence is manifest, then catalog overrides, then backend runtime attributes. Runtime attributes do not affect catalog identity or Helm release name.
 - Helm release identity is backend-derived, deterministic, and user-specific: static content identity, static effective attributes, and namespace bindings contribute; runtime attributes do not.
 - Use one unified frontend/backend image and one HTTPS Service.
-- Use direct standard-library Kubernetes REST/TLS calls for current narrow ConfigMap/user calls, avoiding `client-go` dependency weight.
+- Use typed Kubernetes and OpenShift clients for all cluster API access.
 
 ## Open or deferred
 

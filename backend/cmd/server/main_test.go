@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -13,133 +14,223 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	configv1 "github.com/openshift/api/config/v1"
+	userv1 "github.com/openshift/api/user/v1"
+	configclient "github.com/openshift/client-go/config/clientset/versioned"
+	configfake "github.com/openshift/client-go/config/clientset/versioned/fake"
+	userclient "github.com/openshift/client-go/user/clientset/versioned"
+	userfake "github.com/openshift/client-go/user/clientset/versioned/fake"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/bundle"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/handler"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/manifest"
 )
 
-func TestRuntimeAttributesReadsClusterValues(t *testing.T) {
-	const (
-		serviceAccountToken = "service-account-token"
-		oldConsolePath      = "/apis/operator.openshift.io/v1/consoles/cluster"
-	)
-	var paths []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.URL.Path)
-		require.Equal(t, "Bearer "+serviceAccountToken, r.Header.Get("Authorization"))
-		switch r.URL.Path {
-		case "/apis/config.openshift.io/v1/infrastructures/cluster":
-			_, _ = w.Write([]byte(`{"status":{"apiServerURL":"https://api.example.test:6443"}}`))
-		case "/apis/config.openshift.io/v1/consoles/cluster":
-			_, _ = w.Write([]byte(`{"status":{"consoleURL":"https://console.example.test"}}`))
-		case "/apis/config.openshift.io/v1/ingresses/cluster":
-			_, _ = w.Write([]byte(`{"spec":{"domain":"apps.example.test"}}`))
-		default:
-			http.Error(w, "unexpected request path", http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
+const (
+	apiServerURL  = "https://api.example.test:6443"
+	consoleURL    = "https://console.example.test"
+	ingressDomain = "apps.example.test"
+)
 
-	attributes, err := newClusterRuntimeAttributes(server.URL, func() (string, error) {
-		return serviceAccountToken, nil
-	}, server.Client(), nil)(httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil), "alice")
+func TestRuntimeAttributesReadsTypedClusterConfig(t *testing.T) {
+	client := typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain})
+	var configClient configclient.Interface = client
+
+	attributes, err := newClusterRuntimeAttributes(configClient, nil)(httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil), "alice")
 
 	require.NoError(t, err)
 	require.Equal(t, map[string]string{
 		"user":                             "alice",
-		"openshift_api_url":                "https://api.example.test:6443",
-		"openshift_console_url":            "https://console.example.test",
-		"openshift_cluster_ingress_domain": "apps.example.test",
+		"openshift_api_url":                apiServerURL,
+		"openshift_console_url":            consoleURL,
+		"openshift_cluster_ingress_domain": ingressDomain,
 	}, attributes)
-	require.Equal(t, []string{
-		"/apis/config.openshift.io/v1/infrastructures/cluster",
-		"/apis/config.openshift.io/v1/consoles/cluster",
-		"/apis/config.openshift.io/v1/ingresses/cluster",
-	}, paths)
-	require.NotContains(t, paths, oldConsolePath)
 }
 
-func TestRuntimeAttributeFailureLogsOnlyAttributeName(t *testing.T) {
-	const (
-		serviceAccountToken = "service-account-token"
-		consoleURL          = "https://console.example.test"
-	)
-	var logs bytes.Buffer
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/apis/config.openshift.io/v1/infrastructures/cluster":
-			_, _ = w.Write([]byte(`{"status":{"apiServerURL":"https://api.example.test:6443"}}`))
-		case "/apis/config.openshift.io/v1/consoles/cluster":
-			http.Error(w, consoleURL, http.StatusForbidden)
-		default:
-			http.Error(w, "unexpected request path", http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
+func TestRuntimeAttributesPreservesCallerContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client := typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain})
+	var configClient configclient.Interface = client
 
-	attributes, err := newClusterRuntimeAttributes(server.URL, func() (string, error) {
-		return serviceAccountToken, nil
-	}, server.Client(), slog.New(slog.NewTextHandler(&logs, nil)))(httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil), "alice")
+	attributes, err := newClusterRuntimeAttributes(configClient, nil)(httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil), "alice")
 
-	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, attributes)
-	require.Contains(t, logs.String(), "attribute=openshift_console_url")
-	require.NotContains(t, logs.String(), serviceAccountToken)
-	require.NotContains(t, logs.String(), "alice")
-	require.NotContains(t, logs.String(), "https://api.example.test:6443")
-	require.NotContains(t, logs.String(), consoleURL)
+	require.Empty(t, client.Actions())
 }
 
-func TestRuntimeAttributesRejectsInvalidClusterResponses(t *testing.T) {
-	const (
-		infrastructurePath = "/apis/config.openshift.io/v1/infrastructures/cluster"
-		consolePath        = "/apis/config.openshift.io/v1/consoles/cluster"
-		ingressPath        = "/apis/config.openshift.io/v1/ingresses/cluster"
-	)
-	validResponse := func(path string) string {
-		switch path {
-		case infrastructurePath:
-			return `{"status":{"apiServerURL":"https://api.example.test:6443"}}`
-		case consolePath:
-			return `{"status":{"consoleURL":"https://console.example.test"}}`
-		default:
-			return `{"spec":{"domain":"apps.example.test"}}`
-		}
-	}
+func TestRuntimeAttributeFailuresAreAtomicAndSafeToLog(t *testing.T) {
 	for _, tc := range []struct {
-		name, path, body string
-		status           int
+		name, attribute string
+		client          *configfake.Clientset
 	}{
-		{name: "missing API URL", path: infrastructurePath, body: `{"status":{}}`},
-		{name: "missing console URL", path: consolePath, body: `{"status":{}}`},
-		{name: "missing ingress domain", path: ingressPath, body: `{"spec":{}}`},
-		{name: "malformed response", path: consolePath, body: `{`},
-		{name: "API failure", path: ingressPath, status: http.StatusInternalServerError},
+		{
+			name:      "missing API URL",
+			attribute: "openshift_api_url",
+			client:    typedConfigClient(configv1.InfrastructureStatus{}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain}),
+		},
+		{
+			name:      "missing console URL",
+			attribute: "openshift_console_url",
+			client:    typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{}, configv1.IngressSpec{Domain: ingressDomain}),
+		},
+		{
+			name:      "missing ingress domain",
+			attribute: "openshift_cluster_ingress_domain",
+			client:    typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{}),
+		},
+		{
+			name:      "typed client error",
+			attribute: "openshift_console_url",
+			client: func() *configfake.Clientset {
+				client := typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain})
+				client.PrependReactor("get", "consoles", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("console credential leak")
+				})
+				return client
+			}(),
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == tc.path {
-					if tc.status != 0 {
-						w.WriteHeader(tc.status)
-						return
-					}
-					_, _ = w.Write([]byte(tc.body))
-					return
-				}
-				_, _ = w.Write([]byte(validResponse(r.URL.Path)))
-			}))
-			defer server.Close()
+			var logs bytes.Buffer
+			var configClient configclient.Interface = tc.client
 
-			attributes, err := newClusterRuntimeAttributes(server.URL, func() (string, error) {
-				return "service-account-token", nil
-			}, server.Client(), nil)(httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil), "alice")
+			attributes, err := newClusterRuntimeAttributes(configClient, slog.New(slog.NewTextHandler(&logs, nil)))(httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil), "alice@example.test")
 
 			require.Error(t, err)
 			require.Nil(t, attributes)
+			require.Contains(t, logs.String(), "attribute="+tc.attribute)
+			require.NotContains(t, logs.String(), "alice@example.test")
+			require.NotContains(t, logs.String(), apiServerURL)
+			require.NotContains(t, logs.String(), consoleURL)
+			require.NotContains(t, logs.String(), ingressDomain)
+			require.NotContains(t, logs.String(), "console credential leak")
 		})
 	}
+}
+
+func TestClusterCatalogSourceGetsTypedConfigMap(t *testing.T) {
+	const namespace = "interactive-labs-console-plugin"
+	client := k8sfake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "interactive-labs-catalog"},
+		Data:       map[string]string{"catalog.yaml": "labs: []"},
+	})
+
+	configMap, err := newClusterCatalogSource(client, namespace)(context.Background())
+
+	require.NoError(t, err)
+	require.Equal(t, "labs: []", configMap.Data["catalog.yaml"])
+	require.Len(t, client.Actions(), 1)
+	action := client.Actions()[0]
+	require.Equal(t, "get", action.GetVerb())
+	require.Equal(t, "configmaps", action.GetResource().Resource)
+	require.Equal(t, namespace, action.GetNamespace())
+}
+
+func TestClusterCatalogSourcePreservesCallerContextAndFailsSafely(t *testing.T) {
+	const secret = "catalog credential leak"
+	client := k8sfake.NewSimpleClientset()
+	client.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New(secret)
+	})
+
+	configMap, err := newClusterCatalogSource(client, "ns")(context.Background())
+
+	require.Nil(t, configMap)
+	require.EqualError(t, err, "catalog unavailable")
+	require.NotContains(t, err.Error(), secret)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cancelledClient := k8sfake.NewSimpleClientset()
+	configMap, err = newClusterCatalogSource(cancelledClient, "ns")(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, configMap)
+	require.Empty(t, cancelledClient.Actions())
+}
+
+func TestClusterIdentityResolverGetsCurrentUserFromPerRequestTypedClient(t *testing.T) {
+	const (
+		token     = "forwarded-token"
+		nextToken = "next-forwarded-token"
+	)
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+	var factoryTokens []string
+	var userClients []*userfake.Clientset
+	resolver := newClusterIdentityResolver(func(receivedToken string) (userclient.Interface, error) {
+		factoryTokens = append(factoryTokens, receivedToken)
+		client := userfake.NewSimpleClientset()
+		client.PrependReactor("get", "users", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, &userv1.User{ObjectMeta: metav1.ObjectMeta{Name: "alice"}}, nil
+		})
+		userClients = append(userClients, client)
+		return client, nil
+	})
+
+	subject, err := resolver(context.Background(), token)
+	nextSubject, nextErr := resolver(context.Background(), nextToken)
+
+	require.NoError(t, err)
+	require.NoError(t, nextErr)
+	require.Equal(t, "alice", subject)
+	require.Equal(t, "alice", nextSubject)
+	require.Equal(t, []string{token, nextToken}, factoryTokens)
+	require.NotContains(t, logs.String(), token)
+	require.NotContains(t, logs.String(), nextToken)
+	require.Len(t, userClients, 2)
+	for _, client := range userClients {
+		require.Len(t, client.Actions(), 1)
+		action := client.Actions()[0]
+		require.Equal(t, "get", action.GetVerb())
+		require.Equal(t, "users", action.GetResource().Resource)
+		require.Equal(t, "~", action.(k8stesting.GetAction).GetName())
+	}
+}
+
+func TestClusterIdentityResolverPreservesCallerContextAndFailsSafely(t *testing.T) {
+	const token = "forwarded-token"
+	const secret = "identity credential leak"
+	client := userfake.NewSimpleClientset()
+	client.PrependReactor("get", "users", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New(secret)
+	})
+	resolver := newClusterIdentityResolver(func(string) (userclient.Interface, error) { return client, nil })
+
+	subject, err := resolver(context.Background(), token)
+
+	require.Empty(t, subject)
+	require.EqualError(t, err, "identity unavailable")
+	require.NotContains(t, err.Error(), token)
+	require.NotContains(t, err.Error(), secret)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	factoryCalls := 0
+	resolver = newClusterIdentityResolver(func(string) (userclient.Interface, error) {
+		factoryCalls++
+		return userfake.NewSimpleClientset(), nil
+	})
+	subject, err = resolver(ctx, token)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Empty(t, subject)
+	require.Zero(t, factoryCalls)
+}
+
+func typedConfigClient(infrastructure configv1.InfrastructureStatus, console configv1.ConsoleStatus, ingress configv1.IngressSpec) *configfake.Clientset {
+	return configfake.NewSimpleClientset(
+		&configv1.Infrastructure{ObjectMeta: metav1.ObjectMeta{Name: "cluster"}, Status: infrastructure},
+		&configv1.Console{ObjectMeta: metav1.ObjectMeta{Name: "cluster"}, Status: console},
+		&configv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: "cluster"}, Spec: ingress},
+	)
 }
 
 func TestPluginHandlerServesBuiltAssets(t *testing.T) {
