@@ -5,14 +5,18 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM golang:1.27-alpine AS backend
+FROM --platform=${BUILDPLATFORM} golang:1.27-alpine AS backend
+ARG TARGETOS
+ARG TARGETARCH
+
 WORKDIR /src
 COPY backend/go.mod backend/go.sum ./backend/
 RUN cd backend && go mod download
 COPY backend/ ./backend/
-RUN cd backend && CGO_ENABLED=0 go build -o /out/interactive-labs ./cmd/server
+RUN echo "Building the binary for $TARGETOS/$TARGETARCH"
+RUN cd backend && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o /out/interactive-labs ./cmd/server
 
-FROM alpine:3.21
+FROM --platform=${TARGETPLATFORM} alpine:3.21
 RUN apk add --no-cache ca-certificates git && adduser -D -u 10001 interactive-labs && \
   mkdir -p /var/lib/interactive-labs/cache && \
   chown 0:0 /var/lib/interactive-labs/cache && \
