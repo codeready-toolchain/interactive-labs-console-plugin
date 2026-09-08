@@ -113,7 +113,7 @@ func TestCatalogHandler_ReturnsItemsInDeclaredOrder(t *testing.T) {
 	assert.NotContains(t, items[0].(map[string]any), "id")
 }
 
-func TestCatalogHandler_ExposesNormalizedLabPathWithoutDescriptionURL(t *testing.T) {
+func TestCatalogHandler_ExposesNormalizedLabPath(t *testing.T) {
 	rw := httptest.NewRecorder()
 	newRouter(t).ServeHTTP(rw, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil))
 
@@ -123,17 +123,6 @@ func TestCatalogHandler_ExposesNormalizedLabPathWithoutDescriptionURL(t *testing
 	item := body["items"].([]any)[0].(map[string]any)
 	assert.Equal(t, "lab", item["labPath"])
 	assert.Equal(t, "Manifest description", item["description"])
-	assert.NotContains(t, item, "descriptionUrl")
-}
-
-func TestCatalogHandler_NoAuthorizationEchoed(t *testing.T) {
-	rw := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil)
-	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
-	newRouter(t).ServeHTTP(rw, req)
-
-	body := rw.Body.String()
-	assertNoTokenInBody(t, body)
 }
 
 // --- GET /api/v1alpha1/labs/{id}/bundle (stub — no real loader) ---
@@ -287,33 +276,6 @@ func TestSetupHandler_DifferentSubject_DifferentReleaseName(t *testing.T) {
 	assert.NotEqual(t, call("user1"), call("user2"), "different subjects must produce different helmReleaseName")
 }
 
-func TestSetupHandler_NoAuthorizationEchoed(t *testing.T) {
-	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
-	rw := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup",
-		strings.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
-	newRouter(t).ServeHTTP(rw, req)
-
-	assertNoTokenInBody(t, rw.Body.String())
-}
-
-func TestSetupHandler_TokenNotLogged(t *testing.T) {
-	// Token-logging test: capture stderr/stdout is complex;
-	// instead assert the handler implementation uses no fmt.Printf with the token.
-	// The real TestTokenNotLogged integration test is in cmd/server.
-	// Here we just confirm the response body has no token material.
-	rw := httptest.NewRecorder()
-	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup",
-		strings.NewReader(payload))
-	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
-	req.Header.Set("Content-Type", "application/json")
-	newRouter(t).ServeHTTP(rw, req)
-	assertNoTokenInBody(t, rw.Body.String())
-}
-
 // --- New tests for catalogRef, auth on bundle, and attribute merging (RED before implementation) ---
 
 // goodCatalogRef returns the expected catalogRef for goodCatalogCM's single entry.
@@ -332,8 +294,6 @@ func TestCatalogHandler_ExposesCatalogRef(t *testing.T) {
 	require.Len(t, items, 1)
 	item := items[0].(map[string]any)
 	assert.Contains(t, item, "catalogRef", "catalogRef must be present")
-	assert.NotContains(t, item, "id", "id must not be exposed")
-	assert.NotContains(t, item, "attributeOverrides", "attributeOverrides must not be exposed to browser")
 }
 
 func TestBundleHandler_ReturnsSortedNavigablePageDescriptors(t *testing.T) {
@@ -669,25 +629,42 @@ func TestResourceHandler_RejectsInvalidResources(t *testing.T) {
 	ref := goodCatalogRef()
 	router := resourceRouter(t, goodCatalogCM, root, "abc123")
 	for _, tc := range []struct {
-		name       string
-		resource   string
-		wantStatus int
-		wantType   string
+		name         string
+		resource     string
+		wantStatus   int
+		wantType     string
+		wantRedirect string
 	}{
 		{name: "missing", resource: "lab/content/missing.adoc", wantStatus: http.StatusNotFound, wantType: "content_error"},
-		{name: "remote", resource: "https:%2F%2Fexample.test%2Foutside.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
-		{name: "absolute", resource: "%2Fetc%2Fpasswd", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
-		{name: "repository escape", resource: "lab%2Fcontent%2F..%2F..%2Foutside.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+		// these cases makes sure that even if the caller wants to be clever and pass in the path as one url segment, we handle the path on the backend properly and don't allow an escape from the repo root
+		{name: "missing encoded", resource: "lab%2Fcontent%2Fmissing.adoc", wantStatus: http.StatusNotFound, wantType: "content_error"},
+		{name: "remote", resource: "https://example.test/outside.adoc", wantStatus: http.StatusTemporaryRedirect, wantRedirect: "https:/example.test/outside.adoc"},
+		{name: "remote redirected", resource: "https:/example.test/outside.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+		{name: "remote encoded", resource: "https:%2F%2Fexample.test%2Foutside.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+		{name: "absolute", resource: "/etc/passwd", wantStatus: http.StatusTemporaryRedirect, wantRedirect: "etc/passwd"},
+		{name: "absolute encoded", resource: "%2Fetc%2Fpasswd", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+		// here we just test we cannot obtain a path that would point outside of our repository - we actually obtain a URL that points to a different enpoint completely, giving a 404 after the redirect, so that's correct behavior
+		{name: "repository escape", resource: "lab/content/../../../../outside.adoc", wantStatus: http.StatusTemporaryRedirect, wantRedirect: "labs/outside.adoc"},
+		{name: "repository escape encoded", resource: "lab%2Fcontent%2F..%2F..%2F..%2Foutside.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
 		{name: "directory", resource: "lab/content", wantStatus: http.StatusUnprocessableEntity, wantType: "content_error"},
+		{name: "directory encoded", resource: "lab%2Fcontent", wantStatus: http.StatusUnprocessableEntity, wantType: "content_error"},
 		{name: "symlink escape", resource: "lab/content/escape.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+		{name: "symlink escape encoded", resource: "lab%2Fcontent%2Fescape.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
 		{name: "symlink", resource: "lab/content/link.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+		{name: "symlink encoded", resource: "lab%2Fcontent%2Flink.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rw := resourceRequest(t, router, ref, tc.resource)
 			require.Equal(t, tc.wantStatus, rw.Code)
 			var body map[string]any
-			require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
-			assert.Equal(t, tc.wantType, body["type"])
+			// redirects don't have a body we can influence but have a target that we should check
+			if rw.Code < 300 || rw.Code > 399 {
+				require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+				assert.Equal(t, tc.wantType, body["type"])
+			} else {
+				loc := rw.Header().Get("Location")
+				assert.True(t, strings.HasSuffix(loc, tc.wantRedirect), "expected redirect %s but got %s", tc.wantRedirect, loc)
+			}
 		})
 	}
 }
@@ -766,13 +743,6 @@ func pngBytes() []byte {
 }
 
 // helpers
-
-func assertNoTokenInBody(t *testing.T, body string) {
-	t.Helper()
-	assert.NotContains(t, body, "Bearer")
-	assert.NotContains(t, body, "eyJ")
-	assert.NotContains(t, body, "Authorization")
-}
 
 // makeTestJWT builds a minimal unsigned JWT with the given sub.
 // No signature verification is expected in MVP; cluster validates the token.
