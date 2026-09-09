@@ -135,6 +135,7 @@ func inClusterRuntimeAttributes(log *slog.Logger) func(*http.Request, string) (m
 			return nil, fmt.Errorf("runtime attributes unavailable")
 		}
 	}
+	config.Timeout = 10 * time.Minute // generous but finite timeout
 	client, err := configclient.NewForConfig(config)
 	if err != nil {
 		log.Warn("runtime attributes unavailable", "category", "runtime_client")
