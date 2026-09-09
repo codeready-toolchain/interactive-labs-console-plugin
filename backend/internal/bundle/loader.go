@@ -94,7 +94,7 @@ func ReadResource(repositoryRoot, resourcePath string) (*Resource, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: snapshot", ErrRepositoryUnavailable)
 	}
-	if err := rejectSymlinkPath(root, resourcePath); err != nil {
+	if err = rejectSymlinkPath(root, resourcePath); err != nil {
 		return nil, err
 	}
 	target, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(resourcePath)))
@@ -119,7 +119,7 @@ func ReadResource(repositoryRoot, resourcePath string) (*Resource, error) {
 		return nil, fmt.Errorf("%w: target is not a regular file", ErrResourceUnsupported)
 	}
 
-	content, err := os.ReadFile(target) //nolint:gosec // target is canonical and contained above.
+	content, err := os.ReadFile(target)
 	if err != nil {
 		return nil, fmt.Errorf("%w: read target", ErrResourceInvalid)
 	}

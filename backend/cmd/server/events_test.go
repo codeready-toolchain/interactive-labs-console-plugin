@@ -14,14 +14,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
-	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestCatalogEventPosterCreatesOneSafeTypedWarningPerRefAndReason(t *testing.T) {
 	const namespace = "interactive-labs-console-plugin"
 	client := k8sfake.NewSimpleClientset()
-	var events corev1client.EventInterface = client.CoreV1().Events(namespace)
+	events := client.CoreV1().Events(namespace)
 	poster := newCatalogEventPoster(namespace, events, slog.Default())
 
 	poster.Post(context.Background(), "opaque-ref", "ManifestMissing")
@@ -59,7 +58,7 @@ func TestCatalogEventPosterPreservesCallerContext(t *testing.T) {
 }
 
 func TestCatalogEventPosterConcurrentFailureIsAttemptedOnceAndSafe(t *testing.T) {
-	const secret = "event credential leak"
+	const secret = "event credential leak" // #nosec G101
 	client := k8sfake.NewSimpleClientset()
 	client.PrependReactor("create", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New(secret)
@@ -69,11 +68,9 @@ func TestCatalogEventPosterConcurrentFailureIsAttemptedOnceAndSafe(t *testing.T)
 
 	var wg sync.WaitGroup
 	for range 10 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			poster.Post(context.Background(), "opaque-ref", "RepositoryUnavailable")
-		}()
+		})
 	}
 	wg.Wait()
 

@@ -577,7 +577,7 @@ func TestResourceHandler_ReturnsNotModifiedBeforeLoadingResource(t *testing.T) {
 			return nil, errors.New("resource loader must not run")
 		},
 	})
-	request := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/labs/"+ref+"/resources/lab/content/intro.adoc", nil)
+	request := httptest.NewRequestWithContext(context.TODO(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/resources/lab/content/intro.adoc", nil)
 	request.Header.Set("Authorization", "Bearer user1")
 	request.Header.Set("If-None-Match", `"abc123"`)
 	recorder := httptest.NewRecorder()

@@ -118,8 +118,8 @@ func TestRuntimeAttributeFailuresAreAtomicAndSafeToLog(t *testing.T) {
 func TestClusterCatalogSourceGetsTypedConfigMap(t *testing.T) {
 	const namespace = "interactive-labs-console-plugin"
 	client := k8sfake.NewSimpleClientset(&corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "interactive-labs-catalog"},
-		Data:       map[string]string{"catalog.yaml": "labs: []"},
+		Namespace: namespace, Name: "interactive-labs-catalog",
+		Data: map[string]string{"catalog.yaml": "labs: []"},
 	})
 
 	configMap, err := newClusterCatalogSource(client, namespace)(context.Background())
@@ -134,7 +134,7 @@ func TestClusterCatalogSourceGetsTypedConfigMap(t *testing.T) {
 }
 
 func TestClusterCatalogSourcePreservesCallerContextAndFailsSafely(t *testing.T) {
-	const secret = "catalog credential leak"
+	const secret = "catalog credential leak" // #nosec G101
 	client := k8sfake.NewSimpleClientset()
 	client.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New(secret)

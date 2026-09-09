@@ -208,7 +208,7 @@ func snapshotID(repository, branch string) string {
 }
 
 func snapshotRevision(destination string) (string, error) {
-	cmd := exec.Command("git", "-C", destination, "rev-parse", "HEAD") // #nosec G204 -- destination is cache controlled
+	cmd := exec.CommandContext(context.TODO(), "git", "-C", destination, "rev-parse", "HEAD") // #nosec G204 -- destination is cache controlled
 	cmd.Env = gitEnv(nil)
 	revision, err := cmd.Output()
 	if err != nil {
@@ -226,7 +226,7 @@ func isCommitSHA(revision string) bool {
 		return false
 	}
 	for _, value := range revision {
-		if !('0' <= value && value <= '9' || 'a' <= value && value <= 'f') {
+		if ('0' > value || value > '9') && ('a' > value || value > 'f') {
 			return false
 		}
 	}
