@@ -10,3 +10,6 @@ data:
     - repository: https://github.com/metlos/devsandbox-ocp-getting-started-lab.git
       branch: master
       labPath: lab-02
+    - repository: https://github.com/metlos/devsandbox-ocp-getting-started-lab.git
+      branch: master
+      labPath: lab-03

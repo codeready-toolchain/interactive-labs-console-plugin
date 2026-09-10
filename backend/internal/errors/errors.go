@@ -2,18 +2,19 @@
 package errors
 
 const (
-	TypeCatalogUnavailable         = "catalog_unavailable"
-	TypeConfigurationError         = "configuration_error"
-	TypeUnauthorized               = "unauthorized"
-	TypeLabNotFound                = "lab_not_found"
-	TypeManifestVersionUnsupported = "manifest_version_unsupported"
-	TypeRepositoryError            = "repository_error"
-	TypePathTraversal              = "path_traversal"
-	TypeContentError               = "content_error"
-	TypeNamespaceBindingInvalid    = "namespace_binding_invalid"
-	TypeRBACDenied                 = "rbac_denied"
-	TypeChartNotFound              = "chart_not_found"
-	TypeSetupConflict              = "setup_conflict"
+	TypeCatalogUnavailable           = "catalog_unavailable"
+	TypeConfigurationError           = "configuration_error"
+	TypeUnauthorized                 = "unauthorized"
+	TypeLabNotFound                  = "lab_not_found"
+	TypeManifestVersionUnsupported   = "manifest_version_unsupported"
+	TypeRepositoryError              = "repository_error"
+	TypePathTraversal                = "path_traversal"
+	TypeContentError                 = "content_error"
+	TypeNamespaceBindingInvalid      = "namespace_binding_invalid"
+	TypeRBACDenied                   = "rbac_denied"
+	TypeChartNotFound                = "chart_not_found"
+	TypeSetupConflict                = "setup_conflict"
+	TypeRuntimeAttributesUnavailable = "runtime_attributes_unavailable"
 )
 
 // LabError is the typed error response body. All non-2xx responses use this shape.

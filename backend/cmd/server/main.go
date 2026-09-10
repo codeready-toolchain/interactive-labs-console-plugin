@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -14,7 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	configclient "github.com/openshift/client-go/config/clientset/versioned"
+	userclient "github.com/openshift/client-go/user/clientset/versioned"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/bundle"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/handler"
@@ -37,11 +41,14 @@ func main() {
 	}
 
 	cfg := handler.Config{
-		CatalogSource:     inClusterCatalogSource(),
-		BundleLoader:      cache.Load,
-		CatalogLabOmitted: inClusterCatalogEventPoster(log),
-		Logger:            log,
-		Authenticate:      inClusterIdentityResolver(),
+		CatalogSource:      inClusterCatalogSource(),
+		BundleLoader:       cache.Load,
+		SnapshotCommitHash: cache.CommitHash,
+		ResourceLoader:     cache.Read,
+		CatalogLabOmitted:  inClusterCatalogEventPoster(log),
+		Logger:             log,
+		Authenticate:       inClusterIdentityResolver(),
+		RuntimeAttributes:  inClusterRuntimeAttributes(log),
 	}
 
 	backend := &http.Server{
@@ -86,90 +93,128 @@ func combinedHandler(api http.Handler, assets string) http.Handler {
 	})
 }
 
-// inClusterIdentityResolver uses OpenShift's user endpoint to verify a forwarded token
-// and obtain its subject. The token lives only in this request and is never logged.
+// inClusterIdentityResolver verifies each forwarded user token through a request-local typed client.
+// The token lives only in this request and is never logged or retained.
 func inClusterIdentityResolver() func(context.Context, string) (string, error) {
-	caPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	apiHost := fmt.Sprintf("https://%s", os.Getenv("KUBERNETES_SERVICE_HOST")+":"+os.Getenv("KUBERNETES_SERVICE_PORT"))
+	baseConfig, err := rest.InClusterConfig()
+	if err != nil {
+		return newClusterIdentityResolver(func(string) (userclient.Interface, error) { return nil, err })
+	}
+	return newClusterIdentityResolver(func(token string) (userclient.Interface, error) {
+		config := rest.CopyConfig(baseConfig)
+		config.BearerToken = token
+		config.BearerTokenFile = ""
+		return userclient.NewForConfig(config)
+	})
+}
 
+func newClusterIdentityResolver(newClient func(string) (userclient.Interface, error)) func(context.Context, string) (string, error) {
 	return func(ctx context.Context, token string) (string, error) {
-		client, err := tlsClientWithCA(caPath)
-		if err != nil {
-			return "", fmt.Errorf("create identity client: %w", err)
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiHost+"/apis/user.openshift.io/v1/users/~", nil) //nolint:gosec
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := client.Do(req) //nolint:gosec
-		if err != nil {
-			return "", err
+		client, err := newClient(token)
+		if err != nil || client == nil {
+			return "", fmt.Errorf("identity unavailable")
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("identity request status %d", resp.StatusCode)
+		user, err := client.UserV1().Users().Get(ctx, "~", metav1.GetOptions{})
+		if err != nil || user.Name == "" {
+			return "", fmt.Errorf("identity unavailable")
 		}
-		var user struct {
-			Metadata struct {
-				Name string `json:"name"`
-			} `json:"metadata"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
-			return "", err
-		}
-		if user.Metadata.Name == "" {
-			return "", fmt.Errorf("identity response has no user name")
-		}
-		return user.Metadata.Name, nil
+		return user.Name, nil
 	}
 }
 
-// inClusterCatalogSource returns a function that reads the catalog ConfigMap from the cluster.
-// In-cluster client configuration is loaded from the mounted service account token.
-// ponytail: direct Kubernetes REST call without client-go to avoid the dependency weight.
+// inClusterRuntimeAttributes reads cluster values through service-account-authenticated typed API calls.
+// Returned values are request-scoped and only become effective manifest attributes.
+func inClusterRuntimeAttributes(log *slog.Logger) func(*http.Request, string) (map[string]string, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Warn("runtime attributes unavailable", "category", "runtime_client")
+		return func(*http.Request, string) (map[string]string, error) {
+			return nil, fmt.Errorf("runtime attributes unavailable")
+		}
+	}
+	config.Timeout = 10 * time.Minute // generous but finite timeout
+	client, err := configclient.NewForConfig(config)
+	if err != nil {
+		log.Warn("runtime attributes unavailable", "category", "runtime_client")
+		return func(*http.Request, string) (map[string]string, error) {
+			return nil, fmt.Errorf("runtime attributes unavailable")
+		}
+	}
+	return newClusterRuntimeAttributes(client, log)
+}
+
+func newClusterRuntimeAttributes(client configclient.Interface, log *slog.Logger) func(*http.Request, string) (map[string]string, error) {
+	return func(r *http.Request, subject string) (map[string]string, error) {
+		fail := func(category string) (map[string]string, error) {
+			if log != nil {
+				log.Warn("runtime attributes unavailable", "attribute", category)
+			}
+			return nil, fmt.Errorf("runtime attributes unavailable")
+		}
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
+		if subject == "" {
+			return fail("user")
+		}
+		if client == nil {
+			return fail("runtime_client")
+		}
+
+		infrastructure, err := client.ConfigV1().Infrastructures().Get(r.Context(), "cluster", metav1.GetOptions{})
+		if err != nil || infrastructure.Status.APIServerURL == "" {
+			return fail("openshift_api_url")
+		}
+		console, err := client.ConfigV1().Consoles().Get(r.Context(), "cluster", metav1.GetOptions{})
+		if err != nil || console.Status.ConsoleURL == "" {
+			return fail("openshift_console_url")
+		}
+		ingress, err := client.ConfigV1().Ingresses().Get(r.Context(), "cluster", metav1.GetOptions{})
+		if err != nil || ingress.Spec.Domain == "" {
+			return fail("openshift_cluster_ingress_domain")
+		}
+
+		return map[string]string{
+			"user":                             subject,
+			"openshift_api_url":                infrastructure.Status.APIServerURL,
+			"openshift_console_url":            console.Status.ConsoleURL,
+			"openshift_cluster_ingress_domain": ingress.Spec.Domain,
+		}, nil
+	}
+}
+
+// inClusterCatalogSource reads the catalog ConfigMap through the service-account-authenticated typed client.
 func inClusterCatalogSource() func(ctx context.Context) (*corev1.ConfigMap, error) {
 	namespace := os.Getenv("NAMESPACE")
 	if namespace == "" {
 		namespace = "interactive-labs-console-plugin"
 	}
-	cmName := "interactive-labs-catalog"
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return newClusterCatalogSource(nil, namespace)
+	}
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return newClusterCatalogSource(nil, namespace)
+	}
+	return newClusterCatalogSource(client, namespace)
+}
 
-	// Read the service account token for in-cluster auth.
-	tokenPath := "/var/run/secrets/kubernetes.io/serviceaccount/token" //nolint:gosec
-	caPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	apiHost := fmt.Sprintf("https://%s", os.Getenv("KUBERNETES_SERVICE_HOST")+":"+os.Getenv("KUBERNETES_SERVICE_PORT"))
-
+func newClusterCatalogSource(client kubernetes.Interface, namespace string) func(context.Context) (*corev1.ConfigMap, error) {
 	return func(ctx context.Context) (*corev1.ConfigMap, error) {
-		token, err := os.ReadFile(tokenPath)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if client == nil {
+			return nil, fmt.Errorf("catalog unavailable")
+		}
+		configMap, err := client.CoreV1().ConfigMaps(namespace).Get(ctx, "interactive-labs-catalog", metav1.GetOptions{})
 		if err != nil {
-			return nil, fmt.Errorf("read service account token: %w", err)
+			return nil, fmt.Errorf("catalog unavailable")
 		}
-
-		// ponytail: stdlib HTTP with CA cert — avoids k8s client-go transport overhead for one call.
-		client, err := tlsClientWithCA(caPath)
-		if err != nil {
-			return nil, fmt.Errorf("create catalog client: %w", err)
-		}
-
-		url := fmt.Sprintf("%s/api/v1/namespaces/%s/configmaps/%s", apiHost, namespace, cmName)
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec
-		req.Header.Set("Authorization", "Bearer "+string(token))
-
-		resp, err := client.Do(req) //nolint:gosec
-		if err != nil {
-			return nil, fmt.Errorf("catalog configmap GET: %w", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("catalog configmap GET status %d", resp.StatusCode)
-		}
-
-		var cm corev1.ConfigMap
-		if err := json.NewDecoder(resp.Body).Decode(&cm); err != nil {
-			return nil, fmt.Errorf("decode catalog configmap: %w", err)
-		}
-		return &cm, nil
+		return configMap, nil
 	}
 }
