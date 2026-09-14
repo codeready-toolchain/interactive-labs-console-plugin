@@ -125,6 +125,21 @@ describe("renderAsciiDoc", () => {
     expect(result.html).toContain("Included resource is unavailable or unsafe.");
   });
 
+  it("rejects before fetching includes when already aborted", async () => {
+    const loadResource = jest.fn(async () => "Included content");
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(renderAsciiDoc({
+      source: "include::partial.adoc[]",
+      sourceURL,
+      attributes: {},
+      loadResource,
+      signal: controller.signal,
+    })).rejects.toMatchObject({ name: "AbortError" });
+    expect(loadResource).not.toHaveBeenCalled();
+  });
+
   it("cancels pending include fetches", async () => {
     let reject!: (reason: unknown) => void;
     const pending = jest.fn(

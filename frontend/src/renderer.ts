@@ -220,36 +220,41 @@ async function renderMermaid(root: DocumentFragment, warnings: string[]): Promis
 }
 
 export async function renderAsciiDoc(input: RenderInput): Promise<RenderResult> {
+  if (input.signal?.aborted) throw abort();
   const controller = new AbortController();
-  input.signal?.addEventListener("abort", () => controller.abort(), { once: true });
-  if (controller.signal.aborted) throw abort();
+  const forwardAbort = () => controller.abort();
+  input.signal?.addEventListener("abort", forwardAbort, { once: true });
 
-  const prefetched = await prefetchIncludes(input.source, input.sourceURL, input.loadResource, controller);
-  if (controller.signal.aborted) throw abort();
-  const warnings: string[] = [];
-  const options = {
-    attributes: {
-      ...Object.fromEntries(Object.entries(input.attributes).map(([name, value]) => [`${name}@`, value])),
-      relfilesuffix: ".adoc",
-    },
-    extension_registry: registry(prefetched.resources, warnings),
-    safe: "secure" as const,
-    standalone: false,
-    to_file: false,
-  };
-  const resolvedXrefs = await resolveXrefTitles(prefetched.source, input, controller, options);
-  const asciidocDocument = await load(resolvedXrefs.source, options);
-  const converted = await asciidocDocument.convert({ standalone: false });
-  if (typeof converted !== "string") throw new Error("AsciiDoc conversion did not return markup.");
+  try {
+    const prefetched = await prefetchIncludes(input.source, input.sourceURL, input.loadResource, controller);
+    if (controller.signal.aborted) throw abort();
+    const warnings: string[] = [];
+    const options = {
+      attributes: {
+        ...Object.fromEntries(Object.entries(input.attributes).map(([name, value]) => [`${name}@`, value])),
+        relfilesuffix: ".adoc",
+      },
+      extension_registry: registry(prefetched.resources, warnings),
+      safe: "secure" as const,
+      standalone: false,
+      to_file: false,
+    };
+    const resolvedXrefs = await resolveXrefTitles(prefetched.source, input, controller, options);
+    const asciidocDocument = await load(resolvedXrefs.source, options);
+    const converted = await asciidocDocument.convert({ standalone: false });
+    if (typeof converted !== "string") throw new Error("AsciiDoc conversion did not return markup.");
 
-  const template = document.createElement("template");
-  template.innerHTML = converted;
-  rewriteImages(template.content, input.sourceURL);
-  highlight(template.content, warnings);
-  template.innerHTML = sanitizeAsciiDocHtml(template.innerHTML);
-  replaceXrefTitles(template.content, resolvedXrefs.titles);
-  await renderMermaid(template.content, warnings);
-  if (controller.signal.aborted) throw abort();
-  const title = asciidocDocument.getDocumentTitle();
-  return { html: template.innerHTML, warnings, title: typeof title === "string" ? title : undefined };
+    const template = document.createElement("template");
+    template.innerHTML = converted;
+    rewriteImages(template.content, input.sourceURL);
+    highlight(template.content, warnings);
+    template.innerHTML = sanitizeAsciiDocHtml(template.innerHTML);
+    replaceXrefTitles(template.content, resolvedXrefs.titles);
+    await renderMermaid(template.content, warnings);
+    if (controller.signal.aborted) throw abort();
+    const title = asciidocDocument.getDocumentTitle();
+    return { html: template.innerHTML, warnings, title: typeof title === "string" ? title : undefined };
+  } finally {
+    input.signal?.removeEventListener("abort", forwardAbort);
+  }
 }
