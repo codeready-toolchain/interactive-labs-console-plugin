@@ -32,6 +32,7 @@ import type { CatalogEntry } from "./types/catalog";
 import type { LabError } from "./types/errors";
 import type { PersistedSession } from "./types/session";
 import type { LabPage } from "./types/manifest";
+import { sanitizeTitle } from "./sanitizer";
 
 type PageState =
   | { status: "loading" }
@@ -366,8 +367,8 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
                     <Title headingLevel="h2">
                       <span dangerouslySetInnerHTML={{
                         __html: renderState.status === "success"
-                          ? renderState.result.title ?? activePanel.currentPagePath
-                          : "",
+                          ? sanitizeTitle(renderState.result.title ?? activePanel.currentPagePath)
+                          : ""
                       }} />
                     </Title>
                     {navigationWarning && <Alert variant="warning" title={navigationWarning} isInline />}

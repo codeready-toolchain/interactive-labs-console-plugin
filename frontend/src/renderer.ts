@@ -1,5 +1,5 @@
 import { load, IncludeProcessor, Registry, type PreprocessorReader } from "@asciidoctor/core";
-import DOMPurify from "dompurify";
+import { sanitizeAsciiDocHtml, sanitizeMermaidSvg } from "./sanitizer";
 import hljs from "highlight.js";
 
 const MAX_INCLUDE_DEPTH = 64;
@@ -208,11 +208,7 @@ async function renderMermaid(root: DocumentFragment, warnings: string[]): Promis
     const code = blocks[index];
     try {
       const { svg } = await mermaid.render(`interactive-labs-mermaid-${index}`, code.textContent ?? "");
-      const cleanSvg = DOMPurify.sanitize(svg, {
-        USE_PROFILES: { svg: true, svgFilters: true },
-        FORBID_TAGS: ["form"],
-        FORBID_ATTR: [],
-      });
+      const cleanSvg = sanitizeMermaidSvg(svg);
       const wrapper = document.createElement("div");
       wrapper.innerHTML = cleanSvg;
       code.closest("pre")?.replaceWith(wrapper);
@@ -250,10 +246,7 @@ export async function renderAsciiDoc(input: RenderInput): Promise<RenderResult> 
   template.innerHTML = converted;
   rewriteImages(template.content, input.sourceURL);
   highlight(template.content, warnings);
-  template.innerHTML = DOMPurify.sanitize(template.innerHTML, {
-    FORBID_TAGS: ["style", "form"],
-    FORBID_ATTR: ["style"],
-  });
+  template.innerHTML = sanitizeAsciiDocHtml(template.innerHTML);
   replaceXrefTitles(template.content, resolvedXrefs.titles);
   await renderMermaid(template.content, warnings);
   if (controller.signal.aborted) throw abort();
