@@ -92,7 +92,7 @@ Relative links resolve by browser URL semantics from active source and navigate 
 
 Asciidoctor safe mode alone does not establish browser XSS safety. Initial fixture supports syntax-highlighted source blocks and Mermaid diagrams, not arbitrary executable extensions or author-supplied SVG. Highlighting consumes text content and rejects unescaped HTML. Mermaid runs with strict security, no auto-start or click/callback binding; generated SVG receives separate DOMPurify SVG/SVG-filter-profile sanitization, which retains allowed Mermaid styles and SVG filter elements, after final AsciiDoc HTML sanitization. Recoverable rejected content/resources and Mermaid/highlighter failures render explicit inline warnings; page fetch, conversion, or sanitizer failures render safe actionable page error. Do not share Asciidoctor's global logger across concurrent page/description conversions.
 
-A Quick Start-compatible AsciiDoc macro authors each Console guidance link and carries a same-Console route plus optional symbolic target ID. Plugin translates it to a typed instruction, then validates route and target against Console-supported Quick Start addressing. It navigates first, waits for target render, then finds matching `data-quickstart-id`, scrolls it into view, and displays spotlight. Missing or unsupported target falls back to route-only navigation. Dismiss spotlight on target interaction, Escape, route change, or timeout.
+**Implemented and verified:** `console:<quickstart-data-id>[label]` accepts only the fixed 25-ID Console registry; authors cannot provide a route or selector. Renderer emits fixed-route anchors with per-render provenance metadata. Plugin revalidates metadata, ID, and href before querying exact visible `data-quickstart-id` nodes. Route-backed IDs navigate once before waiting up to 10 seconds; visible-only IDs do not navigate. Found targets scroll into view and receive non-modal spotlight; target interaction, Escape, route change, timeout, panel close, unmount, or replacement cancels it. Drawer minimizes only when it horizontally overlaps target. `resource:` macros require two or three GVK components (`version/kind` or `group/version/kind`), enforce scope and attribute schema, and reject `namespace` with cluster scope. Each GVK component and every nonempty supplied `name`/`namespace` selector is URI-encoded into fixed derived same-origin Console resource list/details paths; Console resolves resource existence. Authors cannot supply routes or filter syntax. Resource links do not use spotlight.
 
 ```mermaid
 sequenceDiagram
@@ -101,15 +101,17 @@ sequenceDiagram
   participant UI as Plugin UI
   participant Console as OpenShift Console
 
-  User->>Page: Activate guidance link
-  Page->>UI: route + target ID
-  UI->>UI: Validate both values
-  UI->>Console: Navigate to route
+  User->>Page: Activate console:id[label]
+  Page->>UI: renderer-provenanced target ID
+  UI->>UI: Validate ID and fixed registry route
+  alt absent route-backed target
+    UI->>Console: Navigate to fixed route
+  end
+  UI->>Console: Find exact visible data-quickstart-id
   alt registered target becomes available
-    UI->>Console: Find data-quickstart-id
     UI->>User: Scroll and spotlight target
   else absent or unsupported target
-    UI->>Console: Route only
+    UI->>User: Announce unavailable; retain route fallback if navigated
   end
 ```
 
@@ -130,7 +132,7 @@ Evidence, checkpoint, and completion rules remain open. Current provisional dire
 | **Helm release identity** | Server-derived identity for one user's deployment of one configured lab branch into one normalized set of namespace bindings. | Never generate, persist as authority, or submit it; use it only as backend-provided correlation context. |
 | **Setup result** | Final backend result for optional Helm prerequisite installation. | Show typed status and safe next action. |
 | **Lab page** | One lab-local AsciiDoc page. | Resolve allowed relative links; show loading, missing-page, malformed-content states. |
-| **Console guidance link** | Typed `{ route, targetId? }` instruction using Console-supported Quick Start addressing, not URL/selector escape hatch. | Validate, navigate, attempt spotlight, fallback safely. |
+| **Console guidance link** | Renderer-generated `console:<quickstart-data-id>[label]` using fixed registry route/target behavior, not URL/selector escape hatch. | Revalidate, route only when registry requires it, attempt spotlight, fallback safely. |
 | **Checkpoint** | Provisional typed section-progress marker; current candidate is `type: manual`. | Never present user attestation as automated verification or settled completion evidence. |
 
 ### Lab content delivery

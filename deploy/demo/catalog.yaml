@@ -5,7 +5,7 @@ metadata:
 data:
   catalog.yaml: |
     - repository: https://github.com/metlos/devsandbox-ocp-getting-started-lab.git
-      branch: master
+      branch: links
       labPath: lab-01
     - repository: https://github.com/metlos/devsandbox-ocp-getting-started-lab.git
       branch: master

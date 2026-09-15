@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useNavigate } from "react-router-dom-v5-compat";
+import { useLocation, useNavigate } from "react-router-dom-v5-compat";
 import "./interactive-labs.css";
 import {
   Alert,
@@ -51,6 +51,18 @@ type RenderState =
   | { status: "success"; result: RenderResult }
   | { status: "error"; message: string };
 
+type GuidanceRequest = {
+  animationKey: number;
+  controller: AbortController;
+  id: string;
+  expectedRoute: { pathname: string; search: string };
+  startingRoute: { pathname: string; search: string };
+  phase: "waiting-route" | "waiting-target" | "spotlight";
+  target?: HTMLElement;
+};
+
+type GuidanceState = GuidanceRequest | { phase: "notice"; message: string };
+
 type InteractiveLabsContextValue = {
   launch: (catalogRef: string, trigger: HTMLElement, requestedPageURL?: string) => Promise<void>;
   loadingCatalogRef?: string;
@@ -61,6 +73,52 @@ type InteractiveLabsContextValue = {
 const SESSION_PREFIX = "interactive-labs-console-plugin:session:";
 const PROXY_BASE = "/api/proxy/plugin/interactive-labs-console-plugin/backend";
 const LINK_WARNING = "Link is unavailable or unsafe.";
+const GUIDANCE_UNAVAILABLE = "Console target is unavailable.";
+const GUIDANCE_HIGHLIGHTED = "Console target highlighted.";
+const consoleGuidanceRegistry: Record<string, { route?: string }> = {
+  "qs-nav-add": { route: "/add" },
+  "qs-nav-topology": { route: "/topology" },
+  "qs-admin-nav-topology": { route: "/topology" },
+  "qs-nav-search": { route: "/search-page" },
+  "qs-nav-project": { route: "/project-details" },
+  "qs-nav-functions": { route: "/functions" },
+  "qs-nav-helm": { route: "/helm" },
+  "qs-nav-builds": { route: "/builds" },
+  "qs-nav-monitoring": { route: "/dev-monitoring" },
+  "qs-nav-home": {},
+  "qs-nav-ecosystem": {},
+  "qs-nav-workloads": {},
+  "qs-nav-networking": {},
+  "qs-nav-storage": {},
+  "qs-nav-compute": {},
+  "qs-nav-usermanagement": {},
+  "qs-nav-administration": {},
+  "qs-nav-serverless": {},
+  "qs-perspective-switcher": {},
+  "qs-masthead-cloudshell": {},
+  "qs-masthead-import": {},
+  "qs-masthead-utilitymenu": {},
+  "qs-masthead-usermenu": {},
+  "qs-masthead-notifications": {},
+  "qs-masthead-help": {},
+};
+
+const routeMatches = (
+  location: { pathname: string; search: string },
+  expected: { pathname: string; search: string },
+): boolean => location.pathname === expected.pathname && location.search === expected.search;
+
+const visibleGuidanceTarget = (id: string): HTMLElement | undefined =>
+  Array.from(document.querySelectorAll<HTMLElement>("[data-quickstart-id]")).find((target) => {
+    const rect = target.getBoundingClientRect();
+    const style = window.getComputedStyle(target);
+    return target.dataset.quickstartId === id && target.isConnected && !target.hidden &&
+      rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  });
+
+const overlapsHorizontally = (first: DOMRect, second: DOMRect): boolean =>
+  first.left < second.right && first.right > second.left;
+
 const InteractiveLabsContext = React.createContext<InteractiveLabsContextValue | undefined>(undefined);
 
 const sessionKey = (catalogRef: string) => `${SESSION_PREFIX}${catalogRef}`;
@@ -131,9 +189,14 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const restoreFocusRef = React.useRef<HTMLButtonElement | null>(null);
   const renderedContentRef = React.useRef<HTMLDivElement | null>(null);
   const pendingFragmentRef = React.useRef<string>();
+  const guidanceControllerRef = React.useRef<AbortController>();
+  const guidanceAnimationKeyRef = React.useRef(0);
+  const mountedRef = React.useRef(true);
+  const [guidance, setGuidance] = React.useState<GuidanceState>();
   const [navigationWarning, setNavigationWarning] = React.useState<string>();
   const isOpen = activePanel?.panelMode === "open";
   const navigate = useNavigate();
+  const location = useLocation();
   const pagePaths = activePanel ? getNavigablePagePaths(activePanel.pages) : [];
   const currentPageIndex = activePanel ? pagePaths.indexOf(activePanel.currentPagePath) : -1;
 
@@ -202,7 +265,26 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
     });
   }, []);
 
-  const closePanel = React.useCallback(() => setActivePanel(null), []);
+  const clearGuidance = React.useCallback((message?: string): void => {
+    guidanceControllerRef.current?.abort();
+    guidanceControllerRef.current = undefined;
+    if (mountedRef.current) setGuidance(message ? { phase: "notice", message } : undefined);
+  }, []);
+
+  const unavailableGuidance = React.useCallback((controller: AbortController): void => {
+    if (controller.signal.aborted) return;
+    controller.abort();
+    if (guidanceControllerRef.current === controller) guidanceControllerRef.current = undefined;
+    if (!mountedRef.current) return;
+    setGuidance((current) => current && "controller" in current && current.controller === controller
+      ? { phase: "notice", message: GUIDANCE_UNAVAILABLE }
+      : current);
+  }, []);
+
+  const closePanel = React.useCallback(() => {
+    clearGuidance();
+    setActivePanel(null);
+  }, [clearGuidance]);
 
   const selectPage = React.useCallback((path: string): void => {
     setNavigationWarning(undefined);
@@ -214,10 +296,79 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
     });
   }, []);
 
-  const handleRenderedLink = React.useCallback((event: React.MouseEvent<HTMLDivElement>): void => {
+  const spotlightGuidanceTarget = React.useCallback((request: GuidanceRequest, target: HTMLElement): void => {
+    const panel = document.getElementById("interactive-labs-drawer-panel");
+    const minimize = isOpen && panel && overlapsHorizontally(target.getBoundingClientRect(), panel.getBoundingClientRect());
+    if (minimize) setPanelMode("minimized");
+    const frame = window.requestAnimationFrame(() => {
+      if (request.controller.signal.aborted || !visibleGuidanceTarget(request.id)?.isSameNode(target)) {
+        unavailableGuidance(request.controller);
+        return;
+      }
+      target.scrollIntoView?.({ block: "center", inline: "nearest" });
+      if (target.matches("a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])")) {
+        target.focus({ preventScroll: true });
+      }
+      setGuidance((current) => current && "controller" in current && current.controller === request.controller
+        ? { ...current, phase: "spotlight", target }
+        : current);
+    });
+    request.controller.signal.addEventListener("abort", () => window.cancelAnimationFrame(frame), { once: true });
+  }, [isOpen, setPanelMode, unavailableGuidance]);
+
+  const activateGuidance = React.useCallback((id: string): void => {
+    const entry = consoleGuidanceRegistry[id];
+    if (!entry) return;
+    clearGuidance();
+    const controller = new AbortController();
+    guidanceControllerRef.current = controller;
+    const startingRoute = { pathname: location.pathname, search: location.search };
+    const target = visibleGuidanceTarget(id);
+    const expectedRoute = entry.route && !target
+      ? { pathname: entry.route, search: "" }
+      : startingRoute;
+    const request: GuidanceRequest = {
+      animationKey: ++guidanceAnimationKeyRef.current,
+      controller,
+      id,
+      expectedRoute,
+      startingRoute,
+      phase: target ? "spotlight" : entry.route && !routeMatches(startingRoute, expectedRoute)
+        ? "waiting-route"
+        : "waiting-target",
+      target,
+    };
+    setGuidance(request);
+    if (target) {
+      spotlightGuidanceTarget(request, target);
+    } else if (entry.route) {
+      navigate(entry.route);
+    } else {
+      unavailableGuidance(controller);
+    }
+  }, [clearGuidance, location.pathname, location.search, navigate, spotlightGuidanceTarget, unavailableGuidance]);
+
+  const handleRenderedLink = React.useCallback((event: React.MouseEvent<HTMLDivElement> | MouseEvent): void => {
     if (event.defaultPrevented || event.button !== 0 || !activePanel) return;
     const link = (event.target as Element).closest("a[href]") as HTMLAnchorElement | null;
     const href = link?.getAttribute("href");
+    const guidanceID = link?.dataset.interactiveLabsGuidanceId;
+    if (guidanceID) {
+      event.preventDefault();
+      const entry = consoleGuidanceRegistry[guidanceID];
+      const guidanceLink = renderState.status === "success"
+        ? renderState.result.guidanceLinks?.find((candidate) =>
+          candidate.id === guidanceID && candidate.href === href && candidate.token === link?.dataset.interactiveLabsGuidanceToken,
+        )
+        : undefined;
+      if (!entry || !guidanceLink || href !== (entry.route ?? "#")) {
+        setNavigationWarning(LINK_WARNING);
+        return;
+      }
+      event.stopPropagation();
+      activateGuidance(guidanceID);
+      return;
+    }
     const currentPage = activePanel.pages.find((page) => page.path === activePanel.currentPagePath);
     if (!href || !currentPage) return;
 
@@ -266,7 +417,81 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
     }
     event.preventDefault();
     setNavigationWarning(LINK_WARNING);
-  }, [activePanel, navigate, selectPage]);
+  }, [activePanel, activateGuidance, navigate, renderState, selectPage]);
+
+  React.useEffect(() => () => {
+    mountedRef.current = false;
+    guidanceControllerRef.current?.abort();
+  }, []);
+
+  React.useEffect(() => {
+    if (!guidance || guidance.phase === "notice") return;
+    if (guidance.phase === "waiting-route") {
+      if (routeMatches(location, guidance.expectedRoute)) {
+        setGuidance((current) => current && "controller" in current && current.controller === guidance.controller
+          ? { ...current, phase: "waiting-target" }
+          : current);
+      } else if (!routeMatches(location, guidance.startingRoute)) {
+        unavailableGuidance(guidance.controller);
+      }
+      return;
+    }
+    if (!routeMatches(location, guidance.expectedRoute)) clearGuidance();
+  }, [clearGuidance, guidance, location, unavailableGuidance]);
+
+  React.useEffect(() => {
+    if (!guidance || guidance.phase !== "waiting-target") return undefined;
+    const findTarget = (): void => {
+      const target = visibleGuidanceTarget(guidance.id);
+      if (target) spotlightGuidanceTarget(guidance, target);
+    };
+    const observer = new MutationObserver(findTarget);
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class", "data-quickstart-id", "hidden", "style"],
+    });
+    const timeout = window.setTimeout(() => unavailableGuidance(guidance.controller), 10_000);
+    findTarget();
+    return () => {
+      observer.disconnect();
+      window.clearTimeout(timeout);
+    };
+  }, [guidance, spotlightGuidanceTarget, unavailableGuidance]);
+
+  React.useEffect(() => {
+    if (!guidance || guidance.phase !== "spotlight" || !guidance.target) return undefined;
+    const { controller, id, target } = guidance;
+    const dismiss = (): void => clearGuidance();
+    const onTargetKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Enter" || event.key === " ") dismiss();
+    };
+    const onDocumentKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") dismiss();
+    };
+    const observer = new MutationObserver(() => {
+      if (!controller.signal.aborted && (!target.isConnected || !visibleGuidanceTarget(id)?.isSameNode(target))) dismiss();
+    });
+    target.addEventListener("pointerdown", dismiss);
+    target.addEventListener("click", dismiss);
+    target.addEventListener("keydown", onTargetKeyDown);
+    document.addEventListener("click", dismiss);
+    document.addEventListener("keydown", onDocumentKeyDown);
+    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+    const timeout = window.setTimeout(() => {
+      if (!controller.signal.aborted) dismiss();
+    }, 17_800);
+    return () => {
+      target.removeEventListener("pointerdown", dismiss);
+      target.removeEventListener("click", dismiss);
+      target.removeEventListener("keydown", onTargetKeyDown);
+      document.removeEventListener("click", dismiss);
+      document.removeEventListener("keydown", onDocumentKeyDown);
+      observer.disconnect();
+      window.clearTimeout(timeout);
+    };
+  }, [clearGuidance, guidance]);
 
   React.useEffect(() => {
     if (!activePanel || activePanel.panelMode !== "open") return undefined;
@@ -310,6 +535,9 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
     () => ({ launch, loadingCatalogRef, launchError, setupDeferred }),
     [launch, launchError, loadingCatalogRef, setupDeferred],
   );
+  const spotlightRect = guidance?.phase === "spotlight" && guidance.target
+    ? guidance.target.getBoundingClientRect()
+    : undefined;
 
   return (
     <InteractiveLabsContext.Provider value={value}>
@@ -323,6 +551,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
           <DrawerContent
             panelContent={isOpen ? (
               <DrawerPanelContent
+                id="interactive-labs-drawer-panel"
                 isResizable
                 minSize="20rem"
                 defaultSize="40%"
@@ -399,6 +628,24 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
             <div />
           </DrawerContent>
         </Drawer>
+      )}
+      {guidance?.phase === "spotlight" && guidance.target && spotlightRect && (
+        <div
+          key={guidance.animationKey}
+          aria-hidden="true"
+          className="interactive-labs-guidance-ring"
+          style={{
+            left: spotlightRect.left,
+            top: spotlightRect.top,
+            width: spotlightRect.width,
+            height: spotlightRect.height,
+          }}
+        />
+      )}
+      {guidance && (
+        <p className="interactive-labs-guidance-status" role="status">
+          {guidance.phase === "notice" ? guidance.message : GUIDANCE_HIGHLIGHTED}
+        </p>
       )}
       {activePanel?.panelMode === "minimized" && (
         <Button

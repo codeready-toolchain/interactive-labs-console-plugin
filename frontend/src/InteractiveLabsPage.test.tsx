@@ -16,7 +16,11 @@ import { renderAsciiDoc } from './renderer';
 jest.mock('./api/client');
 jest.mock('./renderer', () => ({ renderAsciiDoc: jest.fn() }));
 const mockNavigate = jest.fn();
-jest.mock('react-router-dom-v5-compat', () => ({ useNavigate: () => mockNavigate }));
+let mockLocation = { pathname: '/interactive-labs', search: '' };
+jest.mock('react-router-dom-v5-compat', () => ({
+  useNavigate: () => mockNavigate,
+  useLocation: () => mockLocation,
+}));
 
 const mockListCatalog = client.listCatalog as jest.MockedFunction<typeof client.listCatalog>;
 const mockLoadLabBundle = client.loadLabBundle as jest.MockedFunction<typeof client.loadLabBundle>;
@@ -49,7 +53,9 @@ beforeEach(() => {
   mockRenderAsciiDoc.mockReset();
   mockRenderAsciiDoc.mockImplementation(() => new Promise<never>(() => {}));
   mockNavigate.mockReset();
+  mockLocation = { pathname: '/interactive-labs', search: '' };
   localStorage.clear();
+  document.querySelectorAll('[data-test-guidance-target]').forEach((target) => target.remove());
 });
 
 afterEach(() => {
@@ -125,6 +131,34 @@ const renderCatalog = async () => {
       container,
     );
   });
+};
+
+const guidanceTarget = (id: string, rect = { left: 10, right: 110, top: 10, bottom: 40 }): HTMLElement => {
+  const target = document.createElement('button');
+  target.dataset.quickstartId = id;
+  target.dataset.testGuidanceTarget = '';
+  target.getBoundingClientRect = () => ({ ...rect, width: rect.right - rect.left, height: rect.bottom - rect.top, x: rect.left, y: rect.top, toJSON: () => ({}) }) as DOMRect;
+  document.body.appendChild(target);
+  return target;
+};
+
+const launchGuidanceLab = async (html: string, trusted = true): Promise<void> => {
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  const guidanceLinks = Array.from(template.content.querySelectorAll<HTMLAnchorElement>('[data-interactive-labs-guidance-id]'))
+    .map((link, index) => {
+      const token = `guidance-${index}`;
+      link.dataset.interactiveLabsGuidanceToken = token;
+      return { id: link.dataset.interactiveLabsGuidanceId!, href: link.getAttribute('href')!, token };
+    });
+  mockLoadLabBundle.mockResolvedValue(noChartBundle);
+  mockRenderAsciiDoc.mockImplementation(({ sourceURL }) => Promise.resolve({
+    html: sourceURL.endsWith('/lab.yaml') ? '<p>Description</p>' : template.innerHTML,
+    warnings: [],
+    guidanceLinks: trusted ? guidanceLinks : [],
+  }));
+  await renderCatalog();
+  await act(async () => { getButton(/^Launch$/).click(); });
 };
 
 describe('InteractiveLabsPage', () => {
@@ -718,6 +752,195 @@ describe('InteractiveLabsPage', () => {
     expect(localStorage.getItem(sessionKey('lab-1'))).toBe(
       JSON.stringify({ currentPagePath: 'pages/a-first.adoc', panelMode: 'open' }),
     );
+  });
+
+  test('highlights only renderer-created valid guidance markers already visible in Console', async () => {
+    const target = guidanceTarget('qs-nav-search');
+    const scrollIntoView = jest.fn();
+    target.scrollIntoView = scrollIntoView;
+    await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>');
+
+    const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Search')!;
+    expect(link.dataset.interactiveLabsGuidanceId).toBe('qs-nav-search');
+    expect(link.closest('.interactive-labs-content')).not.toBeNull();
+    const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+    await act(async () => { link.dispatchEvent(click); });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+    expect(click.defaultPrevented).toBe(true);
+    expect(mockNavigate).not.toHaveBeenCalled();
+    expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+    expect(scrollIntoView).toHaveBeenCalled();
+    expect(container.querySelector('[role="status"]')?.textContent).toMatch(/highlighted/i);
+  });
+
+  test('rejects a forged guidance marker rather than spotlighting its matching target', async () => {
+    const target = guidanceTarget('qs-nav-search');
+    await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>', false);
+
+    await act(async () => {
+      Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Search')!
+        .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    });
+
+    expect(mockNavigate).not.toHaveBeenCalled();
+    expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+    expect(container.textContent).toMatch(/unavailable or unsafe/i);
+    target.remove();
+  });
+
+  test('revalidates a guidance marker against fixed registry instead of trusting its href or arbitrary ID', async () => {
+    await launchGuidanceLab([
+      '<a href="/arbitrary" data-interactive-labs-guidance-id="qs-nav-search">Bad route</a>',
+      '<a href="/search-page" data-interactive-labs-guidance-id="not-a-registry-id">Bad ID</a>',
+    ].join(''));
+
+    for (const link of Array.from(container.querySelectorAll('a'))) {
+      await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+    }
+
+    expect(mockNavigate).not.toHaveBeenCalled();
+    expect(document.querySelector('[data-quickstart-id="not-a-registry-id"]')).toBeNull();
+    expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+  });
+
+  test('never navigates or waits for an absent visible-only guidance target', async () => {
+    await launchGuidanceLab('<a href="#" data-interactive-labs-guidance-id="qs-nav-home">Home</a>');
+    const observer = jest.spyOn(window, 'MutationObserver');
+
+    await act(async () => {
+      Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Home')!
+        .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    });
+
+    expect(mockNavigate).not.toHaveBeenCalled();
+    expect(observer).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="status"]')?.textContent).toMatch(/unavailable/i);
+    observer.mockRestore();
+  });
+
+  test('navigates route-backed guidance once, then observes exact delayed visible target at expected route', async () => {
+    mockNavigate.mockImplementation((route: string) => { mockLocation = { pathname: route, search: '' }; });
+    await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>');
+    const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Search')!;
+
+    await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+    expect(mockNavigate).toHaveBeenCalledTimes(1);
+    expect(mockNavigate).toHaveBeenCalledWith('/search-page');
+
+    const target = guidanceTarget('qs-nav-search');
+    const scrollIntoView = jest.fn();
+    target.scrollIntoView = scrollIntoView;
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+
+    expect(scrollIntoView).toHaveBeenCalled();
+    expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+  });
+
+  test('dismisses spotlight on any subsequent document click', async () => {
+    const target = guidanceTarget('qs-nav-search');
+    await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>');
+    const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Search')!;
+
+    await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+    expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+
+    await act(async () => { document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+    target.remove();
+  });
+
+  test('keeps replacement guidance spotlight after its activating click bubbles', async () => {
+    guidanceTarget('qs-nav-search');
+    guidanceTarget('qs-nav-topology', { left: 220, right: 320, top: 10, bottom: 40 });
+    await launchGuidanceLab([
+      '<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>',
+      '<a href="/topology" data-interactive-labs-guidance-id="qs-nav-topology">Topology</a>',
+    ].join(''));
+    const search = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Search')!;
+    const topology = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Topology')!;
+
+    await act(async () => { search.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+    const previousRing = container.querySelector<HTMLElement>('.interactive-labs-guidance-ring');
+    await act(async () => { topology.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+
+    const ring = container.querySelector<HTMLElement>('.interactive-labs-guidance-ring');
+    expect(ring).not.toBeNull();
+    expect(ring).not.toBe(previousRing);
+    expect(ring?.style.left).toBe('220px');
+  });
+
+  test('keeps spotlight through Quick Starts pulse and removes it after its full animation', async () => {
+    jest.useFakeTimers();
+    try {
+      guidanceTarget('qs-nav-search');
+      await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>');
+      const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Search')!;
+
+      await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+      await act(async () => { jest.advanceTimersByTime(16); });
+      expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+
+      await act(async () => { jest.advanceTimersByTime(10_000); });
+      expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+      await act(async () => { jest.advanceTimersByTime(7_800); });
+      expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('dismisses spotlight on Escape and target interaction, and cancels it on drawer close', async () => {
+    const target = guidanceTarget('qs-nav-search');
+    await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>');
+    const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Search')!;
+
+    await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+    expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+    await act(async () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); });
+    expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+
+    await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+    await act(async () => { target.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+
+    await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+    act(() => { getButton(/close/i).click(); });
+    expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+  });
+
+  test('minimizes only horizontally overlapping guidance targets; resource links retain ordinary open-drawer navigation', async () => {
+    const target = guidanceTarget('qs-nav-search', { left: 700, right: 800, top: 900, bottom: 930 });
+    const scrollIntoView = jest.fn();
+    target.scrollIntoView = scrollIntoView;
+    await launchGuidanceLab([
+      '<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>',
+      '<a href="/k8s/all-namespaces/apps~v1~Deployment">Deployment</a>',
+    ].join(''));
+    const panel = container.querySelector('[class*="drawer__panel"]') as HTMLElement;
+    panel.getBoundingClientRect = () => ({ left: 600, right: 1000, top: 0, bottom: 1000, width: 400, height: 1000, x: 600, y: 0, toJSON: () => ({}) }) as DOMRect;
+
+    await act(async () => {
+      Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Search')!
+        .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+    expect(getButton(/restore lab/i)).toBeTruthy();
+    expect(scrollIntoView).toHaveBeenCalled();
+
+    act(() => { getButton(/restore lab/i).click(); });
+    await act(async () => {});
+    await act(async () => {
+      Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Deployment')!
+        .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    });
+    expect(mockNavigate).toHaveBeenLastCalledWith('/k8s/all-namespaces/apps~v1~Deployment');
+    expect(container.querySelector('button[aria-label="Minimize lab"]')).not.toBeNull();
   });
 
   test('shows empty state when catalog returns no items', async () => {

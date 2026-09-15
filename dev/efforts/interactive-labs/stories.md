@@ -76,7 +76,7 @@ Labs with prerequisites need a namespace-selection policy that preserves user in
 
 **Dependencies:** STORY-1, STORY-3.
 
-## ☐ STORY-6: Guide users to supported Console targets
+## ☑ STORY-6: Guide users to supported Console targets
 
 Instructions must direct users to relevant Console UI without binding content to private selectors or unsafe arbitrary routes.
 

@@ -300,3 +300,54 @@
 .interactive-labs-content .icon i::after { hyphens: none; }
 .interactive-labs-content th.tableblock,
 .interactive-labs-content td.tableblock { word-break: break-word; }
+
+@keyframes interactive-labs-guidance-expand {
+  from { outline-offset: -4px; outline-width: 4px; opacity: 1; }
+  to { outline-offset: 21px; outline-width: 12px; opacity: 0; }
+}
+
+@keyframes interactive-labs-guidance-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes interactive-labs-guidance-fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+.interactive-labs-guidance-ring {
+  box-shadow: inset 0 0 0 4px var(--pf-t--global--color--brand--default, #06c);
+  opacity: 0;
+  pointer-events: none;
+  position: fixed;
+  z-index: 1001;
+  animation: 0.4s interactive-labs-guidance-fade-in 0s ease-in-out,
+    5s interactive-labs-guidance-fade-out 12.8s ease-in-out;
+  animation-fill-mode: forwards;
+}
+
+.interactive-labs-guidance-ring::after {
+  animation: 1.2s interactive-labs-guidance-expand 1.6s ease-out;
+  animation-fill-mode: forwards;
+  bottom: 0;
+  content: '';
+  left: 0;
+  outline: 4px solid var(--pf-t--global--color--brand--default, #06c);
+  outline-offset: -4px;
+  pointer-events: none;
+  position: absolute;
+  right: 0;
+  top: 0;
+}
+
+.interactive-labs-guidance-status {
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  position: absolute;
+  width: 1px;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
