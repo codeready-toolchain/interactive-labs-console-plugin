@@ -134,6 +134,15 @@ func TestReadCatalog_RejectsUnsafeSourceLocator(t *testing.T) {
 		`- repository: https://github.com/redhat/lab
   branch: main
   labPath: /lab`,
+		`- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: ../lab`,
+		`- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: lab/../other`,
+		`- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: lab/../../etc`,
 	} {
 		_, err := catalog.Read(catalogCM(content))
 		require.ErrorContains(t, err, "configuration_error")

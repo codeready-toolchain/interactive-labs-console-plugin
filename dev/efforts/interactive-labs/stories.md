@@ -47,19 +47,17 @@ Users need to launch a selected supported lab beside Console work with predictab
 
 ## ☐ STORY-4: Render restricted AsciiDoc and navigate lab pages
 
-Lab authors need inter-linked instructional pages without allowing content to execute code, escape its bundle, or inject unsafe DOM into Console.
+Lab authors need inter-linked instructions without content executing code, escaping its bundle, or injecting unsafe Console DOM.
 
-**Goal:** Render documented supported AsciiDoc subset, navigate allowed lab pages, and resolve approved repository-local includes.
+**Goal:** Render supported AsciiDoc, navigate approved lab pages, and resolve same-repository resources.
 
-**Planning note:** Catalog description is AsciiDoc in `lab.yaml` `metadata.description`. Client renders it through this story's
-full restricted, sanitised path with `lab.yaml` as relative-resource base; STORY-1 only transports raw text.
+**Planning note:** Catalog response exposes normalized server-derived `labPath`; client uses it only to derive the `lab.yaml` base for raw `metadata.description` AsciiDoc.
 
 **Acceptance criteria:**
-- Asciidoctor.js renders supported fixture-lab content and catalog descriptions after DOM sanitization, including syntax-highlighted source blocks and Mermaid diagrams.
-- Backend runtime attributes override author-defined attributes.
-- Bundle lists normalized navigable paths under `labPath/content` with server-approved source URLs; page navigation and ordinary links use only those paths in drawer, preserving same-page fragments. Validated page links in catalog descriptions are explicit Launch intent and open drawer at target after bundle validation.
-- Includes and images may resolve outside `labPath` only within same approved repository through backend-validated resource URLs.
-- Recoverable unsupported content, missing resources, Mermaid, and highlighter failures show explicit inline warnings; fetch, conversion, or sanitization failures show safe actionable page error. Remote includes, executable extensions, arbitrary filesystem access, repository-root escapes, and unsupported raw HTML never execute.
+- Use exact Asciidoctor, DOMPurify, highlight.js, and Mermaid dependencies to render supported fixture content after sanitization; final backend attributes are hard-set in Asciidoctor.
+- Bundle page descriptors carry backend-relative approved resource paths; client resolves them through Console proxy. Resource reads use a quoted cached Git-HEAD SHA as shared ETag with `private, no-cache`; resource-size caps are not yet enforced.
+- Includes/images stay in approved repository. Relative links open only known descriptor pages in drawer; external HTTP(S) opens safe new tab; Console URLs navigate same tab without closing drawer; plugin resource URLs warn.
+- Description page link validates bundle then explicitly launches requested page. Recoverable rendering/resource faults warn; fetch, conversion, and sanitization faults show safe actionable page error.
 
 **Dependencies:** STORY-1, STORY-3, STORY-9.
 

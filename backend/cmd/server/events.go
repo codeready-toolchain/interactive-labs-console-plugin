@@ -1,18 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"fmt"
 	"log/slog"
-	"net/http"
-	"net/url"
 	"os"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 )
 
 type eventKey struct {
@@ -24,17 +22,18 @@ type catalogEventPoster struct {
 	mu        sync.Mutex
 	attempted map[eventKey]struct{}
 	namespace string
-	apiHost   string
-	token     func() (string, error)
-	client    *http.Client
+	events    corev1client.EventInterface
 	log       *slog.Logger
 }
 
-func newCatalogEventPoster(namespace, apiHost string, token func() (string, error), client *http.Client, log *slog.Logger) *catalogEventPoster {
-	return &catalogEventPoster{attempted: make(map[eventKey]struct{}), namespace: namespace, apiHost: apiHost, token: token, client: client, log: log}
+func newCatalogEventPoster(namespace string, events corev1client.EventInterface, log *slog.Logger) *catalogEventPoster {
+	return &catalogEventPoster{attempted: make(map[eventKey]struct{}), namespace: namespace, events: events, log: log}
 }
 
 func (p *catalogEventPoster) Post(ctx context.Context, catalogRef, reason string) {
+	if ctx.Err() != nil {
+		return
+	}
 	key := eventKey{catalogRef: catalogRef, reason: reason}
 	p.mu.Lock()
 	if _, exists := p.attempted[key]; exists {
@@ -44,13 +43,11 @@ func (p *catalogEventPoster) Post(ctx context.Context, catalogRef, reason string
 	p.attempted[key] = struct{}{}
 	p.mu.Unlock()
 
-	token, err := p.token()
-	if err != nil {
+	if p.events == nil {
 		p.warn(catalogRef, reason)
 		return
 	}
-	body, err := json.Marshal(corev1.Event{
-		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Event"},
+	_, err := p.events.Create(ctx, &corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "interactive-labs-catalog-",
 			Annotations:  map[string]string{"interactive-labs.openshift.io/catalog-ref": catalogRef},
@@ -59,27 +56,10 @@ func (p *catalogEventPoster) Post(ctx context.Context, catalogRef, reason string
 		Reason:         reason,
 		Message:        "Configured lab omitted from catalog",
 		Type:           corev1.EventTypeWarning,
-	})
+	}, metav1.CreateOptions{})
 	if err != nil {
 		p.warn(catalogRef, reason)
-		return
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiHost+"/api/v1/namespaces/"+url.PathEscape(p.namespace)+"/events", bytes.NewReader(body))
-	if err != nil {
-		p.warn(catalogRef, reason)
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := p.client.Do(req)
-	if err != nil || resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		if resp != nil {
-			resp.Body.Close()
-		}
-		p.warn(catalogRef, reason)
-		return
-	}
-	resp.Body.Close()
 }
 
 func (p *catalogEventPoster) warn(catalogRef, reason string) {
@@ -93,16 +73,19 @@ func inClusterCatalogEventPoster(log *slog.Logger) func(context.Context, string,
 	if namespace == "" {
 		namespace = "interactive-labs-console-plugin"
 	}
-	client, err := tlsClientWithCA("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+	config, err := rest.InClusterConfig()
 	if err != nil {
-		log.Warn("catalog event client unavailable")
+		if log != nil {
+			log.Warn("catalog event client unavailable")
+		}
 		return func(context.Context, string, string) {}
 	}
-	poster := newCatalogEventPoster(namespace,
-		fmt.Sprintf("https://%s", os.Getenv("KUBERNETES_SERVICE_HOST")+":"+os.Getenv("KUBERNETES_SERVICE_PORT")),
-		func() (string, error) {
-			value, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
-			return string(value), err
-		}, client, log)
-	return poster.Post
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		if log != nil {
+			log.Warn("catalog event client unavailable")
+		}
+		return func(context.Context, string, string) {}
+	}
+	return newCatalogEventPoster(namespace, client.CoreV1().Events(namespace), log).Post
 }

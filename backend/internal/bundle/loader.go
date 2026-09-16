@@ -25,7 +25,18 @@ var (
 	ErrManifestMissing = errors.New("manifest missing")
 	// ErrLabInvalid means lab content cannot safely form a valid bundle.
 	ErrLabInvalid = errors.New("lab invalid")
+	// ErrResourceNotFound means a requested repository resource does not exist.
+	ErrResourceNotFound = errors.New("resource not found")
+	// ErrResourceInvalid means a requested repository resource is unsafe or unsupported.
+	ErrResourceInvalid = errors.New("resource invalid")
+	// ErrResourceUnsupported means a contained resource cannot be safely served.
+	ErrResourceUnsupported = errors.New("resource unsupported")
 )
+
+// Resource is one regular file from an approved repository snapshot.
+type Resource struct {
+	Bytes []byte
+}
 
 // validBranchRE allows branch names that cannot contain shell-special characters.
 // Allows: alphanumeric, dash, dot, underscore, forward-slash.
@@ -34,7 +45,7 @@ var validBranchRE = regexp.MustCompile(`^[a-zA-Z0-9._/-]+$`)
 // Result is the in-memory lab bundle loaded from disk.
 type Result struct {
 	Manifest           *manifest.LabManifest
-	Pages              map[string]string // pagePath → AsciiDoc source
+	Pages              []string // sorted navigable relative page paths
 	HelmChartAvailable bool
 	ValuesSchema       []byte // raw contents of setup/helm/values.schema.json, nil if absent
 }
@@ -62,6 +73,74 @@ func ValidateLabPath(labPath string) error {
 	}
 	if slices.Contains(strings.Split(labPath, "/"), "..") {
 		return errors.New("lab path must not traverse")
+	}
+	return nil
+}
+
+// ValidateResourcePath permits only a repository-relative non-URL path.
+func ValidateResourcePath(resourcePath string) error {
+	parsed, err := url.Parse(resourcePath)
+	if resourcePath == "" || err != nil || parsed.IsAbs() || parsed.Host != "" || path.IsAbs(resourcePath) || strings.Contains(resourcePath, "\\") || slices.Contains(strings.Split(resourcePath, "/"), "..") {
+		return ErrResourceInvalid
+	}
+	return nil
+}
+
+// ReadResource resolves and reads a regular file below repositoryRoot.
+func ReadResource(repositoryRoot, resourcePath string) (*Resource, error) {
+	if err := ValidateResourcePath(resourcePath); err != nil {
+		return nil, err
+	}
+	root, err := filepath.EvalSymlinks(repositoryRoot)
+	if err != nil {
+		return nil, fmt.Errorf("%w: snapshot", ErrRepositoryUnavailable)
+	}
+	if err = rejectSymlinkPath(root, resourcePath); err != nil {
+		return nil, err
+	}
+	target, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(resourcePath)))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: target", ErrResourceNotFound)
+		}
+		return nil, fmt.Errorf("%w: resolve target", ErrResourceInvalid)
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("%w: target escapes repository", ErrResourceInvalid)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: target", ErrResourceNotFound)
+		}
+		return nil, fmt.Errorf("%w: stat target", ErrResourceInvalid)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: target is not a regular file", ErrResourceUnsupported)
+	}
+
+	content, err := os.ReadFile(target)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read target", ErrResourceInvalid)
+	}
+	return &Resource{Bytes: content}, nil
+}
+
+func rejectSymlinkPath(root, resourcePath string) error {
+	current := root
+	for _, segment := range strings.Split(resourcePath, "/") {
+		current = filepath.Join(current, segment)
+		info, err := os.Lstat(current)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("%w: target", ErrResourceNotFound)
+			}
+			return fmt.Errorf("%w: inspect target", ErrResourceInvalid)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: symlink target", ErrResourceInvalid)
+		}
 	}
 	return nil
 }
@@ -127,7 +206,7 @@ func LoadFromDir(labDir string, repoRoot string) (*Result, error) {
 		return nil, fmt.Errorf("%w: manifest", ErrLabInvalid)
 	}
 
-	pages := map[string]string{}
+	var contentPaths []string
 	contentDir := filepath.Join(labDir, "content")
 	if err := filepath.WalkDir(contentDir, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -140,18 +219,22 @@ func LoadFromDir(labDir string, repoRoot string) (*Result, error) {
 		if err != nil {
 			return err
 		}
-		content, err := os.ReadFile(p) //nolint:gosec
-		if err != nil {
-			return err
-		}
-		pages[filepath.ToSlash(rel)] = string(content)
+		contentPaths = append(contentPaths, filepath.ToSlash(rel))
 		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("%w: read content", ErrLabInvalid)
 	}
-	if labErr := manifest.ValidateBundlePaths(keys(pages)); labErr != nil {
+	if labErr := manifest.ValidateBundlePaths(contentPaths); labErr != nil {
 		return nil, fmt.Errorf("%w: content", ErrLabInvalid)
 	}
+
+	pages := make([]string, 0, len(contentPaths))
+	for _, page := range contentPaths {
+		if !isIncludeOnly(page) {
+			pages = append(pages, page)
+		}
+	}
+	slices.Sort(pages)
 
 	helmDir := filepath.Join(repoRoot, "setup", "helm")
 	_, helmErr := os.Stat(filepath.Join(helmDir, "Chart.yaml"))
@@ -166,10 +249,6 @@ func LoadFromDir(labDir string, repoRoot string) (*Result, error) {
 	return result, nil
 }
 
-func keys(m map[string]string) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	return ks
+func isIncludeOnly(page string) bool {
+	return strings.HasPrefix(page, "_") || strings.Contains(page, "/_")
 }

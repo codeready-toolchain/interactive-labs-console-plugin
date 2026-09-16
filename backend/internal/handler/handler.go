@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -25,6 +28,10 @@ type Config struct {
 	CatalogSource func(context.Context) (*corev1.ConfigMap, error)
 	// BundleLoader loads a bundle from the configured repo; nil means bundles are unavailable.
 	BundleLoader func(context.Context, string, string, string) (*bundle.Result, error)
+	// SnapshotCommitHash returns the immutable commit hash of an approved source snapshot.
+	SnapshotCommitHash func(context.Context, string, string, string) (string, error)
+	// ResourceLoader reads an approved resource from the configured source snapshot.
+	ResourceLoader func(context.Context, string, string, string, string) (*bundle.Resource, error)
 	// CatalogLabOmitted receives catalog entry omission notifications.
 	CatalogLabOmitted func(ctx context.Context, catalogRef, reason string)
 	// Logger receives safe operational fields only; tokens must never be passed to it.
@@ -34,7 +41,7 @@ type Config struct {
 	// RuntimeAttributes returns request-scoped attributes merged on top of static ones.
 	// nil means no runtime attrs. The subject is the authenticated user identifier.
 	// Production default may be nil while the key list is TBD.
-	RuntimeAttributes func(r *http.Request, subject string) map[string]string
+	RuntimeAttributes func(r *http.Request, subject string) (map[string]string, error)
 	// SetupClient handles SpaceRequest operations for lab setup.
 	// nil means setup is unavailable.
 	SetupClient *setup.SpaceRequestClient
@@ -51,6 +58,9 @@ func NewRouter(cfg Config) http.Handler {
 	})
 	mux.HandleFunc("GET /api/v1alpha1/labs/{catalogRef}/bundle", func(w http.ResponseWriter, r *http.Request) {
 		handleBundle(w, r, cfg)
+	})
+	mux.HandleFunc("GET /api/v1alpha1/labs/{catalogRef}/resources/{resourcePath...}", func(w http.ResponseWriter, r *http.Request) {
+		handleResource(w, r, cfg)
 	})
 	mux.HandleFunc("POST /api/v1alpha1/labs/{catalogRef}/setup", func(w http.ResponseWriter, r *http.Request) {
 		handleSetup(w, r, cfg)
@@ -91,6 +101,18 @@ func mergeAttributes(layers ...map[string]string) map[string]string {
 		maps.Copy(out, layer)
 	}
 	return out
+}
+
+func completeRuntimeAttributes(attrs map[string]string) bool {
+	if len(attrs) != 4 {
+		return false
+	}
+	for _, key := range []string{"user", "openshift_api_url", "openshift_console_url", "openshift_cluster_ingress_domain"} {
+		if attrs[key] == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // catalogEntryByCatalogRef returns the catalog entry for the given catalogRef, or an error.
@@ -147,6 +169,7 @@ func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 		CatalogRef  string `json:"catalogRef"`
 		DisplayName string `json:"displayName"`
 		Description string `json:"description,omitempty"`
+		LabPath     string `json:"labPath"`
 	}
 	items := make([]item, 0, len(entries))
 	for _, e := range entries {
@@ -160,7 +183,12 @@ func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 				laberr.New(laberr.TypeRepositoryError, "failed to resolve lab catalog", nil))
 			return
 		}
-		items = append(items, item{CatalogRef: e.CatalogRef, DisplayName: result.Manifest.Metadata.DisplayName, Description: result.Manifest.Metadata.Description})
+		items = append(items, item{
+			CatalogRef:  e.CatalogRef,
+			DisplayName: result.Manifest.Metadata.DisplayName,
+			Description: result.Manifest.Metadata.Description,
+			LabPath:     path.Clean(e.LabPath),
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"apiVersion": "v1alpha1",
@@ -203,16 +231,34 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
-	if labErr := manifest.ValidateBundlePaths(keys(result.Pages)); labErr != nil {
+	if labErr := manifest.ValidateBundlePaths(result.Pages); labErr != nil {
 		writeError(w, http.StatusUnprocessableEntity, labErr)
 		return
+	}
+	type page struct {
+		Path string `json:"path"`
+		URL  string `json:"url"`
+	}
+	pages := make([]page, 0, len(result.Pages))
+	for _, pagePath := range result.Pages {
+		pages = append(pages, page{
+			Path: pagePath,
+			URL:  resourcePath(entry.CatalogRef, entry.LabPath, pagePath),
+		})
 	}
 
 	// Merge attributes: manifest → catalog overrides → runtime attrs.
 	staticAttrs := mergeAttributes(result.Manifest.Spec.Attributes, entry.AttributeOverrides)
-	var runtimeAttrs map[string]string
-	if cfg.RuntimeAttributes != nil {
-		runtimeAttrs = cfg.RuntimeAttributes(r, subject)
+	if cfg.RuntimeAttributes == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			laberr.New(laberr.TypeRuntimeAttributesUnavailable, "runtime attributes unavailable", nil))
+		return
+	}
+	runtimeAttrs, err := cfg.RuntimeAttributes(r, subject)
+	if err != nil || !completeRuntimeAttributes(runtimeAttrs) {
+		writeError(w, http.StatusServiceUnavailable,
+			laberr.New(laberr.TypeRuntimeAttributesUnavailable, "runtime attributes unavailable", nil))
+		return
 	}
 	result.Manifest.Spec.Attributes = mergeAttributes(staticAttrs, runtimeAttrs)
 
@@ -220,13 +266,93 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 		"apiVersion": "v1alpha1",
 		"kind":       "LabBundle",
 		"manifest":   result.Manifest,
-		"pages":      result.Pages,
+		"pages":      pages,
 		"runtimeContext": map[string]any{
 			"catalogRef":         entry.CatalogRef,
 			"branch":             entry.Branch,
 			"helmChartAvailable": result.HelmChartAvailable,
 		},
 	})
+}
+
+func handleResource(w http.ResponseWriter, r *http.Request, cfg Config) {
+	token := bearerToken(r)
+	if token == "" || cfg.Authenticate == nil {
+		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication required", nil))
+		return
+	}
+	if subject, err := cfg.Authenticate(r.Context(), token); err != nil || subject == "" {
+		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication failed", nil))
+		return
+	}
+
+	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, r.PathValue("catalogRef"))
+	if labError != nil {
+		writeError(w, http.StatusNotFound, labError)
+		return
+	}
+	resourcePath := r.PathValue("resourcePath")
+	if err := bundle.ValidateResourcePath(resourcePath); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, laberr.New(laberr.TypePathTraversal, "resource path is invalid", nil))
+		return
+	}
+	if cfg.SnapshotCommitHash == nil || cfg.ResourceLoader == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			laberr.New(laberr.TypeRepositoryError, "resource loader not configured", nil))
+		return
+	}
+	commitHash, err := cfg.SnapshotCommitHash(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
+	if err != nil {
+		handleResourceError(w, err)
+		return
+	}
+	etag := fmt.Sprintf("%q", commitHash)
+	w.Header().Set("Cache-Control", "private, no-cache")
+	w.Header().Set("ETag", etag)
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	resource, err := cfg.ResourceLoader(r.Context(), entry.Repository, entry.Branch, entry.LabPath, resourcePath)
+	if err != nil {
+		handleResourceError(w, err)
+		return
+	}
+	if resource == nil {
+		writeError(w, http.StatusUnprocessableEntity, laberr.New(laberr.TypeContentError, "resource is unsupported", nil))
+		return
+	}
+	contentType := http.DetectContentType(resource.Bytes)
+	if !isSafeResourceContentType(contentType) {
+		writeError(w, http.StatusUnprocessableEntity, laberr.New(laberr.TypeContentError, "resource is unsupported", nil))
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(resource.Bytes)
+}
+
+func handleResourceError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, bundle.ErrResourceNotFound):
+		writeError(w, http.StatusNotFound, laberr.New(laberr.TypeContentError, "resource not found", nil))
+	case errors.Is(err, bundle.ErrResourceInvalid):
+		writeError(w, http.StatusUnprocessableEntity, laberr.New(laberr.TypePathTraversal, "resource path is invalid", nil))
+	case errors.Is(err, bundle.ErrResourceUnsupported):
+		writeError(w, http.StatusUnprocessableEntity, laberr.New(laberr.TypeContentError, "resource is unsupported", nil))
+	default:
+		writeError(w, http.StatusBadGateway, laberr.New(laberr.TypeRepositoryError, "failed to load resource", nil))
+	}
+}
+
+func isSafeResourceContentType(contentType string) bool {
+	switch contentType {
+	case "text/plain; charset=utf-8", "image/png", "image/jpeg", "image/gif", "image/webp":
+		return true
+	default:
+		return false
+	}
 }
 
 func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
@@ -419,10 +545,13 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"apiVersion": "v1alpha1",
-		"kind":       "SetupStatus",
-		"status":     overallStatus,
-		"namespaces": namespaces,
+		"apiVersion":      "v1alpha1",
+		"kind":            "SetupStatus",
+		"status":          overallStatus,
+		"namespaces":      namespaces,
+		"outcome":         "success",
+		"message":         "Lab setup complete",
+		"helmReleaseName": setup.HelmReleaseName(subject, entry.LabPath, entry.Branch, bindings),
 	})
 }
 
@@ -448,10 +577,7 @@ func recordCatalogOmission(ctx context.Context, cfg Config, catalogRef, reason s
 	}
 }
 
-func keys(m map[string]string) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	return ks
+func resourcePath(catalogRef, labPath, pagePath string) string {
+	resourceURL := url.URL{Path: path.Join("api/v1alpha1/labs", catalogRef, "resources", path.Clean(labPath), "content", pagePath)}
+	return resourceURL.EscapedPath()
 }

@@ -60,14 +60,14 @@ Create/update `interactive-labs-catalog` ConfigMap in `interactive-labs-console-
 
 Repositories must be plain HTTPS URLs. `labPath` must be repository-relative. Customers select approved Red Hat-authored labs by adding catalog entries. Backend reads catalog `displayName` and optional `description` from each validated `lab.yaml`; legacy ConfigMap display fields are ignored. Entry order controls returned catalog order for successfully resolved labs. `catalogRef` is backend-derived; do not configure an ID.
 
-Backend shallow-clones each `(repository, branch)` source once into `/var/lib/interactive-labs/cache/<sha256 canonical repository+branch>/content`; entry directory is reserved for future metadata and paths never expose source URLs. `Close` keeps successful snapshots, so next backend start reuses them when this storage remains. No PVC is mounted today: pod/container replacement loses cache. Future PVCs must mount `/var/lib/interactive-labs/cache`; clearing or replacing that storage makes next request clone a new snapshot. Backend does not poll, refresh, or expose revisions.
+Backend shallow-clones each `(repository, branch)` source once into `/var/lib/interactive-labs/cache/<sha256 canonical repository+branch>/content`; entry directory is reserved for future metadata and paths never expose source URLs. `Close` keeps successful snapshots, so next backend start reuses them when this storage remains. No PVC is mounted today: pod/container replacement loses cache. Future PVCs must mount `/var/lib/interactive-labs/cache`; clearing or replacing that storage makes next request clone a new snapshot. Backend does not poll or refresh sources. Catalog, bundle, and session data do not expose revision identity; resource responses expose a quoted snapshot Git `HEAD` SHA in `ETag`.
 
 Schema, validation, and attributes: [catalog ConfigMap contract](../efforts/interactive-labs/contract/catalog-configmap.md).
 
 ## RBAC and runtime security
 
-- Backend ServiceAccount may only `get` named catalog ConfigMap and `create` namespaced Events.
-- Setup/bundle calls authenticate forwarded current-user token; browser never sends privileged credentials.
+- Backend ServiceAccount may only `get` named catalog ConfigMap, `create` namespaced Events, and `get` named `config.openshift.io` cluster configuration: `infrastructures/cluster`, `ingresses/cluster`, and `consoles/cluster`. Runtime-attribute failure logs name only failed attribute/category; they never include tokens or values.
+- Setup/bundle calls authenticate forwarded current-user token; browser never sends privileged credentials. Backend uses that token only for identity; service account reads cluster configuration per bundle request.
 - Pod runs non-root with privilege escalation disabled, all capabilities dropped, and RuntimeDefault seccomp.
 
 ## Validate
@@ -88,8 +88,8 @@ Fix malformed repository URLs, unsafe branches or lab paths, missing required so
 
 ## Operating boundary
 
-**Implemented and verified:** catalog list and lab-bundle APIs, manifest-derived catalog metadata, immutable hashed approved-source snapshots, manifest/path validation, and safe catalog-omission Warning Events.
+**Implemented and verified:** catalog list and lab-bundle APIs, manifest-derived catalog metadata, immutable hashed approved-source snapshots, manifest/path validation, browser page/include/image resource serving and rendering, and safe catalog-omission Warning Events. Resource responses are private, revalidated browser-cache entries with a quoted cached snapshot Git `HEAD` SHA as `ETag`; this header exposes revision while catalog, bundle, and session data do not. Resource-size caps are not yet enforced.
 
-**Not implemented:** no browser resource endpoint exists; setup does not execute Helm. It returns a success-shaped response only. Do not treat response as cluster-resource installation.
+**Not implemented:** setup does not execute Helm. It returns a success-shaped response only. Do not treat response as cluster-resource installation. Helm setup execution and namespace selection remain STORY-5 work.
 
-**Decided target / planned:** STORY-4 adds browser page/include/image resource serving and rendering. Synchronous bounded Helm setup has no automatic retry, cleanup, cancellation, or recovery. A failure/timeout can require manual user or administrator remediation; future operational guidance must describe chart-specific recovery.
+**Deferred:** synchronous bounded Helm setup has no automatic retry, cleanup, cancellation, or recovery. A failure/timeout can require manual user or administrator remediation; future operational guidance must describe chart-specific recovery.
