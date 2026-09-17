@@ -60,7 +60,7 @@ This produces two SpaceRequests, one for each namespace property.
 
 ### POST — initiate setup
 
-`POST /api/v1alpha1/labs/{catalogRef}/setup` creates the SpaceRequests and returns 202 Accepted immediately.
+`POST /api/v1alpha1/labs/{catalogRef}/setup` creates SpaceRequests sequentially. If all succeed, it returns **202 Accepted**. If any creation fails, it returns **502 Bad Gateway** with a `configuration_error` body and stops — previously created SpaceRequests from the same request are left in place. Retrying after a partial failure is safe: `EnsureSpaceRequest` is idempotent, so already-created SpaceRequests are skipped.
 
 ### GET — poll status
 
