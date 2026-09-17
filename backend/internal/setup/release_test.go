@@ -14,7 +14,7 @@ func TestHelmReleaseName_Deterministic(t *testing.T) {
 	name1 := HelmReleaseName("user1", "labs/intro/", "main", bindings)
 	name2 := HelmReleaseName("user1", "labs/intro/", "main", bindings)
 	assert.Equal(t, name1, name2)
-	assert.True(t, len(name1) <= 53, "must fit Helm 53-char limit")
+	assert.LessOrEqual(t, len(name1), 53, "must fit Helm 53-char limit")
 	assert.Regexp(t, `^il-[0-9a-f]{12}$`, name1)
 }
 

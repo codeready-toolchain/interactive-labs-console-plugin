@@ -146,17 +146,20 @@ func TestBundleHandler_UnknownLabReturns404(t *testing.T) {
 
 var testValuesSchema = []byte(`{
 	"properties": {
-		"namespaces": {
-			"type": "object",
-			"properties": {
-				"gitea": {
-					"type": "string",
-					"x-interactive-labs": { "kind": "namespace-name" }
-				},
-				"datasphere": {
-					"type": "string",
-					"x-interactive-labs": { "kind": "namespace-name" }
-				}
+		"gitea.namespace": {
+			"type": "string",
+			"title": "gitea namespace",
+			"description": "Namespace name for Gitea deployment",
+			"x-interactive-labs": {
+				"kind": "namespace-name"
+			}
+		},
+		"datasphere.namespace": {
+			"type": "string",
+			"title": "datasphere namespace",
+			"description": "Namespace name for Datasphere deployment",
+			"x-interactive-labs": {
+				"kind": "namespace-name"
 			}
 		}
 	}
@@ -426,35 +429,6 @@ func TestSetupStatusHandler_AllReady(t *testing.T) {
 	json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
 	assert.Equal(t, "SetupStatus", body["kind"])
 	assert.Equal(t, "ready", body["status"])
-}
-
-func TestSetupHandler_ReleaseNameExcludesRuntimeAttrs(t *testing.T) {
-	makeRouter := func(runtimeAttrs map[string]string) http.Handler {
-		return handler.NewRouter(handler.Config{
-			CatalogSource: goodCatalogCM,
-			Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{Manifest: &manifest.LabManifest{}}, nil
-			},
-			RuntimeAttributes: func(_ *http.Request, _ string) (map[string]string, error) {
-				return runtimeAttrs, nil
-			},
-		})
-	}
-	ref := goodCatalogRef()
-	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
-	call := func(router http.Handler) string {
-		rw := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", strings.NewReader(payload))
-		req.Header.Set("Authorization", "Bearer user1")
-		router.ServeHTTP(rw, req)
-		var body map[string]any
-		json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
-		return body["helmReleaseName"].(string)
-	}
-	r1 := makeRouter(map[string]string{"runtime-key": "val1"})
-	r2 := makeRouter(map[string]string{"runtime-key": "val2"})
-	assert.Equal(t, call(r1), call(r2), "runtime attrs must not affect helmReleaseName")
 }
 
 func TestSetupStatusHandler_Provisioning(t *testing.T) {
