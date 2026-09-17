@@ -516,7 +516,7 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 			allReady = false
 			continue
 		}
-		if sr.IsReady() {
+		if sr.IsReady() && sr.TargetNamespace() != "" {
 			if cfg.Logger != nil {
 				cfg.Logger.Info("SpaceRequest ready", "name", b.Key, "namespace", sr.TargetNamespace())
 			}

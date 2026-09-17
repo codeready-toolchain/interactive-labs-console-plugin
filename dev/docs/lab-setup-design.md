@@ -76,7 +76,7 @@ This produces two SpaceRequests, one for each namespace property.
 }
 ```
 
-The frontend shows a spinner while `status` is `provisioning`. Once all SpaceRequests have a `Ready=True` condition, the overall status becomes `ready` and the lab opens.
+The frontend shows a spinner while `status` is `provisioning`. Intermediate SpaceRequest conditions (e.g. `Provisioning`, `SpaceNotReady`) keep the overall status at `provisioning`. A SpaceRequest with a terminal failure reason (e.g. `UnableToCreateSpace`) moves the overall status to `failed`. The overall status becomes `ready` only when every SpaceRequest has a `Ready=True` condition **and** a non-empty `namespaceAccess.name`; `Ready=True` alone is not sufficient.
 
 ### State reconstruction
 

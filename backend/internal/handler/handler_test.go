@@ -464,6 +464,72 @@ func TestSetupStatusHandler_Provisioning(t *testing.T) {
 	assert.Equal(t, "provisioning", body["status"])
 }
 
+func TestSetupStatusHandler_ReadyWithoutNamespaceAccessStaysProvisioning(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"metadata":{"name":"test"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}`)
+	}))
+	defer server.Close()
+
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
+			return &bundle.Result{
+				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
+				Pages:              []string{"intro.adoc"},
+				HelmChartAvailable: true,
+				ValuesSchema:       testValuesSchema,
+			}, nil
+		},
+		SetupClient: &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL},
+	})
+
+	ref := goodCatalogRef()
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/setup/status", nil)
+	req.Header.Set("Authorization", "Bearer user1")
+	router.ServeHTTP(rw, req)
+
+	require.Equal(t, http.StatusOK, rw.Code)
+	var body map[string]any
+	json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
+	assert.Equal(t, "provisioning", body["status"])
+}
+
+func TestSetupStatusHandler_TerminalFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"metadata":{"name":"test"},"status":{"conditions":[{"type":"Ready","status":"False","reason":"UnableToCreateSpace"}]}}`)
+	}))
+	defer server.Close()
+
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
+			return &bundle.Result{
+				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
+				Pages:              []string{"intro.adoc"},
+				HelmChartAvailable: true,
+				ValuesSchema:       testValuesSchema,
+			}, nil
+		},
+		SetupClient: &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL},
+	})
+
+	ref := goodCatalogRef()
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/setup/status", nil)
+	req.Header.Set("Authorization", "Bearer user1")
+	router.ServeHTTP(rw, req)
+
+	require.Equal(t, http.StatusOK, rw.Code)
+	var body map[string]any
+	json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
+	assert.Equal(t, "failed", body["status"])
+}
+
 func TestSetupStatusHandler_RequiresAuth(t *testing.T) {
 	ref := goodCatalogRef()
 	rw := httptest.NewRecorder()
