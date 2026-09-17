@@ -551,7 +551,7 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 		"namespaces":      namespaces,
 		"outcome":         "success",
 		"message":         "Lab setup complete",
-		"helmReleaseName": setup.HelmReleaseName(subject, entry.LabPath, entry.Branch, bindings),
+		"helmReleaseName": setup.HelmReleaseName(subject, catalogRef, bindings),
 	})
 }
 

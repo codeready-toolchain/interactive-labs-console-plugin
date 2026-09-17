@@ -770,6 +770,6 @@ func assertNoTokenInBody(t *testing.T, body string) {
 // No signature verification is expected in MVP; cluster validates the token.
 func makeTestJWT(sub string) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
-	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":%q}`, sub))) //nolint:fmtappendf
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":%q}`, sub)))
 	return header + "." + payload + "."
 }
