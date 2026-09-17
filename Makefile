@@ -6,7 +6,7 @@ NAMESPACE ?= interactive-labs-console-plugin
 REGISTRY ?= $(shell $(OC) get route default-route -n openshift-image-registry --template='{{ .spec.host }}' 2>/dev/null)
 DEV_IMAGE ?= $(REGISTRY)/$(NAMESPACE)/interactive-labs-console-plugin:latest
 PLATFORM ?= linux/amd64
-COMMIT ?= $(shell git rev-parse --short HEAD)$(shell git diff --quiet HEAD 2>/dev/null || echo '-dirty')
+COMMIT ?= $(shell c=$$(git rev-parse --short HEAD 2>/dev/null) && { git diff --quiet HEAD 2>/dev/null || c="$$c-dirty"; } && echo "$$c" || echo unknown)
 BUILDTIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 .PHONY: all build test frontend-build frontend-test backend-build backend-test image push-image validate-frontend-bundle validate-deploy validate-demo-catalog validate-catalog-namespace check-spacerequest-crd deploy check-registry create-namespace dev-image push-dev-image dev-deploy dev-deploy-with-demo-catalog help
