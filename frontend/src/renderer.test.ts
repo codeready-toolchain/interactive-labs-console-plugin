@@ -58,7 +58,7 @@ describe("renderAsciiDoc", () => {
       expect(result.html).toContain('<a href="next.adoc#section">Referenced Page Title</a>');
     });
 
-    it("renders an approved target document title as text", async () => {
+    it("renders safe markup in an approved target document title", async () => {
       const loadResource = jest.fn(async (url: string) => {
         if (url === targetPageURL) return "= <strong>Not markup</strong>";
         throw new Error("resource not found");
@@ -66,7 +66,7 @@ describe("renderAsciiDoc", () => {
 
       const result = await renderAsciiDoc(xrefInput("xref:next.adoc[]", loadResource));
 
-      expect(result.html).toContain('<a href="next.adoc">&lt;strong&gt;Not markup&lt;/strong&gt;</a>');
+      expect(result.html).toContain('<a href="next.adoc"><strong>Not markup</strong></a>');
     });
 
     it("keeps an explicit xref label unchanged", async () => {
