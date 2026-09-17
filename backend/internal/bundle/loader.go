@@ -2,13 +2,11 @@
 package bundle
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -35,7 +33,8 @@ var (
 
 // Resource is one regular file from an approved repository snapshot.
 type Resource struct {
-	Bytes []byte
+	Bytes    []byte
+	Revision string
 }
 
 // validBranchRE allows branch names that cannot contain shell-special characters.
@@ -51,7 +50,7 @@ type Result struct {
 	ValuesSchema       []byte // raw contents of setup/helm/values.schema.json, nil if absent
 }
 
-// ValidateCloneArgs validates repository URL and branch before shell execution.
+// ValidateCloneArgs validates an approved repository URL and branch.
 // Returns a non-nil error if either argument is unsafe.
 func ValidateCloneArgs(repoURL, branch string) error {
 	u, err := url.Parse(repoURL)
@@ -61,6 +60,7 @@ func ValidateCloneArgs(repoURL, branch string) error {
 	if u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("repository URL must be a plain https URL: %q", repoURL)
 	}
+	// '-' is disallowed to be the first char of the branch name by git apparently, so let's do this check early, too
 	if !validBranchRE.MatchString(branch) || strings.HasPrefix(branch, "-") || strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") || strings.Contains(branch, "//") || strings.Contains(branch, "..") {
 		return fmt.Errorf("branch contains invalid characters: %q", branch)
 	}
@@ -144,28 +144,6 @@ func rejectSymlinkPath(root, resourcePath string) error {
 		}
 	}
 	return nil
-}
-
-// CloneAndLoad shallow-clones one repository for callers outside Cache.
-func CloneAndLoad(ctx context.Context, repoURL, branch, labPath string) (*Result, error) {
-	if err := ValidateCloneArgs(repoURL, branch); err != nil {
-		return nil, err
-	}
-	if err := ValidateLabPath(labPath); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrLabInvalid, err)
-	}
-	tmpDir, err := os.MkdirTemp("", "ilab-clone-*")
-	if err != nil {
-		return nil, fmt.Errorf("%w: create temp dir", ErrRepositoryUnavailable)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	cmd := exec.CommandContext(ctx, "git", cloneArgs(repoURL, branch, tmpDir)...) // #nosec: G204
-	cmd.Env = gitEnv(nil)
-	if _, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("%w: clone failed", ErrRepositoryUnavailable)
-	}
-	return LoadFromSnapshot(tmpDir, labPath)
 }
 
 // LoadFromSnapshot validates labPath before reading it from repositoryRoot.

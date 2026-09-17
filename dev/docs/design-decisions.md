@@ -66,7 +66,7 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 **Why:** centrally maintained branches avoid customer ConfigMap changes for each content update.
 
-**Tradeoff:** Cached-resource responses expose snapshot Git `HEAD` as HTTP `ETag`, but MVP has no revision identity in catalog, bundle, or session data; it also has no update notification, migration, rollback, or running-session reconciliation.
+**Tradeoff:** Service-account refresh transparently stages and replaces changed branch snapshots on validated cadence, while cached-resource responses expose current generation Git `HEAD` as HTTP `ETag`. MVP has no revision identity in catalog, bundle, or session data; no update notification, pinning, migration, rollback, or running-session reconciliation.
 
 ## Cross-cutting decisions
 

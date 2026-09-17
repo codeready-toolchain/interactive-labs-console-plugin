@@ -25,6 +25,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Invalid values are logged and use defaults.
+            - name: CACHE_REFRESH_INTERVAL
+              value: 1h
+            - name: CACHE_CONCURRENT_REFRESH_LIMIT
+              value: "4"
           volumeMounts:
             - name: backend-tls
               mountPath: /etc/tls/backend

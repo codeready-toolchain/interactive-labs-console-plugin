@@ -6,10 +6,22 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
+
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/storage/memory"
+)
+
+var (
+	// ErrRemoteReferenceLookupFailed means the configured remote branch could not be resolved.
+	ErrRemoteReferenceLookupFailed = errors.New("remote reference lookup failed")
+	// ErrCloneFailed means a staged source clone failed.
+	ErrCloneFailed = errors.New("clone failed")
+	// ErrHeadResolutionFailed means a staged clone did not yield a valid HEAD.
+	ErrHeadResolutionFailed = errors.New("head resolution failed")
 )
 
 type sourceKey struct {
@@ -18,21 +30,66 @@ type sourceKey struct {
 }
 
 type cacheEntry struct {
-	destination string
-	revision    string
-	done        chan struct{}
-	err         error
+	mu                sync.RWMutex
+	checkoutDirectory string
+	revision          *string
+}
+
+// hide behind an interface for testing purposes
+type gitClient interface {
+	RemoteRef(context.Context, string, string) (string, error)
+	Clone(context.Context, string, string, string) error
+	Head(string) (string, error)
+}
+
+type goGitClient struct{}
+
+func (goGitClient) RemoteRef(ctx context.Context, repository, branch string) (string, error) {
+	remote := git.NewRemote(memory.NewStorage(), &config.RemoteConfig{URLs: []string{repository}})
+	refs, err := remote.ListContext(ctx, &git.ListOptions{})
+	if err != nil {
+		return "", err
+	}
+	wanted := plumbing.NewBranchReferenceName(branch)
+	for _, ref := range refs {
+		if ref.Name() == wanted {
+			return ref.Hash().String(), nil
+		}
+	}
+	return "", errors.New("branch ref not found")
+}
+
+func (goGitClient) Clone(ctx context.Context, repository, branch, destination string) error {
+	_, err := git.PlainCloneContext(ctx, destination, false, &git.CloneOptions{
+		URL:           repository,
+		Depth:         1,
+		SingleBranch:  true,
+		ReferenceName: plumbing.NewBranchReferenceName(branch),
+	})
+	return err
+}
+
+func (goGitClient) Head(destination string) (string, error) {
+	repository, err := git.PlainOpen(destination)
+	if err != nil {
+		return "", err
+	}
+	head, err := repository.Head()
+	if err != nil {
+		return "", err
+	}
+	return head.Hash().String(), nil
 }
 
 // Cache holds immutable repository snapshots in its configured storage.
 type Cache struct {
-	mu              sync.Mutex
-	root            string
-	entries         map[sourceKey]*cacheEntry
-	closed          bool
-	cloning         sync.WaitGroup
-	clone           func(context.Context, string, string, string) error
-	getRepoRevision func(string) (string, error)
+	mu      sync.Mutex
+	root    string
+	entries map[sourceKey]*cacheEntry
+	closed  bool
+	// tracks work in progress, used in Close to wait for all operations to complete
+	work sync.WaitGroup
+	git  gitClient
 }
 
 // NewCache creates a snapshot cache rooted at root.
@@ -40,150 +97,166 @@ func NewCache(root string) (*Cache, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("create snapshot cache: %w", err)
 	}
-	return newCache(root, cloneSnapshot), nil
+	return newCache(root, goGitClient{}), nil
 }
 
-func newCache(root string, clone func(context.Context, string, string, string) error) *Cache {
-	return &Cache{root: root, entries: make(map[sourceKey]*cacheEntry), clone: clone, getRepoRevision: snapshotRevision}
+func newCache(root string, client gitClient) *Cache {
+	return &Cache{root: root, entries: make(map[sourceKey]*cacheEntry), git: client}
 }
 
-// Load obtains a validated lab from one immutable source snapshot.
-func (c *Cache) Load(ctx context.Context, repository, branch, labPath string) (*Result, error) {
-	entry, err := c.entry(ctx, repository, branch, labPath)
+// Refresh stages and atomically publishes one repository branch snapshot.
+func (c *Cache) Refresh(ctx context.Context, request RepositoryRefreshRequest) error {
+	if err := ValidateCloneArgs(request.Repository, request.Branch); err != nil {
+		return fmt.Errorf("%w: invalid source", ErrRepositoryUnavailable)
+	}
+	if err := c.beginWork(); err != nil {
+		return err
+	}
+	defer c.work.Done()
+	entry, err := c.entry(request.Repository, request.Branch)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return LoadFromSnapshot(entry.destination, labPath)
-}
 
-// CommitHash obtains the immutable snapshot commit hash without reading a resource.
-func (c *Cache) CommitHash(ctx context.Context, repository, branch, labPath string) (string, error) {
-	entry, err := c.entry(ctx, repository, branch, labPath)
+	entry.mu.RLock()
+	localRevision := entry.revision
+	entry.mu.RUnlock()
+
+	remoteRevision, err := c.git.RemoteRef(ctx, request.Repository, request.Branch)
 	if err != nil {
-		return "", err
+		if ctxErr := ctx.Err(); errors.Is(err, ctxErr) {
+			return ctxErr
+		}
+		return fmt.Errorf("%w: %w", ErrRepositoryUnavailable, ErrRemoteReferenceLookupFailed)
 	}
-	return entry.revision, nil
-}
+	if !isCommitSHA(remoteRevision) {
+		return fmt.Errorf("%w: %w", ErrRepositoryUnavailable, ErrRemoteReferenceLookupFailed)
+	}
+	if localRevision != nil && *localRevision == remoteRevision {
+		return nil
+	}
 
-// Read obtains a resource from the same immutable snapshot as Load.
-func (c *Cache) Read(ctx context.Context, repository, branch, labPath, resourcePath string) (*Resource, error) {
-	entry, err := c.entry(ctx, repository, branch, labPath)
+	entryDir := filepath.Dir(entry.checkoutDirectory)
+	if err = os.MkdirAll(entryDir, 0o700); err != nil {
+		return fmt.Errorf("%w: create snapshot directory", ErrRepositoryUnavailable)
+	}
+	staging, err := os.MkdirTemp(entryDir, ".staging-")
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("%w: create staging directory", ErrRepositoryUnavailable)
 	}
-	if _, err := LoadFromSnapshot(entry.destination, labPath); err != nil {
-		return nil, err
+	defer os.RemoveAll(staging)
+
+	if err = c.git.Clone(ctx, request.Repository, request.Branch, staging); err != nil {
+		if errors.Is(err, ctx.Err()) {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: %w", ErrRepositoryUnavailable, ErrCloneFailed)
 	}
-	return ReadResource(entry.destination, resourcePath)
+	revision, err := c.git.Head(staging)
+	if err != nil || !isCommitSHA(revision) {
+		return fmt.Errorf("%w: %w", ErrRepositoryUnavailable, ErrHeadResolutionFailed)
+	}
+	if localRevision != nil && *localRevision == revision {
+		return nil
+	}
+	if err = c.publish(entry, staging, revision); err != nil {
+		return fmt.Errorf("%w: publish snapshot", ErrRepositoryUnavailable)
+	}
+	return nil
 }
 
-func (c *Cache) entry(ctx context.Context, repository, branch, labPath string) (*cacheEntry, error) {
+func (c *Cache) beginWork() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return fmt.Errorf("%w: cache closed", ErrRepositoryUnavailable)
+	}
+	c.work.Add(1)
+	return nil
+}
+
+func (c *Cache) entry(repository, branch string) (*cacheEntry, error) {
+	key := sourceKey{repository: repository, branch: branch}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, fmt.Errorf("%w: cache closed", ErrRepositoryUnavailable)
+	}
+	if entry := c.entries[key]; entry != nil {
+		return entry, nil
+	}
+	entry := &cacheEntry{checkoutDirectory: filepath.Join(c.root, snapshotID(repository, branch), "content")}
+	if revision, err := c.git.Head(entry.checkoutDirectory); err == nil && isCommitSHA(revision) {
+		entry.revision = &revision
+	}
+	c.entries[key] = entry
+	return entry, nil
+}
+
+func (c *Cache) publish(entry *cacheEntry, staging, revision string) error {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	old := entry.checkoutDirectory + ".old"
+	if err := os.RemoveAll(old); err != nil {
+		return err
+	}
+	if err := os.Rename(entry.checkoutDirectory, old); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(staging, entry.checkoutDirectory); err != nil {
+		if restoreErr := os.Rename(old, entry.checkoutDirectory); restoreErr != nil && !os.IsNotExist(restoreErr) {
+			return fmt.Errorf("publish snapshot error: %w", restoreErr)
+		}
+		return err
+	}
+	entry.revision = &revision
+	return os.RemoveAll(old)
+}
+
+// LoadBundle obtains a validated lab bundle from one immutable source snapshot.
+func (c *Cache) LoadBundle(_ context.Context, repository, branch, labPath string) (*Result, error) {
 	if err := ValidateCloneArgs(repository, branch); err != nil {
 		return nil, fmt.Errorf("%w: invalid source", ErrRepositoryUnavailable)
 	}
 	if err := ValidateLabPath(labPath); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrLabInvalid, err)
 	}
-
-	key := sourceKey{repository: repository, branch: branch}
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return nil, fmt.Errorf("%w: cache closed", ErrRepositoryUnavailable)
-	}
-	entry, found := c.entries[key]
-	if !found {
-		entry = &cacheEntry{
-			destination: filepath.Join(c.root, snapshotID(repository, branch), "content"),
-			done:        make(chan struct{}),
-		}
-		c.entries[key] = entry
-		c.cloning.Add(1)
-		go c.populate(key, entry)
-	}
-	c.mu.Unlock()
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-entry.done:
-	}
-	if err := ctx.Err(); err != nil {
+	entry, err := c.entry(repository, branch)
+	if err != nil {
 		return nil, err
 	}
-	if entry.err != nil {
-		return nil, entry.err
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+	if entry.revision == nil {
+		return nil, ErrRepositoryUnavailable
 	}
-	return entry, nil
+	return LoadFromSnapshot(entry.checkoutDirectory, labPath)
 }
 
-func (c *Cache) populate(key sourceKey, entry *cacheEntry) {
-	defer c.cloning.Done()
-	revision, err := c.createSnapshot(key, entry.destination)
-	if err == nil {
-		entry.revision = revision
+// ReadResource obtains a resource and its revision from one immutable source snapshot.
+func (c *Cache) ReadResource(_ context.Context, repository, branch, resourcePath string) (*Resource, error) {
+	if err := ValidateCloneArgs(repository, branch); err != nil {
+		return nil, fmt.Errorf("%w: invalid source", ErrRepositoryUnavailable)
 	}
-	c.finish(key, entry, err)
+	entry, err := c.entry(repository, branch)
+	if err != nil {
+		return nil, err
+	}
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+	if entry.revision == nil {
+		return nil, ErrRepositoryUnavailable
+	}
+	resource, err := ReadResource(entry.checkoutDirectory, resourcePath)
+	if err != nil {
+		return nil, err
+	}
+	resource.Revision = *entry.revision
+	return resource, nil
 }
 
-func (c *Cache) finish(key sourceKey, entry *cacheEntry, err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	entry.err = err
-	if err != nil && c.entries[key] == entry {
-		delete(c.entries, key)
-	}
-	close(entry.done)
-}
-
-func (c *Cache) createSnapshot(key sourceKey, destination string) (string, error) {
-	if info, err := os.Stat(destination); err == nil {
-		if !info.IsDir() {
-			return "", fmt.Errorf("%w: snapshot content is not a directory", ErrRepositoryUnavailable)
-		}
-		revision, resolveErr := c.resolveRevision(destination)
-		if resolveErr != nil {
-			return "", fmt.Errorf("%w: snapshot revision", ErrRepositoryUnavailable)
-		}
-		return revision, nil
-	} else if !os.IsNotExist(err) {
-		return "", fmt.Errorf("%w: inspect snapshot", ErrRepositoryUnavailable)
-	}
-
-	entryDir := filepath.Dir(destination)
-	if err := os.MkdirAll(entryDir, 0o700); err != nil {
-		return "", fmt.Errorf("%w: create snapshot directory", ErrRepositoryUnavailable)
-	}
-	// create a temp dir to clone into and then atomically rename it to the expected destination
-	temporary, err := os.MkdirTemp(entryDir, ".content-")
-	if err == nil {
-		err = c.clone(context.Background(), key.repository, key.branch, temporary)
-	}
-	var revision string
-	if err == nil {
-		revision, err = c.resolveRevision(temporary)
-	}
-	if err == nil {
-		err = os.Rename(temporary, destination)
-	}
-	if err == nil {
-		return revision, nil
-	}
-
-	_ = os.RemoveAll(temporary)
-	return "", fmt.Errorf("%w: clone failed", ErrRepositoryUnavailable)
-}
-
-func (c *Cache) resolveRevision(destination string) (string, error) {
-	revision, err := c.getRepoRevision(destination)
-	if err != nil || !isCommitSHA(revision) {
-		return "", errors.New("invalid git revision")
-	}
-	return revision, nil
-}
-
-// Close waits for in-flight clones and preserves the cache root and snapshots.
+// Close prevents new work, waits for in-flight refreshes, and preserves snapshots.
 func (c *Cache) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -192,33 +265,13 @@ func (c *Cache) Close() error {
 	}
 	c.closed = true
 	c.mu.Unlock()
-	c.cloning.Wait()
+	c.work.Wait()
 	return nil
 }
 
 func snapshotID(repository, branch string) string {
-	hasher := sha256.New()
-	hasher.Write([]byte(repository))
-	hasher.Write([]byte("|"))
-	hasher.Write([]byte(branch))
-	// this approach borrowed from sha256.Sum256()
-	var sum [sha256.Size]byte
-	hasher.Sum(sum[:0])
+	sum := sha256.Sum256([]byte(repository + "|" + branch))
 	return fmt.Sprintf("%x", sum)
-}
-
-func snapshotRevision(destination string) (string, error) {
-	cmd := exec.CommandContext(context.TODO(), "git", "-C", destination, "rev-parse", "HEAD") // #nosec G204 -- destination is cache controlled
-	cmd.Env = gitEnv(nil)
-	revision, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	value := strings.TrimSpace(string(revision))
-	if !isCommitSHA(value) {
-		return "", errors.New("invalid git revision")
-	}
-	return value, nil
 }
 
 func isCommitSHA(revision string) bool {
@@ -231,30 +284,4 @@ func isCommitSHA(revision string) bool {
 		}
 	}
 	return true
-}
-
-func cloneArgs(repository, branch, destination string) []string {
-	return []string{"clone", "--depth", "1", "--single-branch", "--branch", branch, "--", repository, destination}
-}
-
-func gitEnv(base []string) []string {
-	if base == nil {
-		base = os.Environ()
-	}
-	out := make([]string, 0, len(base)+1)
-	for _, value := range base {
-		if !strings.HasPrefix(value, "GIT_TERMINAL_PROMPT=") {
-			out = append(out, value)
-		}
-	}
-	return append(out, "GIT_TERMINAL_PROMPT=0")
-}
-
-func cloneSnapshot(ctx context.Context, repository, branch, destination string) error {
-	cmd := exec.CommandContext(ctx, "git", cloneArgs(repository, branch, destination)...) // #nosec G204 -- these args are controlled and safe
-	cmd.Env = gitEnv(nil)
-	if _, err := cmd.CombinedOutput(); err != nil {
-		return err
-	}
-	return nil
 }

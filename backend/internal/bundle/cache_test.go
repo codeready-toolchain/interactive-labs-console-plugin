@@ -11,28 +11,126 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-type observingContext struct {
-	context.Context
-	waiting chan<- struct{}
-	once    sync.Once
+const (
+	testRepository = "https://example.test/labs.git"
+	testBranch     = "main"
+	oldRevision    = "1111111111111111111111111111111111111111"
+	newRevision    = "2222222222222222222222222222222222222222"
+)
+
+type fakeGitClient struct {
+	mu            sync.Mutex
+	refs          map[sourceKey]string
+	heads         map[string]string
+	contents      map[sourceKey]string
+	cloneErr      map[sourceKey]error
+	remoteErr     map[sourceKey]error
+	cloneCalls    map[sourceKey]int
+	headCalls     int
+	cloneCheck    func(string) error
+	cloneStarted  chan struct{}
+	cloneWait     <-chan struct{}
+	cloneFinished chan struct{}
 }
 
-func (c *observingContext) Done() <-chan struct{} {
-	c.once.Do(func() { close(c.waiting) })
-	return c.Context.Done()
+func newFakeGit() *fakeGitClient {
+	return &fakeGitClient{
+		refs:       map[sourceKey]string{},
+		heads:      map[string]string{},
+		contents:   map[sourceKey]string{},
+		cloneErr:   map[sourceKey]error{},
+		remoteErr:  map[sourceKey]error{},
+		cloneCalls: map[sourceKey]int{},
+	}
 }
 
-func writeSnapshotLab(root, labPath string) error {
+func (f *fakeGitClient) RemoteRef(_ context.Context, repository, branch string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := sourceKey{repository, branch}
+	if err := f.remoteErr[key]; err != nil {
+		return "", err
+	}
+	return f.refs[key], nil
+}
+
+func (f *fakeGitClient) Clone(ctx context.Context, repository, branch, destination string) error {
+	key := sourceKey{repository, branch}
+	f.mu.Lock()
+	f.cloneCalls[key]++
+	err, revision, content := f.cloneErr[key], f.refs[key], f.contents[key]
+	check, started, wait := f.cloneCheck, f.cloneStarted, f.cloneWait
+	f.mu.Unlock()
+	if started != nil {
+		close(started)
+	}
+	if wait != nil {
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if check != nil {
+		if err := check(destination); err != nil {
+			return err
+		}
+	}
+	if err := writeSnapshotLab(destination, "lab", content); err != nil {
+		return err
+	}
+	if err := writeSnapshotLab(destination, "other", content); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	f.heads[destination] = revision
+	finished := f.cloneFinished
+	f.mu.Unlock()
+	if finished != nil {
+		close(finished)
+	}
+	return nil
+}
+
+func (f *fakeGitClient) Head(destination string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.headCalls++
+	revision, ok := f.heads[destination]
+	if !ok {
+		return "", errors.New("no HEAD")
+	}
+	return revision, nil
+}
+
+func (f *fakeGitClient) cloneCount(repository, branch string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cloneCalls[sourceKey{repository, branch}]
+}
+
+func (f *fakeGitClient) headCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.headCalls
+}
+
+func writeSnapshotLab(root, labPath, content string) error {
 	lab := filepath.Join(root, filepath.FromSlash(labPath))
 	if err := os.MkdirAll(filepath.Join(lab, "content"), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(lab, "lab.yaml"),
-		[]byte(`apiVersion: v1alpha1
+	if err := os.WriteFile(filepath.Join(lab, "lab.yaml"), []byte(`apiVersion: v1alpha1
 kind: Lab
 metadata:
   name: test
@@ -40,286 +138,168 @@ metadata:
 spec: {}`), 0o600); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(lab, "content", "intro.adoc"), []byte("= Test"), 0o600)
+	return os.WriteFile(filepath.Join(lab, "content", "intro.adoc"), []byte(content), 0o600)
 }
 
-func testCache(root string, clone func(context.Context, string, string, string) error) *Cache {
-	cache := newCache(root, clone)
-	cache.getRepoRevision = func(string) (string, error) {
-		return "0000000000000000000000000000000000000000", nil
-	}
-	return cache
+func refresh(cache *Cache, repository, branch string) error {
+	return cache.Refresh(context.Background(), RepositoryRefreshRequest{Repository: repository, Branch: branch})
 }
 
 func TestCache(t *testing.T) {
 	t.Run("reuses successful snapshot by repository and branch", func(t *testing.T) {
-		root := t.TempDir()
-		var mu sync.Mutex
-		clones := 0
-		cache := testCache(root, func(_ context.Context, _, _, destination string) error {
-			mu.Lock()
-			clones++
-			mu.Unlock()
-			if err := writeSnapshotLab(destination, "labs/one"); err != nil {
-				return err
-			}
-			return writeSnapshotLab(destination, "labs/two")
-		})
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key] = oldRevision, "= Test"
+		cache := newCache(t.TempDir(), client)
 
-		for _, labPath := range []string{"labs/one", "labs/two", "labs/one"} {
-			result, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", labPath)
+		require.NoError(t, refresh(cache, testRepository, testBranch))
+		for _, labPath := range []string{"lab", "other", "lab"} {
+			result, err := cache.LoadBundle(context.Background(), testRepository, testBranch, labPath)
 			require.NoError(t, err)
 			assert.Contains(t, result.Pages, "intro.adoc")
 		}
-		mu.Lock()
-		assert.Equal(t, 1, clones)
-		mu.Unlock()
+		assert.Equal(t, 1, client.cloneCount(testRepository, testBranch))
 	})
 
 	t.Run("caches revision in memory without snapshot metadata", func(t *testing.T) {
-		const (
-			repository = "https://example.test/labs.git"
-			branch     = "main"
-			commitHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-		)
-		clones, revisions := 0, 0
-		cache := newCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
-			clones++
-			return writeSnapshotLab(destination, "lab")
-		})
-		cache.getRepoRevision = func(string) (string, error) {
-			revisions++
-			return commitHash, nil
-		}
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key] = oldRevision, "= Test"
+		cache := newCache(t.TempDir(), client)
 
+		require.NoError(t, refresh(cache, testRepository, testBranch))
+		client.refs[key], client.contents[key] = newRevision, "= New"
+		require.NoError(t, refresh(cache, testRepository, testBranch))
+		result, err := cache.LoadBundle(context.Background(), testRepository, testBranch, "lab")
+		require.NoError(t, err)
+		assert.Contains(t, result.Pages, "intro.adoc")
 		for range 2 {
-			resource, err := cache.Read(context.Background(), repository, branch, "lab", "lab/content/intro.adoc")
+			var resource *Resource
+			resource, err = cache.ReadResource(context.Background(), testRepository, testBranch, "lab/content/intro.adoc")
 			require.NoError(t, err)
-			assert.Equal(t, []byte("= Test"), resource.Bytes)
+			assert.Equal(t, []byte("= New"), resource.Bytes)
+			assert.Equal(t, newRevision, resource.Revision)
 		}
-		assert.Equal(t, 1, clones)
-		assert.Equal(t, 1, revisions)
-		_, err := os.Stat(filepath.Join(cache.root, snapshotID(repository, branch), "snapshot.json"))
+		assert.Equal(t, 2, client.cloneCount(testRepository, testBranch))
+		assert.Equal(t, 3, client.headCount())
+		_, err = os.Stat(filepath.Join(cache.root, snapshotID(testRepository, testBranch), "snapshot.json"))
 		assert.ErrorIs(t, err, os.ErrNotExist)
 	})
 
 	t.Run("resolves revision once for existing checkout", func(t *testing.T) {
-		const (
-			repository = "https://example.test/labs.git"
-			branch     = "main"
-			commitHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-		)
 		root := t.TempDir()
-		destination := filepath.Join(root, snapshotID(repository, branch), "content")
-		require.NoError(t, writeSnapshotLab(destination, "lab"))
+		destination := filepath.Join(root, snapshotID(testRepository, testBranch), "content")
+		require.NoError(t, writeSnapshotLab(destination, "lab", "= Test"))
+		client := newFakeGit()
+		client.heads[destination] = oldRevision
+		cache := newCache(root, client)
 
-		revisions := 0
-		cache := newCache(root, func(context.Context, string, string, string) error {
-			return errors.New("must not clone")
-		})
-		cache.getRepoRevision = func(gotDestination string) (string, error) {
-			assert.Equal(t, destination, gotDestination)
-			revisions++
-			return commitHash, nil
-		}
-
-		_, err := cache.Load(context.Background(), repository, branch, "lab")
+		_, err := cache.LoadBundle(context.Background(), testRepository, testBranch, "lab")
 		require.NoError(t, err)
 		for range 2 {
-			resource, err := cache.Read(context.Background(), repository, branch, "lab", "lab/content/intro.adoc")
+			resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/content/intro.adoc")
 			require.NoError(t, err)
 			assert.Equal(t, []byte("= Test"), resource.Bytes)
+			assert.Equal(t, oldRevision, resource.Revision)
 		}
-		assert.Equal(t, 1, revisions)
+		assert.Zero(t, client.cloneCount(testRepository, testBranch))
+		assert.Equal(t, 1, client.headCount())
 	})
 
 	t.Run("separates repository and branch", func(t *testing.T) {
-		clones := 0
-		cache := testCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
-			clones++
-			return writeSnapshotLab(destination, "lab")
-		})
-		for _, source := range [][2]string{{"https://example.test/one.git", "main"}, {"https://example.test/two.git", "main"}, {"https://example.test/one.git", "next"}} {
-			_, err := cache.Load(context.Background(), source[0], source[1], "lab")
-			require.NoError(t, err)
+		client := newFakeGit()
+		sources := [][2]string{{"https://example.test/one.git", "main"}, {"https://example.test/two.git", "main"}, {"https://example.test/one.git", "next"}}
+		for index, source := range sources {
+			key := sourceKey{source[0], source[1]}
+			client.refs[key] = fmt.Sprintf("%040d", index+1)
+			client.contents[key] = "= Test"
 		}
-		assert.Equal(t, 3, clones)
-	})
+		cache := newCache(t.TempDir(), client)
 
-	t.Run("concurrent same source clones once", func(t *testing.T) {
-		started := make(chan struct{})
-		release := make(chan struct{})
-		var mu sync.Mutex
-		clones := 0
-		cache := testCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
-			mu.Lock()
-			clones++
-			mu.Unlock()
-			close(started)
-			<-release
-			return writeSnapshotLab(destination, "lab")
-		})
-
-		firstDone := make(chan error, 1)
-		go func() {
-			_, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", "lab")
-			firstDone <- err
-		}()
-		<-started
-		secondWaiting := make(chan struct{})
-		secondDone := make(chan error, 1)
-		go func() {
-			ctx := &observingContext{Context: context.Background(), waiting: secondWaiting}
-			_, err := cache.Load(ctx, "https://example.test/labs.git", "main", "lab")
-			secondDone <- err
-		}()
-		<-secondWaiting
-		close(release)
-		require.NoError(t, <-firstDone)
-		require.NoError(t, <-secondDone)
-		mu.Lock()
-		assert.Equal(t, 1, clones)
-		mu.Unlock()
-	})
-
-	t.Run("waiter can cancel while clone in progress", func(t *testing.T) {
-		started := make(chan struct{})
-		release := make(chan struct{})
-		cloneErr := errors.New("clone failed")
-		cache := newCache(t.TempDir(), func(context.Context, string, string, string) error {
-			close(started)
-			<-release
-			return cloneErr
-		})
-
-		firstDone := make(chan error, 1)
-		go func() {
-			_, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", "lab")
-			firstDone <- err
-		}()
-		<-started
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		_, err := cache.Load(ctx, "https://example.test/labs.git", "main", "lab")
-		require.ErrorIs(t, err, context.Canceled)
-		close(release)
-		require.ErrorIs(t, <-firstDone, ErrRepositoryUnavailable)
+		for _, source := range sources {
+			require.NoError(t, refresh(cache, source[0], source[1]))
+		}
+		for _, source := range sources {
+			assert.Equal(t, 1, client.cloneCount(source[0], source[1]))
+		}
 	})
 
 	t.Run("uses hashed entry with content snapshot", func(t *testing.T) {
 		root := t.TempDir()
-		const repository = "https://example.test/labs.git"
-		const branch = "main"
-		cache := testCache(root, func(_ context.Context, _, _, destination string) error {
-			return writeSnapshotLab(destination, "lab")
-		})
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key] = oldRevision, "= Test"
+		cache := newCache(root, client)
 
-		_, err := cache.Load(context.Background(), repository, branch, "lab")
-		require.NoError(t, err)
+		require.NoError(t, refresh(cache, testRepository, testBranch))
 
-		sum := sha256.Sum256([]byte("https://example.test/labs.git|main"))
+		sum := sha256.Sum256([]byte(testRepository + "|" + testBranch))
 		entry := filepath.Join(root, fmt.Sprintf("%x", sum))
-		_, err = os.Stat(filepath.Join(entry, "content"))
+		_, err := os.Stat(filepath.Join(entry, "content"))
 		require.NoError(t, err)
-		assert.NotContains(t, entry, repository)
+		assert.NotContains(t, entry, testRepository)
 	})
 
 	t.Run("clones into reserved empty temporary directory", func(t *testing.T) {
-		cache := testCache(t.TempDir(), func(_ context.Context, _, _, destination string) error {
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key] = oldRevision, "= Test"
+		client.cloneCheck = func(destination string) error {
 			entries, err := os.ReadDir(destination)
 			require.NoError(t, err)
 			assert.Empty(t, entries)
-			return writeSnapshotLab(destination, "lab")
-		})
-
-		_, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", "lab")
-		require.NoError(t, err)
-	})
-
-	t.Run("finish failed entry evicts and notifies waiters", func(t *testing.T) {
-		cache := newCache(t.TempDir(), nil)
-		key := sourceKey{repository: "https://example.test/labs.git", branch: "main"}
-		entry := &cacheEntry{done: make(chan struct{})}
-		cache.entries[key] = entry
-		cloneErr := errors.New("clone failed")
-
-		cache.finish(key, entry, cloneErr)
-
-		select {
-		case <-entry.done:
-		default:
-			assert.FailNow(t, "finish did not notify waiters")
+			return nil
 		}
-		require.ErrorIs(t, entry.err, cloneErr)
-		_, found := cache.entries[key]
-		assert.False(t, found)
+		cache := newCache(t.TempDir(), client)
+
+		require.NoError(t, refresh(cache, testRepository, testBranch))
 	})
 
 	t.Run("reuses existing content snapshot", func(t *testing.T) {
 		root := t.TempDir()
-		const repository = "https://example.test/labs.git"
-		const branch = "main"
-		sum := sha256.Sum256([]byte("https://example.test/labs.git|main"))
-		require.NoError(t, writeSnapshotLab(filepath.Join(root, fmt.Sprintf("%x", sum), "content"), "lab"))
+		destination := filepath.Join(root, snapshotID(testRepository, testBranch), "content")
+		require.NoError(t, writeSnapshotLab(destination, "lab", "= Test"))
+		client := newFakeGit()
+		client.heads[destination] = oldRevision
+		cache := newCache(root, client)
 
-		cloned := false
-		cache := testCache(root, func(context.Context, string, string, string) error {
-			cloned = true
-			return errors.New("must not clone")
-		})
-		_, err := cache.Load(context.Background(), repository, branch, "lab")
+		_, err := cache.LoadBundle(context.Background(), testRepository, testBranch, "lab")
 		require.NoError(t, err)
-		assert.False(t, cloned)
+		assert.Zero(t, client.cloneCount(testRepository, testBranch))
 	})
 
 	t.Run("retries failed clone after removing temporary sibling", func(t *testing.T) {
 		root := t.TempDir()
-		attempts := 0
-		cache := testCache(root, func(_ context.Context, _, _, destination string) error {
-			attempts++
-			if err := writeSnapshotLab(destination, "lab"); err != nil {
-				return err
-			}
-			if attempts == 1 {
-				return errors.New("remote unavailable")
-			}
-			return nil
-		})
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key], client.cloneErr[key] = oldRevision, "= Test", errors.New("remote unavailable")
+		cache := newCache(root, client)
 
-		_, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", "lab")
-		require.ErrorIs(t, err, ErrRepositoryUnavailable)
-		sum := sha256.Sum256([]byte("https://example.test/labs.git|main"))
-		entry := filepath.Join(root, fmt.Sprintf("%x", sum))
-		entries, err := os.ReadDir(entry)
+		err := refresh(cache, testRepository, testBranch)
+		require.ErrorIs(t, err, ErrCloneFailed)
+		entries, err := os.ReadDir(filepath.Join(root, snapshotID(testRepository, testBranch)))
 		require.NoError(t, err)
 		assert.Empty(t, entries)
 
-		_, err = cache.Load(context.Background(), "https://example.test/labs.git", "main", "lab")
-		require.NoError(t, err)
-		assert.Equal(t, 2, attempts)
+		delete(client.cloneErr, key)
+		require.NoError(t, refresh(cache, testRepository, testBranch))
+		assert.Equal(t, 2, client.cloneCount(testRepository, testBranch))
 	})
 
 	t.Run("publishes content only after clone completes", func(t *testing.T) {
 		root := t.TempDir()
-		started := make(chan struct{})
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key] = oldRevision, "= Test"
+		client.cloneStarted = make(chan struct{})
 		release := make(chan struct{})
-		cache := testCache(root, func(_ context.Context, _, _, destination string) error {
-			if err := writeSnapshotLab(destination, "lab"); err != nil {
-				return err
-			}
-			close(started)
-			<-release
-			return nil
-		})
+		client.cloneWait = release
+		cache := newCache(root, client)
 
 		done := make(chan error, 1)
-		go func() {
-			_, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", "lab")
-			done <- err
-		}()
-		<-started
-		sum := sha256.Sum256([]byte(`{"branch":"main","repository":"https://example.test/labs.git"}`))
-		_, err := os.Stat(filepath.Join(root, fmt.Sprintf("%x", sum), "content"))
+		go func() { done <- refresh(cache, testRepository, testBranch) }()
+		<-client.cloneStarted
+		_, err := os.Stat(filepath.Join(root, snapshotID(testRepository, testBranch), "content"))
 		require.ErrorIs(t, err, os.ErrNotExist)
 		close(release)
 		require.NoError(t, <-done)
@@ -327,19 +307,17 @@ func TestCache(t *testing.T) {
 
 	t.Run("close waits and preserves successful content", func(t *testing.T) {
 		root := t.TempDir()
-		started := make(chan struct{})
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key] = oldRevision, "= Test"
+		client.cloneStarted = make(chan struct{})
 		release := make(chan struct{})
-		cache := testCache(root, func(_ context.Context, _, _, destination string) error {
-			close(started)
-			<-release
-			return writeSnapshotLab(destination, "lab")
-		})
-		loadDone := make(chan error, 1)
-		go func() {
-			_, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", "lab")
-			loadDone <- err
-		}()
-		<-started
+		client.cloneWait = release
+		cache := newCache(root, client)
+
+		refreshDone := make(chan error, 1)
+		go func() { refreshDone <- refresh(cache, testRepository, testBranch) }()
+		<-client.cloneStarted
 		closeDone := make(chan error, 1)
 		go func() { closeDone <- cache.Close() }()
 		require.Eventually(t, func() bool {
@@ -348,30 +326,209 @@ func TestCache(t *testing.T) {
 			return cache.closed
 		}, time.Second, time.Millisecond)
 		select {
-		case err := <-closeDone:
-			t.Fatalf("Close returned before clone completed: %v", err)
+		case <-closeDone:
+			require.FailNow(t, "Close returned before refresh completed")
 		default:
 		}
 		close(release)
-		require.NoError(t, <-loadDone)
+		require.NoError(t, <-refreshDone)
 		require.NoError(t, <-closeDone)
-		sum := sha256.Sum256([]byte("https://example.test/labs.git|main"))
-		_, err := os.Stat(filepath.Join(root, fmt.Sprintf("%x", sum), "content"))
+		require.ErrorIs(t, refresh(cache, testRepository, testBranch), ErrRepositoryUnavailable)
+		_, err := os.Stat(filepath.Join(root, snapshotID(testRepository, testBranch), "content"))
 		require.NoError(t, err)
 	})
 
 	t.Run("rejects unsafe lab path before clone", func(t *testing.T) {
-		called := false
-		cache := testCache(t.TempDir(), func(context.Context, string, string, string) error { called = true; return nil })
-		_, err := cache.Load(context.Background(), "https://example.test/labs.git", "main", "../lab")
+		client := newFakeGit()
+		cache := newCache(t.TempDir(), client)
+
+		_, err := cache.LoadBundle(context.Background(), testRepository, testBranch, "../lab")
 		require.ErrorIs(t, err, ErrLabInvalid)
-		assert.False(t, called)
+		assert.Zero(t, client.cloneCount(testRepository, testBranch))
+		assert.Empty(t, cache.entries)
+	})
+
+	t.Run("read resource does not require valid lab bundle", func(t *testing.T) {
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key] = oldRevision, "= Old"
+		cache := newCache(t.TempDir(), client)
+		require.NoError(t, refresh(cache, testRepository, testBranch))
+
+		entry, err := cache.entry(testRepository, testBranch)
+		require.NoError(t, err)
+		require.NoError(t, os.Remove(filepath.Join(entry.checkoutDirectory, "lab", "lab.yaml")))
+		resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/content/intro.adoc")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("= Old"), resource.Bytes)
+	})
+
+	t.Run("refresh acquisition failure retains last known good generation", func(t *testing.T) {
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key] = oldRevision, "= Old"
+		cache := newCache(t.TempDir(), client)
+		require.NoError(t, refresh(cache, testRepository, testBranch))
+
+		client.refs[key], client.cloneErr[key] = newRevision, errors.New("raw git output must not escape")
+		err := refresh(cache, testRepository, testBranch)
+		require.ErrorIs(t, err, ErrCloneFailed)
+		resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/content/intro.adoc")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("= Old"), resource.Bytes)
+		assert.Equal(t, oldRevision, resource.Revision)
+	})
+
+	t.Run("failed initial source does not demand clone again", func(t *testing.T) {
+		client := newFakeGit()
+		client.remoteErr[sourceKey{testRepository, testBranch}] = errors.New("raw remote output")
+		cache := newCache(t.TempDir(), client)
+
+		err := refresh(cache, testRepository, testBranch)
+		require.ErrorIs(t, err, ErrRemoteReferenceLookupFailed)
+		_, err = cache.LoadBundle(context.Background(), testRepository, testBranch, "lab")
+		require.ErrorIs(t, err, ErrRepositoryUnavailable)
+		assert.Zero(t, client.cloneCount(testRepository, testBranch))
+	})
+
+	t.Run("refresh returns cancellation from remote reference lookup", func(t *testing.T) {
+		for _, expected := range []error{context.Canceled, context.DeadlineExceeded} {
+			t.Run(expected.Error(), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				if errors.Is(expected, context.DeadlineExceeded) {
+					cancel()
+					ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				}
+				defer cancel()
+				if errors.Is(expected, context.Canceled) {
+					cancel()
+				}
+				require.ErrorIs(t, ctx.Err(), expected)
+
+				client := newFakeGit()
+				client.remoteErr[sourceKey{testRepository, testBranch}] = ctx.Err()
+
+				err := newCache(t.TempDir(), client).Refresh(ctx, RepositoryRefreshRequest{Repository: testRepository, Branch: testBranch})
+				require.ErrorIs(t, err, expected)
+				require.NotErrorIs(t, err, ErrRepositoryUnavailable)
+			})
+		}
+	})
+
+	t.Run("refresh preserves remote reference failure when context is canceled concurrently", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		client := newFakeGit()
+		client.remoteErr[sourceKey{testRepository, testBranch}] = errors.New("raw remote output")
+
+		err := newCache(t.TempDir(), client).Refresh(ctx, RepositoryRefreshRequest{Repository: testRepository, Branch: testBranch})
+		require.ErrorIs(t, err, ErrRemoteReferenceLookupFailed)
+		require.NotErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("refresh returns cancellation from clone", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key] = oldRevision
+		client.cloneStarted = make(chan struct{})
+		client.cloneWait = make(chan struct{})
+
+		result := make(chan error, 1)
+		go func() {
+			result <- newCache(t.TempDir(), client).Refresh(ctx, RepositoryRefreshRequest{Repository: testRepository, Branch: testBranch})
+		}()
+		<-client.cloneStarted
+		cancel()
+		err := <-result
+		require.ErrorIs(t, err, context.Canceled)
+		require.NotErrorIs(t, err, ErrRepositoryUnavailable)
+	})
+
+	t.Run("read operations reject invalid source before creating entry", func(t *testing.T) {
+		cache := newCache(t.TempDir(), newFakeGit())
+		_, err := cache.LoadBundle(context.Background(), "file:///untrusted", testBranch, "lab")
+		require.ErrorIs(t, err, ErrRepositoryUnavailable)
+		assert.Empty(t, cache.entries)
+
+		cache = newCache(t.TempDir(), newFakeGit())
+		_, err = cache.ReadResource(context.Background(), testRepository, "-untrusted", "lab/content/intro.adoc")
+		require.ErrorIs(t, err, ErrRepositoryUnavailable)
+		assert.Empty(t, cache.entries)
+	})
+
+	t.Run("read concurrent with publish returns complete generation", func(t *testing.T) {
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key] = oldRevision, "= Old"
+		cache := newCache(t.TempDir(), client)
+		require.NoError(t, refresh(cache, testRepository, testBranch))
+
+		entry, err := cache.entry(testRepository, testBranch)
+		require.NoError(t, err)
+		entry.mu.RLock()
+		client.cloneFinished = make(chan struct{})
+		client.refs[key], client.contents[key] = newRevision, "= New"
+		refreshDone := make(chan error, 1)
+		go func() { refreshDone <- refresh(cache, testRepository, testBranch) }()
+		<-client.cloneFinished
+		readerDone := make(chan struct {
+			resource *Resource
+			err      error
+		}, 1)
+		go func() {
+			resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/content/intro.adoc")
+			readerDone <- struct {
+				resource *Resource
+				err      error
+			}{resource, err}
+		}()
+		entry.mu.RUnlock()
+		require.NoError(t, <-refreshDone)
+
+		result := <-readerDone
+		require.NoError(t, result.err)
+		expected := map[string][]byte{oldRevision: []byte("= Old"), newRevision: []byte("= New")}
+		require.Contains(t, expected, result.resource.Revision)
+		require.Equal(t, expected[result.resource.Revision], result.resource.Bytes)
 	})
 }
 
-func TestCloneSnapshotUsesNonInteractiveShallowSingleBranchClone(t *testing.T) {
-	args := cloneArgs("https://example.test/labs.git", "main", "/tmp/destination")
-	assert.Equal(t, []string{"clone", "--depth", "1", "--single-branch", "--branch", "main", "--", "https://example.test/labs.git", "/tmp/destination"}, args)
-	env := gitEnv([]string{"GIT_TERMINAL_PROMPT=1", "OTHER=value"})
-	assert.Equal(t, []string{"OTHER=value", "GIT_TERMINAL_PROMPT=0"}, env)
+func TestGoGitClientUsesShallowExplicitSingleBranchCloneAndHead(t *testing.T) {
+	remote := t.TempDir()
+	repository, err := git.PlainInit(remote, false)
+	require.NoError(t, err)
+	worktree, err := repository.Worktree()
+	require.NoError(t, err)
+	commit := func(content string) plumbing.Hash {
+		file := filepath.Join(remote, "page.adoc")
+		require.NoError(t, os.WriteFile(file, []byte(content), 0o600))
+		_, err = worktree.Add("page.adoc")
+		require.NoError(t, err)
+		hash, cerr := worktree.Commit(content, &git.CommitOptions{Author: &object.Signature{Name: "Test", Email: "test@example.test", When: time.Now()}})
+		require.NoError(t, cerr)
+		return hash
+	}
+	first := commit("first")
+	main := plumbing.NewBranchReferenceName("main")
+	require.NoError(t, repository.Storer.SetReference(plumbing.NewHashReference(main, first)))
+	require.NoError(t, repository.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, main)))
+	second := commit("second")
+	require.NoError(t, repository.Storer.SetReference(plumbing.NewHashReference(plumbing.NewBranchReferenceName("other"), first)))
+	require.NoError(t, repository.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, plumbing.NewBranchReferenceName("other"))))
+
+	destination := filepath.Join(t.TempDir(), "clone")
+	client := goGitClient{}
+	require.NoError(t, client.Clone(context.Background(), remote, "main", destination))
+	head, err := client.Head(destination)
+	require.NoError(t, err)
+	require.Equal(t, second.String(), head)
+
+	clone, err := git.PlainOpen(destination)
+	require.NoError(t, err)
+	_, err = clone.CommitObject(first)
+	require.ErrorIs(t, err, plumbing.ErrObjectNotFound)
+	_, err = clone.Reference(plumbing.NewRemoteReferenceName("origin", "other"), true)
+	require.ErrorIs(t, err, plumbing.ErrReferenceNotFound)
 }
