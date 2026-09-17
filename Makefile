@@ -41,7 +41,7 @@ backend-lint:
 	cd backend && golangci-lint run
 
 backend-build: ## Build backend server
-	cd backend && go build -ldflags "-X main.commit=$(git rev-parse --short HEAD) -X main.buildtime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" ./cmd/server
+	cd backend && go build -ldflags "-X main.commit=$(COMMIT) -X main.buildtime=$(BUILDTIME)" ./cmd/server
 
 backend-test: ## Test and vet backend
 	cd backend && go test ./...
