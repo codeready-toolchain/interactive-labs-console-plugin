@@ -9,7 +9,7 @@ PLATFORM ?= linux/amd64
 COMMIT ?= $(shell git rev-parse --short HEAD)$(shell git diff --quiet HEAD 2>/dev/null || echo '-dirty')
 BUILDTIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-.PHONY: all build test frontend-build frontend-test backend-build backend-test image push-image validate-frontend-bundle validate-deploy validate-demo-catalog validate-catalog-namespace deploy check-registry create-namespace dev-image push-dev-image dev-deploy dev-deploy-with-demo-catalog help
+.PHONY: all build test frontend-build frontend-test backend-build backend-test image push-image validate-frontend-bundle validate-deploy validate-demo-catalog validate-catalog-namespace check-spacerequest-crd deploy check-registry create-namespace dev-image push-dev-image dev-deploy dev-deploy-with-demo-catalog help
 
 help: ## List available targets
 	@printf 'Usage: make <target>\n\nTargets:\n'; \
@@ -69,7 +69,11 @@ validate-demo-catalog: ## Validate demo catalog deployment manifests
 validate-catalog-namespace: ## Validate catalog ConfigMap namespace
 	@for dir in deploy/base deploy/demo; do $(KUSTOMIZE) build "$$dir" | grep -A1 -Fx '  name: interactive-labs-catalog' | grep -Fx '  namespace: interactive-labs-console-plugin' >/dev/null || exit 1; done
 
-deploy: ## Apply deployment manifests
+check-spacerequest-crd: ## Verify SpaceRequest CRD exists on the cluster
+	@$(OC) get crd spacerequests.toolchain.dev.openshift.com >/dev/null 2>&1 || \
+		{ echo "Error: SpaceRequest CRD (spacerequests.toolchain.dev.openshift.com) not found on the cluster."; exit 1; }
+
+deploy: check-spacerequest-crd ## Apply deployment manifests
 	$(OC) apply -k deploy/base
 
 expose-registry: ## Expose OpenShift registry
@@ -92,7 +96,7 @@ dev-image: create-namespace ## Build development image
 push-dev-image: check-registry dev-image ## Build and push development image
 	$(CONTAINER_TOOL) push $(DEV_IMAGE) --creds="unused:$$( $(OC) whoami --show-token )" --tls-verify=false
 
-dev-deploy: push-dev-image ## Build, push, and deploy development image
+dev-deploy: push-dev-image check-spacerequest-crd ## Build, push, and deploy development image
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	cp -R deploy/base/. "$$tmp"; \
 	cd "$$tmp"; \
@@ -102,7 +106,7 @@ dev-deploy: push-dev-image ## Build, push, and deploy development image
 	$(OC) rollout status deployment/interactive-labs -n $(NAMESPACE)
 	$(OC) patch consoles.operator.openshift.io cluster --type=json --patch '[{"op":"add","path":"/spec/plugins/-","value":"interactive-labs-console-plugin"}]'
 
-dev-deploy-with-demo-catalog: push-dev-image ## Build, push, and deploy development image with demo catalog
+dev-deploy-with-demo-catalog: push-dev-image check-spacerequest-crd ## Build, push, and deploy development image with demo catalog
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	cp -R deploy/base/. "$$tmp"; \
 	cp deploy/demo/catalog.yaml "$$tmp/catalog.yaml"; \
