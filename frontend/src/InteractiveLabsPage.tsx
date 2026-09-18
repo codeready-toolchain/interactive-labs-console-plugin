@@ -23,7 +23,7 @@ import {
   TextInput,
   Title,
 } from "@patternfly/react-core";
-import { getNavigablePagePaths, listCatalog, loadLabBundle } from "./api/client";
+import { getNavigablePagePaths, getSetupStatus, listCatalog, loadLabBundle, setupLab } from "./api/client";
 import type { CatalogEntry } from "./types/catalog";
 import type { LabError } from "./types/errors";
 import type { PersistedSession } from "./types/session";
@@ -39,7 +39,7 @@ type InteractiveLabsContextValue = {
   launch: (catalogRef: string, trigger: HTMLButtonElement) => Promise<void>;
   loadingCatalogRef?: string;
   launchError?: string;
-  setupDeferred?: string;
+  settingUp?: string;
 };
 
 const SESSION_PREFIX = "interactive-labs-console-plugin:session:";
@@ -115,14 +115,33 @@ const resetSessions = (): void => {
   }
 };
 
+const SETUP_POLL_INTERVAL_MS = 3000;
+
+const pollSetupUntilReady = async (catalogRef: string, signal: AbortSignal): Promise<void> => {
+  while (!signal.aborted) {
+    const status = await getSetupStatus(catalogRef);
+    if (status.status === "ready") return;
+    if (status.status === "failed") throw new Error("Lab setup failed.");
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, SETUP_POLL_INTERVAL_MS);
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(new DOMException("Aborted", "AbortError"));
+      }, { once: true });
+    });
+  }
+  throw new DOMException("Aborted", "AbortError");
+};
+
 const InteractiveLabsProvider: React.FC = ({ children }) => {
   const [activePanel, setActivePanel] = React.useState<ActivePanel | null>(null);
   const [loadingCatalogRef, setLoadingCatalogRef] = React.useState<string>();
   const [launchError, setLaunchError] = React.useState<string>();
-  const [setupDeferred, setSetupDeferred] = React.useState<string>();
+  const [settingUp, setSettingUp] = React.useState<string>();
   const launchTriggerRef = React.useRef<HTMLButtonElement | null>(null);
   const drawerFocusRef = React.useRef<HTMLSpanElement | null>(null);
   const restoreFocusRef = React.useRef<HTMLButtonElement | null>(null);
+  const setupAbortRef = React.useRef<AbortController | null>(null);
   const isOpen = activePanel?.panelMode === "open";
 
   React.useEffect(() => {
@@ -131,17 +150,25 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
     else if (launchTriggerRef.current?.isConnected) launchTriggerRef.current.focus();
   }, [activePanel, isOpen]);
 
+  React.useEffect(() => () => { setupAbortRef.current?.abort(); }, []);
+
   const launch = React.useCallback(async (catalogRef: string, trigger: HTMLButtonElement): Promise<void> => {
     launchTriggerRef.current = trigger;
+    setupAbortRef.current?.abort();
     setActivePanel(null);
     setLoadingCatalogRef(catalogRef);
     setLaunchError(undefined);
-    setSetupDeferred(undefined);
+    setSettingUp(undefined);
     try {
       const bundle = await loadLabBundle(catalogRef);
+
       if (bundle.runtimeContext.helmChartAvailable) {
-        setSetupDeferred("Lab setup is deferred to STORY-5.");
-        return;
+        setSettingUp(catalogRef);
+        const abortController = new AbortController();
+        setupAbortRef.current = abortController;
+        await setupLab(catalogRef);
+        await pollSetupUntilReady(catalogRef, abortController.signal);
+        setSettingUp(undefined);
       }
 
       const pagePaths = getNavigablePagePaths(bundle.pages);
@@ -157,9 +184,11 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       setActivePanel(panel);
       saveSession(panel);
     } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
       setLaunchError((err as LabError | undefined)?.message ?? "Unable to load lab.");
     } finally {
       setLoadingCatalogRef(undefined);
+      setSettingUp(undefined);
     }
   }, []);
 
@@ -180,8 +209,8 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   }, []);
 
   const value = React.useMemo(
-    () => ({ launch, loadingCatalogRef, launchError, setupDeferred }),
-    [launch, launchError, loadingCatalogRef, setupDeferred],
+    () => ({ launch, loadingCatalogRef, launchError, settingUp }),
+    [launch, launchError, loadingCatalogRef, settingUp],
   );
 
   return (
@@ -314,8 +343,10 @@ const InteractiveLabsPage: React.FC = () => {
       {interactiveLabs?.launchError && (
         <Alert variant="danger" title={interactiveLabs.launchError} isInline isLiveRegion />
       )}
-      {interactiveLabs?.setupDeferred && (
-        <Alert variant="info" title={interactiveLabs.setupDeferred} isInline isLiveRegion />
+      {interactiveLabs?.settingUp && (
+        <Alert variant="info" title="Setting up your lab environment..." isInline isLiveRegion>
+          <Spinner size="md" aria-label="Setting up lab" />
+        </Alert>
       )}
 
       {state.status === "success" && state.items.length === 0 && (

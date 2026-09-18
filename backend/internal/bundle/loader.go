@@ -47,6 +47,7 @@ type Result struct {
 	Manifest           *manifest.LabManifest
 	Pages              []string // sorted navigable relative page paths
 	HelmChartAvailable bool
+	ValuesSchema       []byte // raw contents of setup/helm/values.schema.json, nil if absent
 }
 
 // ValidateCloneArgs validates repository URL and branch before shell execution.
@@ -186,12 +187,13 @@ func LoadFromSnapshot(repositoryRoot, labPath string) (*Result, error) {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return nil, fmt.Errorf("%w: lab path escapes repository", ErrLabInvalid)
 	}
-	return LoadFromDir(labDir)
+	return LoadFromDir(labDir, root)
 }
 
 // LoadFromDir loads a lab bundle from an already-populated labPath on disk.
+// repoRoot is the repository root directory where setup/helm/ is expected.
 // Exported for filesystem-focused tests.
-func LoadFromDir(labDir string) (*Result, error) {
+func LoadFromDir(labDir string, repoRoot string) (*Result, error) {
 	manifestBytes, err := os.ReadFile(filepath.Join(labDir, "lab.yaml"))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -234,8 +236,17 @@ func LoadFromDir(labDir string) (*Result, error) {
 	}
 	slices.Sort(pages)
 
-	_, helmErr := os.Stat(filepath.Join(labDir, "setup", "helm", "Chart.yaml"))
-	return &Result{Manifest: m, Pages: pages, HelmChartAvailable: helmErr == nil}, nil
+	helmDir := filepath.Join(repoRoot, "setup", "helm")
+	_, helmErr := os.Stat(filepath.Join(helmDir, "Chart.yaml"))
+	helmAvailable := helmErr == nil
+
+	result := &Result{Manifest: m, Pages: pages, HelmChartAvailable: helmAvailable}
+	if helmAvailable {
+		if schema, err := os.ReadFile(filepath.Join(helmDir, "values.schema.json")); err == nil {
+			result.ValuesSchema = schema
+		}
+	}
+	return result, nil
 }
 
 func isIncludeOnly(page string) bool {

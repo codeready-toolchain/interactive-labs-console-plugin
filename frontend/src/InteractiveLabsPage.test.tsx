@@ -17,6 +17,7 @@ jest.mock('./api/client');
 const mockListCatalog = client.listCatalog as jest.MockedFunction<typeof client.listCatalog>;
 const mockLoadLabBundle = client.loadLabBundle as jest.MockedFunction<typeof client.loadLabBundle>;
 const mockSetupLab = client.setupLab as jest.MockedFunction<typeof client.setupLab>;
+const mockGetSetupStatus = client.getSetupStatus as jest.MockedFunction<typeof client.getSetupStatus>;
 const mockGetNavigablePagePaths = client.getNavigablePagePaths as jest.MockedFunction<
   typeof client.getNavigablePagePaths
 >;
@@ -31,6 +32,7 @@ beforeEach(() => {
   mockListCatalog.mockReset();
   mockLoadLabBundle.mockReset();
   mockSetupLab.mockReset();
+  mockGetSetupStatus.mockReset();
   mockGetNavigablePagePaths.mockReset();
   mockGetNavigablePagePaths.mockImplementation((pages) =>
     Object.keys(pages)
@@ -257,15 +259,27 @@ describe('InteractiveLabsPage', () => {
     );
   });
 
-  test('defers chart-backed lab setup without opening content or calling setupLab', async () => {
+  test('chart-backed lab calls setupLab and polls until ready', async () => {
     mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockSetupLab.mockResolvedValue({
+      apiVersion: 'v1alpha1',
+      kind: 'SetupResult',
+      outcome: 'accepted',
+      message: 'Lab setup initiated',
+    });
+    mockGetSetupStatus.mockResolvedValue({
+      apiVersion: 'v1alpha1',
+      kind: 'SetupStatus',
+      status: 'ready',
+      namespaces: { gitea: { status: 'ready', name: 'user1-abc' } },
+    });
     await renderCatalog();
 
     await act(async () => { getButton(/^Launch$/).click(); });
 
-    expect(container.textContent).toMatch(/setup.*STORY-5|STORY-5.*setup/i);
-    expect(container.textContent).not.toContain('pages/a-first.adoc');
-    expect(mockSetupLab).not.toHaveBeenCalled();
+    expect(mockSetupLab).toHaveBeenCalledWith('lab-1');
+    expect(mockGetSetupStatus).toHaveBeenCalledWith('lab-1');
+    expect(container.textContent).toContain('pages/a-first.adoc');
   });
 
   test('uses native controls, moves focus into drawer, and restores it after close', async () => {

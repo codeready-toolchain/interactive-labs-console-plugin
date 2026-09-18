@@ -1,7 +1,7 @@
 import { consoleFetch } from "@openshift-console/dynamic-plugin-sdk";
 import type { CatalogList } from "../types/catalog";
 import type { LabBundle, LabManifest } from "../types/manifest";
-import type { SetupResult } from "../types/setup";
+import type { SetupResult, SetupStatus } from "../types/setup";
 import { isKnownErrorType, type LabError } from "../types/errors";
 
 const PROXY_BASE = "/api/proxy/plugin/interactive-labs-console-plugin/backend";
@@ -45,16 +45,16 @@ export async function loadLabBundle(catalogRef: string): Promise<LabBundle> {
   return validateLabBundle(await parseResponse<unknown>(res), catalogRef);
 }
 
-export async function setupLab(
-  catalogRef: string,
-  namespaceBindings: Record<string, string>,
-): Promise<SetupResult> {
+export async function setupLab(catalogRef: string): Promise<SetupResult> {
   const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/setup`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ namespaceBindings }),
   });
   return parseResponse<SetupResult>(res);
+}
+
+export async function getSetupStatus(catalogRef: string): Promise<SetupStatus> {
+  const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/setup/status`);
+  return parseResponse<SetupStatus>(res);
 }
 
 // --- Bundle validation ---

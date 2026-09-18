@@ -2,7 +2,7 @@
 // consoleFetch is stubbed via moduleNameMapper → src/__mocks__/dynamic-plugin-sdk.ts
 
 import { consoleFetch } from "@openshift-console/dynamic-plugin-sdk";
-import { listCatalog, loadLabBundle, setupLab } from "../client";
+import { getSetupStatus, listCatalog, loadLabBundle, setupLab } from "../client";
 
 const mockFetch = consoleFetch as jest.MockedFunction<typeof consoleFetch>;
 
@@ -129,24 +129,40 @@ describe("loadLabBundle", () => {
 });
 
 describe("setupLab", () => {
-  it("calls POST /api/v1alpha1/labs/{catalogRef}/setup with JSON body", async () => {
+  it("calls POST /api/v1alpha1/labs/{catalogRef}/setup with empty body", async () => {
     const resultBody = {
       apiVersion: "v1alpha1",
       kind: "SetupResult",
-      outcome: "success",
-      message: "done",
-      helmReleaseName: "il-abc",
+      outcome: "accepted",
+      message: "Lab setup initiated",
     };
     mockFetch.mockResolvedValueOnce(makeJsonResponse(resultBody));
 
-    const bindings = { releaseNamespace: "my-ns" };
-    const result = await setupLab("l1", bindings);
+    const result = await setupLab("l1");
 
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe(`${PROXY_BASE}/api/v1alpha1/labs/l1/setup`);
     expect(init?.method).toBe("POST");
-    expect(init?.headers).toMatchObject({ "Content-Type": "application/json" });
-    expect(JSON.parse(init?.body as string)).toEqual({ namespaceBindings: bindings });
-    expect(result.helmReleaseName).toBe("il-abc");
+    expect(result.outcome).toBe("accepted");
+  });
+});
+
+describe("getSetupStatus", () => {
+  it("calls GET /api/v1alpha1/labs/{catalogRef}/setup/status", async () => {
+    const statusBody = {
+      apiVersion: "v1alpha1",
+      kind: "SetupStatus",
+      status: "ready",
+      namespaces: { gitea: { status: "ready", name: "user1-abc" } },
+    };
+    mockFetch.mockResolvedValueOnce(makeJsonResponse(statusBody));
+
+    const result = await getSetupStatus("l1");
+
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe(`${PROXY_BASE}/api/v1alpha1/labs/l1/setup/status`);
+    expect(init?.method ?? "GET").toBe("GET");
+    expect(result.status).toBe("ready");
+    expect(result.namespaces.gitea.name).toBe("user1-abc");
   });
 });

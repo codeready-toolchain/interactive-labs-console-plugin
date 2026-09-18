@@ -24,6 +24,7 @@ import (
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/catalog"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/handler"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/manifest"
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/setup"
 )
 
 // stubCatalogReader provides a fixed ConfigMap for handler injection.
@@ -58,6 +59,26 @@ func newRouter(t *testing.T) http.Handler {
 				"user": subject, "openshift_api_url": "https://api.example.test", "openshift_console_url": "https://console.example.test", "openshift_cluster_ingress_domain": "apps.example.test",
 			}, nil
 		},
+	})
+}
+
+func newSetupRouter(t *testing.T) http.Handler {
+	t.Helper()
+	client, _ := stubSetupClient(t)
+	return handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		Authenticate: func(_ context.Context, token string) (string, error) {
+			return token, nil
+		},
+		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
+			return &bundle.Result{
+				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Manifest Lab"}},
+				Pages:              []string{"= Intro"},
+				HelmChartAvailable: true,
+				ValuesSchema:       testValuesSchema,
+			}, nil
+		},
+		SetupClient: client,
 	})
 }
 
@@ -143,137 +164,82 @@ func TestBundleHandler_UnknownLabReturns404(t *testing.T) {
 
 // --- POST /api/v1alpha1/labs/{id}/setup ---
 
-func TestSetupHandler_InvalidBindings_Returns422(t *testing.T) {
-	payload := `{"namespaceBindings":{}}` // missing releaseNamespace
+var testValuesSchema = []byte(`{
+	"properties": {
+		"gitea.namespace": {
+			"type": "string",
+			"title": "gitea namespace",
+			"description": "Namespace name for Gitea deployment",
+			"x-interactive-labs": {
+				"kind": "namespace-name"
+			}
+		},
+		"datasphere.namespace": {
+			"type": "string",
+			"title": "datasphere namespace",
+			"description": "Namespace name for Datasphere deployment",
+			"x-interactive-labs": {
+				"kind": "namespace-name"
+			}
+		}
+	}
+}`)
+
+func stubSetupClient(t *testing.T) (*setup.SpaceRequestClient, *httptest.Server) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(server.Close)
+	return &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, server
+}
+
+func TestSetupHandler_NoHelmChart_Returns422(t *testing.T) {
 	ref := goodCatalogRef()
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
-		strings.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
+	req.Header.Set("Authorization", "Bearer user1")
 	newRouter(t).ServeHTTP(rw, req)
 
 	require.Equal(t, http.StatusUnprocessableEntity, rw.Code)
 	var body map[string]any
 	json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
-	assert.Equal(t, "namespace_binding_invalid", body["type"])
+	assert.Equal(t, "chart_not_found", body["type"])
 }
 
-func TestSetupHandler_ValidBindings_Returns200WithHelmReleaseName(t *testing.T) {
-	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
+func TestSetupHandler_ValidSchema_Returns202(t *testing.T) {
 	ref := goodCatalogRef()
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
-		strings.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	// Provide a minimal JWT with sub=user1
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
 	req.Header.Set("Authorization", "Bearer "+makeTestJWT("user1"))
-	newRouter(t).ServeHTTP(rw, req)
+	newSetupRouter(t).ServeHTTP(rw, req)
 
-	require.Equal(t, http.StatusOK, rw.Code)
+	require.Equal(t, http.StatusAccepted, rw.Code)
 	var body map[string]any
 	json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
 	assert.Equal(t, "SetupResult", body["kind"])
-	assert.Equal(t, "success", body["outcome"])
-	name, _ := body["helmReleaseName"].(string)
-	assert.True(t, strings.HasPrefix(name, "il-"), "helmReleaseName prefix: %q", name)
-	assert.Len(t, name, len("il-")+40, "helmReleaseName length: %q", name)
+	assert.Equal(t, "accepted", body["outcome"])
 }
 
-func TestSetupHandler_DeterministicHelmReleaseName(t *testing.T) {
-	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
-	token := makeTestJWT("user1")
-	ref := goodCatalogRef()
+func TestSetupHandler_NoAuthorizationEchoed(t *testing.T) {
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
+	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
+	newSetupRouter(t).ServeHTTP(rw, req)
 
-	call := func() string {
-		rw := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
-			bytes.NewBufferString(payload))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+token)
-		newRouter(t).ServeHTTP(rw, req)
-		var body map[string]any
-		json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
-		return body["helmReleaseName"].(string)
-	}
-	firstCall := call()
-	secondCall := call()
-	assert.Equal(t, firstCall, secondCall, "deterministic helmReleaseName must be the same")
+	assertNoTokenInBody(t, rw.Body.String())
 }
 
-func TestSetupHandler_ContentPointerDeterminesReleaseName(t *testing.T) {
-	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
-	call := func(repository, labPath, branch string) string {
-		router := handler.NewRouter(handler.Config{
-			CatalogSource: stubCatalogCM(map[string]string{
-				"catalog.yaml": fmt.Sprintf("- displayName: Lab\n  repository: %q\n  branch: %q\n  labPath: %q",
-					repository, branch, labPath),
-			}),
-			Authenticate: func(_ context.Context, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{Manifest: &manifest.LabManifest{}}, nil
-			},
-		})
-		ref := catalog.DeriveRef(repository, branch, labPath, nil)
-		rw := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", strings.NewReader(payload))
-		req.Header.Set("Authorization", "Bearer user1")
-		router.ServeHTTP(rw, req)
-		var body map[string]any
-		json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
-		return body["helmReleaseName"].(string)
-	}
-
-	baseline := call("https://github.com/redhat/lab", "labs/example", "main")
-	assert.NotEqual(t, baseline, call("https://github.com/redhat/other", "labs/example", "main"),
-		"repository must affect helmReleaseName")
-	assert.NotEqual(t, baseline, call("https://github.com/redhat/lab", "labs/other", "main"),
-		"lab path must affect helmReleaseName")
-	assert.NotEqual(t, baseline, call("https://github.com/redhat/lab", "labs/example", "other"),
-		"branch must affect helmReleaseName")
-}
-
-func TestSetupHandler_DifferentManifestAttributes_DifferentReleaseName(t *testing.T) {
-	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
-	ref := goodCatalogRef()
-	call := func(attributes map[string]string) string {
-		router := handler.NewRouter(handler.Config{
-			CatalogSource: goodCatalogCM,
-			Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{Manifest: &manifest.LabManifest{Spec: manifest.Spec{Attributes: attributes}}}, nil
-			},
-		})
-		rw := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", strings.NewReader(payload))
-		req.Header.Set("Authorization", "Bearer user1")
-		router.ServeHTTP(rw, req)
-		var body map[string]any
-		json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
-		return body["helmReleaseName"].(string)
-	}
-
-	assert.NotEqual(t, call(map[string]string{"version": "v1"}), call(map[string]string{"version": "v2"}),
-		"different manifest attributes must produce different helmReleaseName")
-}
-
-func TestSetupHandler_DifferentSubject_DifferentReleaseName(t *testing.T) {
-	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
-	ref := goodCatalogRef()
-
-	call := func(sub string) string {
-		rw := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup",
-			bytes.NewBufferString(payload))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+makeTestJWT(sub))
-		newRouter(t).ServeHTTP(rw, req)
-		var body map[string]any
-		json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
-		return body["helmReleaseName"].(string)
-	}
-
-	assert.NotEqual(t, call("user1"), call("user2"), "different subjects must produce different helmReleaseName")
+func TestSetupHandler_TokenNotLogged(t *testing.T) {
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
+	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
+	newSetupRouter(t).ServeHTTP(rw, req)
+	assertNoTokenInBody(t, rw.Body.String())
 }
 
 // --- New tests for catalogRef, auth on bundle, and attribute merging (RED before implementation) ---
@@ -429,33 +395,148 @@ func TestBundleHandler_RuntimeAttributesAreAllOrSafeFailure(t *testing.T) {
 	}
 }
 
-func TestSetupHandler_ReleaseNameExcludesRuntimeAttrs(t *testing.T) {
-	makeRouter := func(runtimeAttrs map[string]string) http.Handler {
-		return handler.NewRouter(handler.Config{
-			CatalogSource: goodCatalogCM,
-			Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{Manifest: &manifest.LabManifest{}}, nil
-			},
-			RuntimeAttributes: func(_ *http.Request, _ string) (map[string]string, error) {
-				return runtimeAttrs, nil
-			},
-		})
-	}
+// --- GET /api/v1alpha1/labs/{id}/setup/status ---
+
+func TestSetupStatusHandler_AllReady(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"metadata":{"name":"test"},"status":{"namespaceAccess":[{"name":"ns-abc","secretRef":"s"}],"conditions":[{"type":"Ready","status":"True"}]}}`)
+	}))
+	defer server.Close()
+
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
+			return &bundle.Result{
+				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
+				Pages:              []string{"intro.adoc"},
+				HelmChartAvailable: true,
+				ValuesSchema:       testValuesSchema,
+			}, nil
+		},
+		SetupClient: &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL},
+	})
+
 	ref := goodCatalogRef()
-	payload := `{"namespaceBindings":{"releaseNamespace":"my-ns"}}`
-	call := func(router http.Handler) string {
-		rw := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", strings.NewReader(payload))
-		req.Header.Set("Authorization", "Bearer user1")
-		router.ServeHTTP(rw, req)
-		var body map[string]any
-		json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
-		return body["helmReleaseName"].(string)
-	}
-	r1 := makeRouter(map[string]string{"runtime-key": "val1"})
-	r2 := makeRouter(map[string]string{"runtime-key": "val2"})
-	assert.Equal(t, call(r1), call(r2), "runtime attrs must not affect helmReleaseName")
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/setup/status", nil)
+	req.Header.Set("Authorization", "Bearer user1")
+	router.ServeHTTP(rw, req)
+
+	require.Equal(t, http.StatusOK, rw.Code)
+	var body map[string]any
+	json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
+	assert.Equal(t, "SetupStatus", body["kind"])
+	assert.Equal(t, "ready", body["status"])
+}
+
+func TestSetupStatusHandler_Provisioning(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"metadata":{"name":"test"},"status":{"conditions":[{"type":"Ready","status":"False","reason":"Provisioning"}]}}`)
+	}))
+	defer server.Close()
+
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
+			return &bundle.Result{
+				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
+				Pages:              []string{"intro.adoc"},
+				HelmChartAvailable: true,
+				ValuesSchema:       testValuesSchema,
+			}, nil
+		},
+		SetupClient: &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL},
+	})
+
+	ref := goodCatalogRef()
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/setup/status", nil)
+	req.Header.Set("Authorization", "Bearer user1")
+	router.ServeHTTP(rw, req)
+
+	require.Equal(t, http.StatusOK, rw.Code)
+	var body map[string]any
+	json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
+	assert.Equal(t, "provisioning", body["status"])
+}
+
+func TestSetupStatusHandler_ReadyWithoutNamespaceAccessStaysProvisioning(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"metadata":{"name":"test"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}`)
+	}))
+	defer server.Close()
+
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
+			return &bundle.Result{
+				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
+				Pages:              []string{"intro.adoc"},
+				HelmChartAvailable: true,
+				ValuesSchema:       testValuesSchema,
+			}, nil
+		},
+		SetupClient: &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL},
+	})
+
+	ref := goodCatalogRef()
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/setup/status", nil)
+	req.Header.Set("Authorization", "Bearer user1")
+	router.ServeHTTP(rw, req)
+
+	require.Equal(t, http.StatusOK, rw.Code)
+	var body map[string]any
+	json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
+	assert.Equal(t, "provisioning", body["status"])
+}
+
+func TestSetupStatusHandler_TerminalFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"metadata":{"name":"test"},"status":{"conditions":[{"type":"Ready","status":"False","reason":"UnableToCreateSpace"}]}}`)
+	}))
+	defer server.Close()
+
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
+			return &bundle.Result{
+				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
+				Pages:              []string{"intro.adoc"},
+				HelmChartAvailable: true,
+				ValuesSchema:       testValuesSchema,
+			}, nil
+		},
+		SetupClient: &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL},
+	})
+
+	ref := goodCatalogRef()
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/setup/status", nil)
+	req.Header.Set("Authorization", "Bearer user1")
+	router.ServeHTTP(rw, req)
+
+	require.Equal(t, http.StatusOK, rw.Code)
+	var body map[string]any
+	json.Unmarshal(rw.Body.Bytes(), &body) //nolint:errcheck
+	assert.Equal(t, "failed", body["status"])
+}
+
+func TestSetupStatusHandler_RequiresAuth(t *testing.T) {
+	ref := goodCatalogRef()
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/setup/status", nil)
+	newSetupRouter(t).ServeHTTP(rw, req)
+
+	require.Equal(t, http.StatusUnauthorized, rw.Code)
 }
 
 func TestCatalogHandler_UsesManifestMetadataAndOmitsOnlyClassifiedFailures(t *testing.T) {
@@ -744,10 +825,17 @@ func pngBytes() []byte {
 
 // helpers
 
+func assertNoTokenInBody(t *testing.T, body string) {
+	t.Helper()
+	assert.NotContains(t, body, "Bearer")
+	assert.NotContains(t, body, "eyJ")
+	assert.NotContains(t, body, "Authorization")
+}
+
 // makeTestJWT builds a minimal unsigned JWT with the given sub.
 // No signature verification is expected in MVP; cluster validates the token.
 func makeTestJWT(sub string) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
-	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":%q}`, sub))) //nolint:fmtappendf
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":%q}`, sub)))
 	return header + "." + payload + "."
 }
