@@ -137,6 +137,79 @@ func catalogEntryByCatalogRef(ctx context.Context, cfg Config, catalogRef string
 	return nil, laberr.New(laberr.TypeLabNotFound, "lab not found in catalog", nil)
 }
 
+type setupContext struct {
+	token    string
+	subject  string
+	entry    *catalog.Entry
+	result   *bundle.Result
+	bindings []setup.NamespaceBinding
+}
+
+func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*setupContext, bool) {
+	token := bearerToken(r)
+	if token == "" || cfg.Authenticate == nil {
+		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication required", nil))
+		return nil, false
+	}
+	subject, err := cfg.Authenticate(r.Context(), token)
+	if err != nil || subject == "" {
+		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication failed", nil))
+		return nil, false
+	}
+
+	catalogRef := r.PathValue("catalogRef")
+	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, catalogRef)
+	if labError != nil {
+		writeError(w, http.StatusNotFound, labError)
+		return nil, false
+	}
+
+	loader := cfg.BundleLoader
+	if loader == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			laberr.New(laberr.TypeRepositoryError, "bundle loader not configured", nil))
+		return nil, false
+	}
+	result, err := loader(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
+	if err != nil {
+		writeError(w, http.StatusBadGateway,
+			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
+		return nil, false
+	}
+
+	if result.ValuesSchema == nil {
+		writeError(w, http.StatusUnprocessableEntity,
+			laberr.New(laberr.TypeChartNotFound, "lab has no values schema", nil))
+		return nil, false
+	}
+
+	if cfg.SetupClient == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			laberr.New(laberr.TypeConfigurationError, "setup client not configured", nil))
+		return nil, false
+	}
+
+	bindings, err := setup.ParseNamespaceBindings(result.ValuesSchema)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity,
+			laberr.New(laberr.TypeConfigurationError, "invalid values schema", nil))
+		return nil, false
+	}
+	if len(bindings) == 0 {
+		writeError(w, http.StatusUnprocessableEntity,
+			laberr.New(laberr.TypeConfigurationError, "values schema declares no namespace bindings", nil))
+		return nil, false
+	}
+
+	return &setupContext{
+		token:    token,
+		subject:  subject,
+		entry:    entry,
+		result:   result,
+		bindings: bindings,
+	}, true
+}
+
 // --- handler functions ---
 
 func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
@@ -356,73 +429,23 @@ func isSafeResourceContentType(contentType string) bool {
 }
 
 func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
-	catalogRef := r.PathValue("catalogRef")
 	if cfg.Logger != nil {
-		cfg.Logger.Info("setup request received", "catalogRef", catalogRef)
+		cfg.Logger.Info("setup request received", "catalogRef", r.PathValue("catalogRef"))
 	}
 
-	token := bearerToken(r)
-	if token == "" || cfg.Authenticate == nil {
-		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication required", nil))
-		return
-	}
-	subject, err := cfg.Authenticate(r.Context(), token)
-	if err != nil || subject == "" {
-		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication failed", nil))
+	sctx, ok := resolveSetupContext(w, r, cfg)
+	if !ok {
 		return
 	}
 
-	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, catalogRef)
-	if labError != nil {
-		writeError(w, http.StatusNotFound, labError)
-		return
-	}
-
-	loader := cfg.BundleLoader
-	if loader == nil {
-		writeError(w, http.StatusServiceUnavailable,
-			laberr.New(laberr.TypeRepositoryError, "bundle loader not configured", nil))
-		return
-	}
-	result, err := loader(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
-	if err != nil {
-		writeError(w, http.StatusBadGateway,
-			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
-		return
-	}
-
-	if result.ValuesSchema == nil {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeChartNotFound, "lab has no values schema", nil))
-		return
-	}
-
-	if cfg.SetupClient == nil {
-		writeError(w, http.StatusServiceUnavailable,
-			laberr.New(laberr.TypeConfigurationError, "setup client not configured", nil))
-		return
-	}
-
-	bindings, err := setup.ParseNamespaceBindings(result.ValuesSchema)
-	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeConfigurationError, "invalid values schema", nil))
-		return
-	}
-	if len(bindings) == 0 {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeConfigurationError, "values schema declares no namespace bindings", nil))
-		return
-	}
-
-	userNamespace := subject + "-dev"
+	userNamespace := sctx.subject + "-dev"
 	tierName := cfg.SpaceRequestTierName
 	if tierName == "" {
 		tierName = "base1ns"
 	}
 
-	for _, b := range bindings {
-		if err := cfg.SetupClient.EnsureSpaceRequest(r.Context(), token, userNamespace, b.Key, tierName); err != nil {
+	for _, b := range sctx.bindings {
+		if err := cfg.SetupClient.EnsureSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key, tierName); err != nil {
 			if cfg.Logger != nil {
 				cfg.Logger.Error("create SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
 			}
@@ -441,68 +464,23 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 }
 
 func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
-	token := bearerToken(r)
-	if token == "" || cfg.Authenticate == nil {
-		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication required", nil))
-		return
-	}
-	subject, err := cfg.Authenticate(r.Context(), token)
-	if err != nil || subject == "" {
-		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication failed", nil))
+	sctx, ok := resolveSetupContext(w, r, cfg)
+	if !ok {
 		return
 	}
 
-	catalogRef := r.PathValue("catalogRef")
-	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, catalogRef)
-	if labError != nil {
-		writeError(w, http.StatusNotFound, labError)
-		return
-	}
-
-	loader := cfg.BundleLoader
-	if loader == nil {
-		writeError(w, http.StatusServiceUnavailable,
-			laberr.New(laberr.TypeRepositoryError, "bundle loader not configured", nil))
-		return
-	}
-	result, err := loader(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
-	if err != nil {
-		writeError(w, http.StatusBadGateway,
-			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
-		return
-	}
-
-	if result.ValuesSchema == nil {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeChartNotFound, "lab has no values schema", nil))
-		return
-	}
-
-	bindings, err := setup.ParseNamespaceBindings(result.ValuesSchema)
-	if err != nil || len(bindings) == 0 {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeConfigurationError, "invalid or empty values schema", nil))
-		return
-	}
-
-	if cfg.SetupClient == nil {
-		writeError(w, http.StatusServiceUnavailable,
-			laberr.New(laberr.TypeConfigurationError, "setup client not configured", nil))
-		return
-	}
-
-	userNamespace := subject + "-dev"
+	userNamespace := sctx.subject + "-dev"
 
 	type namespaceStatus struct {
 		Status string `json:"status"`
 		Name   string `json:"name"`
 	}
-	namespaces := make(map[string]namespaceStatus, len(bindings))
+	namespaces := make(map[string]namespaceStatus, len(sctx.bindings))
 	allReady := true
 	anyFailed := false
 
-	for _, b := range bindings {
-		sr, err := cfg.SetupClient.GetSpaceRequest(r.Context(), token, userNamespace, b.Key)
+	for _, b := range sctx.bindings {
+		sr, err := cfg.SetupClient.GetSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key)
 		if err != nil {
 			if cfg.Logger != nil {
 				cfg.Logger.Warn("get SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
@@ -551,7 +529,7 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 		"namespaces":      namespaces,
 		"outcome":         "success",
 		"message":         "Lab setup complete",
-		"helmReleaseName": setup.HelmReleaseName(subject, catalogRef, bindings),
+		"helmReleaseName": setup.HelmReleaseName(sctx.subject, sctx.entry.CatalogRef, sctx.bindings),
 	})
 }
 
