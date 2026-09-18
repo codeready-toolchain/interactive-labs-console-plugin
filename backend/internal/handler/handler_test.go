@@ -62,6 +62,26 @@ func newRouter(t *testing.T) http.Handler {
 	})
 }
 
+func newSetupRouter(t *testing.T) http.Handler {
+	t.Helper()
+	client, _ := stubSetupClient(t)
+	return handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		Authenticate: func(_ context.Context, token string) (string, error) {
+			return token, nil
+		},
+		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
+			return &bundle.Result{
+				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Manifest Lab"}},
+				Pages:              []string{"= Intro"},
+				HelmChartAvailable: true,
+				ValuesSchema:       testValuesSchema,
+			}, nil
+		},
+		SetupClient: client,
+	})
+}
+
 // --- GET /api/v1alpha1/catalog ---
 
 func TestCatalogHandler_Returns200(t *testing.T) {
@@ -176,26 +196,6 @@ func stubSetupClient(t *testing.T) (*setup.SpaceRequestClient, *httptest.Server)
 	}))
 	t.Cleanup(server.Close)
 	return &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, server
-}
-
-func newSetupRouter(t *testing.T) http.Handler {
-	t.Helper()
-	client, _ := stubSetupClient(t)
-	return handler.NewRouter(handler.Config{
-		CatalogSource: goodCatalogCM,
-		Authenticate: func(_ context.Context, token string) (string, error) {
-			return token, nil
-		},
-		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-			return &bundle.Result{
-				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Manifest Lab"}},
-				Pages:              []string{"= Intro"},
-				HelmChartAvailable: true,
-				ValuesSchema:       testValuesSchema,
-			}, nil
-		},
-		SetupClient: client,
-	})
 }
 
 func TestSetupHandler_NoHelmChart_Returns422(t *testing.T) {

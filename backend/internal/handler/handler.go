@@ -397,6 +397,12 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
+	if cfg.SetupClient == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			laberr.New(laberr.TypeConfigurationError, "setup client not configured", nil))
+		return
+	}
+
 	bindings, err := setup.ParseNamespaceBindings(result.ValuesSchema)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity,
@@ -406,12 +412,6 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 	if len(bindings) == 0 {
 		writeError(w, http.StatusUnprocessableEntity,
 			laberr.New(laberr.TypeConfigurationError, "values schema declares no namespace bindings", nil))
-		return
-	}
-
-	if cfg.SetupClient == nil {
-		writeError(w, http.StatusServiceUnavailable,
-			laberr.New(laberr.TypeConfigurationError, "setup client not configured", nil))
 		return
 	}
 
