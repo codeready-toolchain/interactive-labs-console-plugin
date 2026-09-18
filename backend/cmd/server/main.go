@@ -3,12 +3,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -57,6 +59,9 @@ func main() {
 		RuntimeAttributes:    inClusterRuntimeAttributes(log),
 		SetupClient:          inClusterSetupClient(log),
 		SpaceRequestTierName: "base1ns",
+		HelmManager:          inClusterHelmClient(log),
+		HelmTimeout:          helmTimeout(),
+		ClusterIngressDomain: inClusterIngressDomain(log),
 	}
 
 	backend := &http.Server{
@@ -236,4 +241,91 @@ func inClusterSetupClient(log *slog.Logger) *setup.SpaceRequestClient {
 		return nil
 	}
 	return &setup.SpaceRequestClient{HTTPClient: client, APIHost: apiHost}
+}
+
+func inClusterHelmClient(log *slog.Logger) setup.HelmManager {
+	caPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	apiHost := fmt.Sprintf("https://%s", os.Getenv("KUBERNETES_SERVICE_HOST")+":"+os.Getenv("KUBERNETES_SERVICE_PORT"))
+	if os.Getenv("KUBERNETES_SERVICE_HOST") == "" {
+		log.Warn("helm client unavailable: KUBERNETES_SERVICE_HOST not set")
+		return nil
+	}
+	client, err := tlsClientWithCA(caPath)
+	if err != nil {
+		log.Warn("helm client unavailable", "err", err)
+		return nil
+	}
+	return &setup.HelmClient{APIHost: apiHost, CAFile: caPath, HTTPClient: client, Logger: log}
+}
+
+func helmTimeout() time.Duration {
+	if s := os.Getenv("HELM_TIMEOUT_SECONDS"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return 300 * time.Second
+}
+
+// inClusterIngressDomain fetches the cluster's ingress domain from the
+// ingresses.config.openshift.io/cluster resource at startup.
+func inClusterIngressDomain(log *slog.Logger) string {
+	log.Info("fetching cluster ingress domain")
+	apiHost := os.Getenv("KUBERNETES_SERVICE_HOST")
+	if apiHost == "" {
+		log.Warn("cluster ingress domain unavailable: KUBERNETES_SERVICE_HOST not set")
+		return ""
+	}
+	caPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	tokenPath := "/var/run/secrets/kubernetes.io/serviceaccount/token" //nolint:gosec
+
+	token, err := os.ReadFile(tokenPath)
+	if err != nil {
+		log.Warn("cluster ingress domain unavailable: cannot read service account token", "err", err)
+		return ""
+	}
+
+	client, err := tlsClientWithCA(caPath)
+	if err != nil {
+		log.Warn("cluster ingress domain unavailable", "err", err)
+		return ""
+	}
+
+	url := fmt.Sprintf("https://%s:%s/apis/config.openshift.io/v1/ingresses/cluster",
+		os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT"))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil) //nolint:gosec
+	if err != nil {
+		log.Warn("cluster ingress domain unavailable", "err", err)
+		return ""
+	}
+	req.Header.Set("Authorization", "Bearer "+string(token))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Warn("cluster ingress domain unavailable", "err", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Warn("cluster ingress domain unavailable", "status", resp.StatusCode)
+		return ""
+	}
+
+	var ingress struct {
+		Spec struct {
+			Domain string `json:"domain"`
+		} `json:"spec"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ingress); err != nil {
+		log.Warn("cluster ingress domain unavailable: decode failed", "err", err)
+		return ""
+	}
+	if ingress.Spec.Domain == "" {
+		log.Warn("cluster ingress domain unavailable: empty domain in response")
+		return ""
+	}
+
+	log.Info("cluster ingress domain resolved", "domain", ingress.Spec.Domain)
+	return ingress.Spec.Domain
 }

@@ -47,6 +47,7 @@ type Result struct {
 	Manifest           *manifest.LabManifest
 	Pages              []string // sorted navigable relative page paths
 	HelmChartAvailable bool
+	HelmChartDir       string // absolute path to setup/helm/ if available, empty otherwise
 	ValuesSchema       []byte // raw contents of setup/helm/values.schema.json, nil if absent
 }
 
@@ -242,6 +243,7 @@ func LoadFromDir(labDir string, repoRoot string) (*Result, error) {
 
 	result := &Result{Manifest: m, Pages: pages, HelmChartAvailable: helmAvailable}
 	if helmAvailable {
+		result.HelmChartDir = helmDir
 		if schema, err := os.ReadFile(filepath.Join(helmDir, "values.schema.json")); err == nil {
 			result.ValuesSchema = schema
 		}

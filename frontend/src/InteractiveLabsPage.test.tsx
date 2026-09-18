@@ -263,15 +263,18 @@ describe('InteractiveLabsPage', () => {
     mockLoadLabBundle.mockResolvedValue(chartBundle);
     mockSetupLab.mockResolvedValue({
       apiVersion: 'v1alpha1',
-      kind: 'SetupResult',
-      outcome: 'accepted',
-      message: 'Lab setup initiated',
+      kind: 'SetupStatus',
+      spaceRequests: { status: 'provisioning', namespaces: null },
+      helm: { status: 'pending', releaseName: 'il-abc123' },
     });
     mockGetSetupStatus.mockResolvedValue({
       apiVersion: 'v1alpha1',
       kind: 'SetupStatus',
-      status: 'ready',
-      namespaces: { gitea: { status: 'ready', name: 'user1-abc' } },
+      spaceRequests: {
+        status: 'ready',
+        namespaces: { gitea: { status: 'ready', name: 'user1-abc' } },
+      },
+      helm: { status: 'deployed', releaseName: 'il-abc123' },
     });
     await renderCatalog();
 

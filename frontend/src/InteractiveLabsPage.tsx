@@ -120,8 +120,15 @@ const SETUP_POLL_INTERVAL_MS = 3000;
 const pollSetupUntilReady = async (catalogRef: string, signal: AbortSignal): Promise<void> => {
   while (!signal.aborted) {
     const status = await getSetupStatus(catalogRef);
-    if (status.status === "ready") return;
-    if (status.status === "failed") throw new Error("Lab setup failed.");
+    if (status.spaceRequests.status === "failed") {
+      throw new Error("Namespace provisioning failed.");
+    }
+    if (status.helm.status === "failed") {
+      throw new Error(status.helm.message || "Lab setup failed.");
+    }
+    if (status.spaceRequests.status === "ready" && status.helm.status === "deployed") {
+      return;
+    }
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(resolve, SETUP_POLL_INTERVAL_MS);
       signal.addEventListener("abort", () => {
