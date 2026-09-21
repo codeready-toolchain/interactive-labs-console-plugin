@@ -157,35 +157,43 @@ func TestClusterCatalogSourcePreservesCallerContextAndFailsSafely(t *testing.T) 
 
 func TestClusterIdentityResolverGetsCurrentUserFromPerRequestTypedClient(t *testing.T) {
 	const (
-		token     = "forwarded-token"
-		nextToken = "next-forwarded-token"
+		directToken       = "forwarded-token"
+		impersonatedToken = "next-forwarded-token"
+		directUser        = "alice"
+		impersonatedUser  = "admin-alice"
 	)
 	var logs bytes.Buffer
 	previousLogger := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
-	var factoryTokens []string
+	var factoryImpersonateUsers, factoryTokens []string
 	var userClients []*userfake.Clientset
-	resolver := newClusterIdentityResolver(func(_ string, receivedToken string) (userclient.Interface, error) {
+	resolver := newClusterIdentityResolver(func(receivedImpersonateUser, receivedToken string) (userclient.Interface, error) {
+		factoryImpersonateUsers = append(factoryImpersonateUsers, receivedImpersonateUser)
 		factoryTokens = append(factoryTokens, receivedToken)
+		userName := directUser
+		if receivedImpersonateUser != "" {
+			userName = receivedImpersonateUser
+		}
 		client := userfake.NewSimpleClientset()
 		client.PrependReactor("get", "users", func(k8stesting.Action) (bool, runtime.Object, error) {
-			return true, &userv1.User{ObjectMeta: metav1.ObjectMeta{Name: "alice"}}, nil
+			return true, &userv1.User{ObjectMeta: metav1.ObjectMeta{Name: userName}}, nil
 		})
 		userClients = append(userClients, client)
 		return client, nil
 	})
 
-	subject, err := resolver(context.Background(), "", token)
-	nextSubject, nextErr := resolver(context.Background(), "", nextToken)
+	directSubject, err := resolver(context.Background(), "", directToken)
+	impersonatedSubject, impersonatedErr := resolver(context.Background(), impersonatedUser, impersonatedToken)
 
 	require.NoError(t, err)
-	require.NoError(t, nextErr)
-	require.Equal(t, "alice", subject)
-	require.Equal(t, "alice", nextSubject)
-	require.Equal(t, []string{token, nextToken}, factoryTokens)
-	require.NotContains(t, logs.String(), token)
-	require.NotContains(t, logs.String(), nextToken)
+	require.NoError(t, impersonatedErr)
+	require.Equal(t, directUser, directSubject)
+	require.Equal(t, impersonatedUser, impersonatedSubject)
+	require.Equal(t, []string{"", impersonatedUser}, factoryImpersonateUsers)
+	require.Equal(t, []string{directToken, impersonatedToken}, factoryTokens)
+	require.NotContains(t, logs.String(), directToken)
+	require.NotContains(t, logs.String(), impersonatedToken)
 	require.Len(t, userClients, 2)
 	for _, client := range userClients {
 		require.Len(t, client.Actions(), 1)
