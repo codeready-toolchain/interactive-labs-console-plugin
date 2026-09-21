@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	configv1 "github.com/openshift/api/config/v1"
@@ -254,7 +255,7 @@ func TestTokenNotLogged(t *testing.T) {
   labPath: lab`}}, nil
 		},
 		Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		Authenticate: func(_ context.Context, _ string) (string, error) {
+		Authenticate: func(_ context.Context, _ string, _ string) (string, error) {
 			return "alice", nil
 		},
 	})
