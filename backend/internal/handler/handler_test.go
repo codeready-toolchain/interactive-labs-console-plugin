@@ -65,9 +65,10 @@ func newRouter(t *testing.T) http.Handler {
 	})
 }
 
-func newSetupRouter(t *testing.T) http.Handler {
+func newSetupRouter(t *testing.T) (http.Handler, <-chan struct{}) {
 	t.Helper()
 	client := prepareSetupClient(t)
+	installCh := make(chan struct{})
 	return handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
 		Authenticate: func(_ context.Context, token string) (string, error) {
@@ -78,12 +79,14 @@ func newSetupRouter(t *testing.T) http.Handler {
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Manifest Lab"}},
 				Pages:              []string{"= Intro"},
 				HelmChartAvailable: true,
+				HelmChartDir:       t.TempDir(),
 				ValuesSchema:       testValuesSchema,
 			}, nil
 		},
 		SetupClient: client,
-		HelmManager: &stubHelmManager{statusErr: errors.New("not found")},
-	})
+		HelmManager: &stubHelmManager{statusErr: errors.New("not found"), installCh: installCh},
+		HelmTimeout: 5 * time.Second,
+	}), installCh
 }
 
 // --- GET /api/v1alpha1/catalog ---
@@ -193,7 +196,9 @@ func prepareSetupClient(t *testing.T) *setup.SpaceRequestClient {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
-			w.WriteHeader(http.StatusNotFound)
+			w.Header().Set("Content-Type", "application/json")
+			name := filepath.Base(r.URL.Path)
+			fmt.Fprintf(w, `{"metadata":{"name":%q},"status":{"namespaceAccess":[{"name":"ns-%s","secretRef":"s"}],"conditions":[{"type":"Ready","status":"True"}]}}`, name, name)
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
@@ -220,7 +225,9 @@ func TestSetupHandler_ValidSchema_Returns202(t *testing.T) {
 	rw := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
 	req.Header.Set("Authorization", "Bearer "+makeTestJWT("user1"))
-	newSetupRouter(t).ServeHTTP(rw, req)
+	router, installCh := newSetupRouter(t)
+	router.ServeHTTP(rw, req)
+	<-installCh
 
 	require.Equal(t, http.StatusAccepted, rw.Code)
 	var body map[string]any
@@ -240,7 +247,9 @@ func TestSetupHandler_NoAuthorizationEchoed(t *testing.T) {
 	rw := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
 	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
-	newSetupRouter(t).ServeHTTP(rw, req)
+	router, installCh := newSetupRouter(t)
+	router.ServeHTTP(rw, req)
+	<-installCh
 
 	assertNoTokenInBody(t, rw.Body.String())
 }
@@ -249,7 +258,9 @@ func TestSetupHandler_TokenNotLogged(t *testing.T) {
 	rw := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
 	req.Header.Set("Authorization", "Bearer eyJtest.token.value")
-	newSetupRouter(t).ServeHTTP(rw, req)
+	router, installCh := newSetupRouter(t)
+	router.ServeHTTP(rw, req)
+	<-installCh
 	assertNoTokenInBody(t, rw.Body.String())
 }
 
@@ -560,7 +571,8 @@ func TestSetupStatusHandler_RequiresAuth(t *testing.T) {
 	ref := goodCatalogRef()
 	rw := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/setup/status", nil)
-	newSetupRouter(t).ServeHTTP(rw, req)
+	router, _ := newSetupRouter(t)
+	router.ServeHTTP(rw, req)
 
 	require.Equal(t, http.StatusUnauthorized, rw.Code)
 }
