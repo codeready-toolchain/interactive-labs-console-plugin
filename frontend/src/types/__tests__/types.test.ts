@@ -3,7 +3,7 @@
 
 import type { CatalogEntry, CatalogList } from "../catalog";
 import type { LabManifest, LabBundle, RuntimeContext } from "../manifest";
-import type { SetupResult } from "../setup";
+import type { SetupResult, SetupStatus } from "../setup";
 import type { PersistedSession } from "../session";
 import type { LabError, LabErrorType } from "../errors";
 
@@ -72,15 +72,27 @@ describe("LabBundle shape", () => {
 });
 
 describe("SetupResult shape", () => {
-  it("has outcome union and helmReleaseName", () => {
+  it("has outcome union", () => {
     const r: SetupResult = {
       apiVersion: "v1alpha1",
       kind: "SetupResult",
-      outcome: "success",
-      message: "done",
-      helmReleaseName: "il-abc",
+      outcome: "accepted",
+      message: "Lab setup initiated",
     };
-    expect(r.outcome).toBe("success");
+    expect(r.outcome).toBe("accepted");
+  });
+});
+
+describe("SetupStatus shape", () => {
+  it("has status and namespaces", () => {
+    const s: SetupStatus = {
+      apiVersion: "v1alpha1",
+      kind: "SetupStatus",
+      status: "ready",
+      namespaces: { gitea: { status: "ready", name: "user1-abc" } },
+    };
+    expect(s.status).toBe("ready");
+    expect(s.namespaces.gitea.name).toBe("user1-abc");
   });
 });
 

@@ -2,7 +2,7 @@
 // consoleFetch is stubbed via moduleNameMapper → src/__mocks__/dynamic-plugin-sdk.ts
 
 import { consoleFetch } from "@openshift-console/dynamic-plugin-sdk";
-import { fetchResourceText, listCatalog, loadLabBundle, setupLab } from "../client";
+import { fetchResourceText, getSetupStatus, listCatalog, loadLabBundle, setupLab } from "../client";
 
 const mockFetch = consoleFetch as jest.MockedFunction<typeof consoleFetch>;
 
@@ -76,13 +76,15 @@ describe("listCatalog", () => {
 });
 
 describe("loadLabBundle", () => {
-  it("calls GET /api/v1alpha1/labs/{catalogRef}/bundle via proxy", async () => {
+  it("calls GET /api/v1alpha1/labs/{catalogRef}/bundle via proxy and forwards cancellation", async () => {
     const bundleBody = validBundle();
+    const controller = new AbortController();
     mockFetch.mockResolvedValueOnce(makeJsonResponse(bundleBody));
 
-    const result = await loadLabBundle("l1");
-    const [url] = mockFetch.mock.calls[0];
+    const result = await loadLabBundle("l1", controller.signal);
+    const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe(`${PROXY_BASE}/api/v1alpha1/labs/l1/bundle`);
+    expect(init).toEqual({ signal: controller.signal });
     expect(result.manifest.metadata.name).toBe("l1");
     expect(result.pages).toEqual([
       {
@@ -180,24 +182,42 @@ describe("fetchResourceText", () => {
 });
 
 describe("setupLab", () => {
-  it("calls POST /api/v1alpha1/labs/{catalogRef}/setup with JSON body", async () => {
+  it("calls POST /api/v1alpha1/labs/{catalogRef}/setup with empty body and forwards cancellation", async () => {
     const resultBody = {
       apiVersion: "v1alpha1",
       kind: "SetupResult",
-      outcome: "success",
-      message: "done",
-      helmReleaseName: "il-abc",
+      outcome: "accepted",
+      message: "Lab setup initiated",
     };
+    const controller = new AbortController();
     mockFetch.mockResolvedValueOnce(makeJsonResponse(resultBody));
 
-    const bindings = { releaseNamespace: "my-ns" };
-    const result = await setupLab("l1", bindings);
+    const result = await setupLab("l1", controller.signal);
 
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe(`${PROXY_BASE}/api/v1alpha1/labs/l1/setup`);
-    expect(init?.method).toBe("POST");
-    expect(init?.headers).toMatchObject({ "Content-Type": "application/json" });
-    expect(JSON.parse(init?.body as string)).toEqual({ namespaceBindings: bindings });
-    expect(result.helmReleaseName).toBe("il-abc");
+    expect(init).toEqual({ method: "POST", signal: controller.signal });
+    expect(result.outcome).toBe("accepted");
+  });
+});
+
+describe("getSetupStatus", () => {
+  it("calls GET /api/v1alpha1/labs/{catalogRef}/setup/status and forwards cancellation", async () => {
+    const statusBody = {
+      apiVersion: "v1alpha1",
+      kind: "SetupStatus",
+      status: "ready",
+      namespaces: { gitea: { status: "ready", name: "user1-abc" } },
+    };
+    const controller = new AbortController();
+    mockFetch.mockResolvedValueOnce(makeJsonResponse(statusBody));
+
+    const result = await getSetupStatus("l1", controller.signal);
+
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe(`${PROXY_BASE}/api/v1alpha1/labs/l1/setup/status`);
+    expect(init).toEqual({ signal: controller.signal });
+    expect(result.status).toBe("ready");
+    expect(result.namespaces.gitea.name).toBe("user1-abc");
   });
 });

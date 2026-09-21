@@ -25,7 +25,14 @@ import {
   TextInput,
   Title,
 } from "@patternfly/react-core";
-import { fetchResourceText, getNavigablePagePaths, listCatalog, loadLabBundle } from "./api/client";
+import {
+  fetchResourceText,
+  getNavigablePagePaths,
+  getSetupStatus,
+  listCatalog,
+  loadLabBundle,
+  setupLab,
+} from "./api/client";
 import { renderAsciiDoc, type RenderResult } from "./renderer";
 import { TimesIcon, WindowMinimizeIcon } from "@patternfly/react-icons";
 import type { CatalogEntry } from "./types/catalog";
@@ -51,6 +58,10 @@ type RenderState =
   | { status: "success"; result: RenderResult }
   | { status: "error"; message: string };
 
+type SetupState =
+  | { status: "pending" }
+  | { status: "error"; message: string };
+
 type GuidanceRequest = {
   animationKey: number;
   controller: AbortController;
@@ -67,7 +78,6 @@ type InteractiveLabsContextValue = {
   launch: (catalogRef: string, trigger: HTMLElement, requestedPageURL?: string) => Promise<void>;
   loadingCatalogRef?: string;
   launchError?: string;
-  setupDeferred?: string;
 };
 
 const SESSION_PREFIX = "interactive-labs-console-plugin:session:";
@@ -177,11 +187,39 @@ const saveSession = (panel: ActivePanel): void => {
   }
 };
 
+const SETUP_POLL_INTERVAL_MS = 3000;
+
+const pollSetupUntilReady = async (catalogRef: string, signal: AbortSignal): Promise<void> => {
+  while (!signal.aborted) {
+    const status = await getSetupStatus(catalogRef, signal);
+    if (signal.aborted) break;
+    if (status.status === "ready") return;
+    if (status.status === "failed") throw new Error("Lab setup failed.");
+    await new Promise<void>((resolve, reject) => {
+      if (signal.aborted) {
+        reject(new DOMException("Aborted", "AbortError"));
+        return;
+      }
+      const onAbort = (): void => {
+        window.clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        reject(new DOMException("Aborted", "AbortError"));
+      };
+      const timer = window.setTimeout(() => {
+        window.clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, SETUP_POLL_INTERVAL_MS);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+  throw new DOMException("Aborted", "AbortError");
+};
 const InteractiveLabsProvider: React.FC = ({ children }) => {
   const [activePanel, setActivePanel] = React.useState<ActivePanel | null>(null);
   const [loadingCatalogRef, setLoadingCatalogRef] = React.useState<string>();
   const [launchError, setLaunchError] = React.useState<string>();
-  const [setupDeferred, setSetupDeferred] = React.useState<string>();
+  const [setupState, setSetupState] = React.useState<SetupState>();
   const [renderState, setRenderState] = React.useState<RenderState>({ status: "loading" });
   const [renderRetry, setRenderRetry] = React.useState(0);
   const launchTriggerRef = React.useRef<HTMLElement | null>(null);
@@ -191,6 +229,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const pendingFragmentRef = React.useRef<string>();
   const guidanceControllerRef = React.useRef<AbortController>();
   const guidanceAnimationKeyRef = React.useRef(0);
+  const launchAbortRef = React.useRef<AbortController>();
   const mountedRef = React.useRef(true);
   const [guidance, setGuidance] = React.useState<GuidanceState>();
   const [navigationWarning, setNavigationWarning] = React.useState<string>();
@@ -212,16 +251,18 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
     requestedPageURL?: string,
   ): Promise<void> => {
     launchTriggerRef.current = trigger;
+    launchAbortRef.current?.abort();
+    const controller = new AbortController();
+    launchAbortRef.current = controller;
+    const isCurrentLaunch = (): boolean => mountedRef.current && launchAbortRef.current === controller && !controller.signal.aborted;
+    let openedPanel = false;
     setActivePanel(null);
     setLoadingCatalogRef(catalogRef);
     setLaunchError(undefined);
-    setSetupDeferred(undefined);
+    setSetupState(undefined);
     try {
-      const bundle = await loadLabBundle(catalogRef);
-      if (bundle.runtimeContext.helmChartAvailable) {
-        setSetupDeferred("Lab setup is deferred to STORY-5.");
-        return;
-      }
+      const bundle = await loadLabBundle(catalogRef, controller.signal);
+      if (!isCurrentLaunch()) return;
 
       const pagePaths = getNavigablePagePaths(bundle.pages);
       const entryPage = pagePaths[0];
@@ -239,20 +280,33 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       pendingFragmentRef.current = requestedPageURL
         ? new URL(requestedPageURL, window.location.origin).hash.slice(1) || undefined
         : undefined;
+      const needsSetup = bundle.runtimeContext.helmChartAvailable;
       const panel: ActivePanel = {
         catalogRef,
         displayName: bundle.manifest.metadata.displayName,
         currentPagePath: requestedPage?.path ?? saved?.currentPagePath ?? entryPage,
-        panelMode: saved?.panelMode ?? "open",
+        panelMode: needsSetup ? "open" : saved?.panelMode ?? "open",
         pages: bundle.pages,
         attributes: bundle.manifest.spec.attributes ?? {},
       };
+      openedPanel = needsSetup;
+      if (needsSetup) setSetupState({ status: "pending" });
       setActivePanel(panel);
       saveSession(panel);
+
+      if (needsSetup) {
+        await setupLab(catalogRef, controller.signal);
+        await pollSetupUntilReady(catalogRef, controller.signal);
+        if (!isCurrentLaunch()) return;
+        setSetupState(undefined);
+      }
     } catch (err: unknown) {
-      setLaunchError((err as LabError | undefined)?.message ?? "Unable to load lab.");
+      if (!isCurrentLaunch()) return;
+      const message = (err as LabError | undefined)?.message ?? "Unable to load lab.";
+      if (openedPanel) setSetupState({ status: "error", message });
+      else setLaunchError(message);
     } finally {
-      setLoadingCatalogRef(undefined);
+      if (isCurrentLaunch()) setLoadingCatalogRef(undefined);
     }
   }, []);
 
@@ -282,7 +336,9 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   }, []);
 
   const closePanel = React.useCallback(() => {
+    launchAbortRef.current?.abort();
     clearGuidance();
+    setSetupState(undefined);
     setActivePanel(null);
   }, [clearGuidance]);
 
@@ -421,6 +477,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
 
   React.useEffect(() => () => {
     mountedRef.current = false;
+    launchAbortRef.current?.abort();
     guidanceControllerRef.current?.abort();
   }, []);
 
@@ -494,7 +551,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   }, [clearGuidance, guidance]);
 
   React.useEffect(() => {
-    if (!activePanel || activePanel.panelMode !== "open") return undefined;
+    if (!activePanel || activePanel.panelMode !== "open" || setupState) return undefined;
     const page = activePanel.pages.find((candidate) => candidate.path === activePanel.currentPagePath);
     if (!page) {
       setRenderState({ status: "error", message: "Lab page is unavailable." });
@@ -520,7 +577,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
         }
       });
     return () => controller.abort();
-  }, [activePanel, renderRetry]);
+  }, [activePanel, renderRetry, setupState]);
 
   React.useEffect(() => {
     if (renderState.status !== "success" || !pendingFragmentRef.current) return;
@@ -532,8 +589,8 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   }, [renderState]);
 
   const value = React.useMemo(
-    () => ({ launch, loadingCatalogRef, launchError, setupDeferred }),
-    [launch, launchError, loadingCatalogRef, setupDeferred],
+    () => ({ launch, loadingCatalogRef, launchError }),
+    [launch, launchError, loadingCatalogRef],
   );
   const spotlightRect = guidance?.phase === "spotlight" && guidance.target
     ? guidance.target.getBoundingClientRect()
@@ -567,7 +624,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
                       <Button
                         variant="secondary"
                         aria-label="Previous page"
-                        isDisabled={currentPageIndex <= 0}
+                        isDisabled={Boolean(setupState) || currentPageIndex <= 0}
                         onClick={() => selectPage(pagePaths[currentPageIndex - 1])}
                       >
                         Previous
@@ -576,7 +633,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
                       <Button
                         variant="secondary"
                         aria-label="Next page"
-                        isDisabled={currentPageIndex < 0 || currentPageIndex >= pagePaths.length - 1}
+                        isDisabled={Boolean(setupState) || currentPageIndex < 0 || currentPageIndex >= pagePaths.length - 1}
                         onClick={() => selectPage(pagePaths[currentPageIndex + 1])}
                       >
                         Next
@@ -593,34 +650,47 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
                   </DrawerActions>
                 </DrawerHead>
                 <DrawerPanelBody>
-                    <Title headingLevel="h2">
-                      <span dangerouslySetInnerHTML={{
-                        __html: renderState.status === "success"
-                          ? sanitizeTitle(renderState.result.title ?? activePanel.currentPagePath)
-                          : ""
-                      }} />
-                    </Title>
-                    {navigationWarning && <Alert variant="warning" title={navigationWarning} isInline />}
-                    {renderState.status === "loading" && <Spinner aria-label="Loading lab page" />}
-                    {renderState.status === "error" && (
-                      <>
-                        <Alert variant="danger" title={renderState.message} isInline isLiveRegion />
-                        <Button variant="link" onClick={() => setRenderRetry((count) => count + 1)}>Retry</Button>
-                      </>
-                    )}
-                    {renderState.status === "success" && (
-                      <>
-                        {renderState.result.warnings.map((warning, index) => (
-                          <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
-                        ))}
-                        <div
-                          ref={renderedContentRef}
-                          className="interactive-labs-content doc"
-                          onClick={handleRenderedLink}
-                          dangerouslySetInnerHTML={{ __html: renderState.result.html }}
-                        />
-                      </>
-                    )}
+                  {setupState?.status === "pending" && (
+                    <Alert variant="info" title="Setting up your lab environment..." isInline isLiveRegion>
+                      <Spinner size="md" aria-label="Setting up lab" />
+                      Lab pages will appear when setup finishes.
+                    </Alert>
+                  )}
+                  {setupState?.status === "error" && (
+                    <Alert variant="danger" title={setupState.message} isInline isLiveRegion />
+                  )}
+                  {!setupState && (
+                    <>
+                      <Title headingLevel="h2">
+                        <span dangerouslySetInnerHTML={{
+                          __html: renderState.status === "success"
+                            ? sanitizeTitle(renderState.result.title ?? activePanel.currentPagePath)
+                            : ""
+                        }} />
+                      </Title>
+                      {navigationWarning && <Alert variant="warning" title={navigationWarning} isInline />}
+                      {renderState.status === "loading" && <Spinner aria-label="Loading lab page" />}
+                      {renderState.status === "error" && (
+                        <>
+                          <Alert variant="danger" title={renderState.message} isInline isLiveRegion />
+                          <Button variant="link" onClick={() => setRenderRetry((count) => count + 1)}>Retry</Button>
+                        </>
+                      )}
+                      {renderState.status === "success" && (
+                        <>
+                          {renderState.result.warnings.map((warning, index) => (
+                            <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
+                          ))}
+                          <div
+                            ref={renderedContentRef}
+                            className="interactive-labs-content doc"
+                            onClick={handleRenderedLink}
+                            dangerouslySetInnerHTML={{ __html: renderState.result.html }}
+                          />
+                        </>
+                      )}
+                    </>
+                  )}
                 </DrawerPanelBody>
               </DrawerPanelContent>
             ) : null}
@@ -805,10 +875,6 @@ const InteractiveLabsPage: React.FC = () => {
       {interactiveLabs?.launchError && (
         <Alert variant="danger" title={interactiveLabs.launchError} isInline isLiveRegion />
       )}
-      {interactiveLabs?.setupDeferred && (
-        <Alert variant="info" title={interactiveLabs.setupDeferred} isInline isLiveRegion />
-      )}
-
       {state.status === "success" && state.items.length === 0 && (
         <EmptyState titleText="No labs available">
           <EmptyStateBody>No labs are currently configured.</EmptyStateBody>

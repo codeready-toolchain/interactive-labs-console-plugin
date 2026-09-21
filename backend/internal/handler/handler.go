@@ -3,7 +3,6 @@ package handler
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +19,7 @@ import (
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/catalog"
 	laberr "github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/errors"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/manifest"
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/setup"
 )
 
 // Config holds injectable dependencies for the router.
@@ -38,9 +38,15 @@ type Config struct {
 	Logger *slog.Logger
 	// Authenticate resolves a forwarded user token to its server-verified subject.
 	Authenticate func(context.Context, string) (string, error)
-	// RuntimeAttributes returns complete request-scoped attributes merged on top of static ones.
-	// The subject is the authenticated user identifier.
+	// RuntimeAttributes returns request-scoped attributes merged on top of static ones.
+	// nil means no runtime attrs. The subject is the authenticated user identifier.
+	// Production default may be nil while the key list is TBD.
 	RuntimeAttributes func(r *http.Request, subject string) (map[string]string, error)
+	// SetupClient handles SpaceRequest operations for lab setup.
+	// nil means setup is unavailable.
+	SetupClient *setup.SpaceRequestClient
+	// SpaceRequestTierName is the tier used when creating SpaceRequests.
+	SpaceRequestTierName string
 }
 
 // NewRouter returns an http.Handler with all three MVP routes registered.
@@ -58,6 +64,9 @@ func NewRouter(cfg Config) http.Handler {
 	})
 	mux.HandleFunc("POST /api/v1alpha1/labs/{catalogRef}/setup", func(w http.ResponseWriter, r *http.Request) {
 		handleSetup(w, r, cfg)
+	})
+	mux.HandleFunc("GET /api/v1alpha1/labs/{catalogRef}/setup/status", func(w http.ResponseWriter, r *http.Request) {
+		handleSetupStatus(w, r, cfg)
 	})
 
 	return mux
@@ -83,30 +92,6 @@ func bearerToken(r *http.Request) string {
 		return ""
 	}
 	return strings.TrimPrefix(auth, "Bearer ")
-}
-
-// helmReleaseName derives a deterministic Helm release name:
-// "il-" + first 40 hex chars of SHA-256 over canonical JSON.
-// Uses static effective attributes (manifest + catalog overrides) — runtime attrs excluded.
-func helmReleaseName(subject, repository, labPath, branch string, staticAttrs, namespaceBindings map[string]string) string {
-	type canonical struct {
-		Attributes        map[string]string `json:"attributes"`
-		Branch            string            `json:"branch"`
-		LabPath           string            `json:"labPath"`
-		NamespaceBindings map[string]string `json:"namespaceBindings"`
-		Repository        string            `json:"repository"`
-		Subject           string            `json:"subject"`
-	}
-	b, _ := json.Marshal(canonical{ //nolint:errchkjson
-		Attributes:        staticAttrs,
-		Branch:            branch,
-		LabPath:           labPath,
-		NamespaceBindings: namespaceBindings,
-		Repository:        repository,
-		Subject:           subject,
-	})
-	sum := sha256.Sum256(b)
-	return fmt.Sprintf("il-%x", sum)[:3+40]
 }
 
 // mergeAttributes merges attribute maps left-to-right (rightmost wins).
@@ -150,6 +135,79 @@ func catalogEntryByCatalogRef(ctx context.Context, cfg Config, catalogRef string
 		}
 	}
 	return nil, laberr.New(laberr.TypeLabNotFound, "lab not found in catalog", nil)
+}
+
+type setupContext struct {
+	token    string
+	subject  string
+	entry    *catalog.Entry
+	result   *bundle.Result
+	bindings []setup.NamespaceBinding
+}
+
+func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*setupContext, bool) {
+	token := bearerToken(r)
+	if token == "" || cfg.Authenticate == nil {
+		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication required", nil))
+		return nil, false
+	}
+	subject, err := cfg.Authenticate(r.Context(), token)
+	if err != nil || subject == "" {
+		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication failed", nil))
+		return nil, false
+	}
+
+	catalogRef := r.PathValue("catalogRef")
+	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, catalogRef)
+	if labError != nil {
+		writeError(w, http.StatusNotFound, labError)
+		return nil, false
+	}
+
+	loader := cfg.BundleLoader
+	if loader == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			laberr.New(laberr.TypeRepositoryError, "bundle loader not configured", nil))
+		return nil, false
+	}
+	result, err := loader(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
+	if err != nil {
+		writeError(w, http.StatusBadGateway,
+			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
+		return nil, false
+	}
+
+	if result.ValuesSchema == nil {
+		writeError(w, http.StatusUnprocessableEntity,
+			laberr.New(laberr.TypeChartNotFound, "lab has no values schema", nil))
+		return nil, false
+	}
+
+	if cfg.SetupClient == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			laberr.New(laberr.TypeConfigurationError, "setup client not configured", nil))
+		return nil, false
+	}
+
+	bindings, err := setup.ParseNamespaceBindings(result.ValuesSchema)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity,
+			laberr.New(laberr.TypeConfigurationError, "invalid values schema", nil))
+		return nil, false
+	}
+	if len(bindings) == 0 {
+		writeError(w, http.StatusUnprocessableEntity,
+			laberr.New(laberr.TypeConfigurationError, "values schema declares no namespace bindings", nil))
+		return nil, false
+	}
+
+	return &setupContext{
+		token:    token,
+		subject:  subject,
+		entry:    entry,
+		result:   result,
+		bindings: bindings,
+	}, true
 }
 
 // --- handler functions ---
@@ -371,67 +429,107 @@ func isSafeResourceContentType(contentType string) bool {
 }
 
 func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
-	catalogRef := r.PathValue("catalogRef")
 	if cfg.Logger != nil {
-		cfg.Logger.Debug("setup request", "catalogRef", catalogRef)
+		cfg.Logger.Info("setup request received", "catalogRef", r.PathValue("catalogRef"))
 	}
 
-	token := bearerToken(r)
-	if token == "" || cfg.Authenticate == nil {
-		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication required", nil))
-		return
-	}
-	subject, err := cfg.Authenticate(r.Context(), token)
-	if err != nil || subject == "" {
-		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication failed", nil))
+	sctx, ok := resolveSetupContext(w, r, cfg)
+	if !ok {
 		return
 	}
 
-	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, catalogRef)
-	if labError != nil {
-		writeError(w, http.StatusNotFound, labError)
+	userNamespace := sctx.subject + "-dev"
+	tierName := cfg.SpaceRequestTierName
+	if tierName == "" {
+		tierName = "base1ns"
+	}
+
+	for _, b := range sctx.bindings {
+		if err := cfg.SetupClient.EnsureSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key, tierName); err != nil {
+			if cfg.Logger != nil {
+				cfg.Logger.Error("create SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
+			}
+			writeError(w, http.StatusBadGateway,
+				laberr.New(laberr.TypeConfigurationError, "failed to create SpaceRequest", nil))
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"apiVersion": "v1alpha1",
+		"kind":       "SetupResult",
+		"outcome":    "accepted",
+		"message":    "Lab setup initiated",
+	})
+}
+
+func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
+	sctx, ok := resolveSetupContext(w, r, cfg)
+	if !ok {
 		return
 	}
 
-	var req struct {
-		NamespaceBindings map[string]string `json:"namespaceBindings"`
+	userNamespace := sctx.subject + "-dev"
+
+	type namespaceStatus struct {
+		Status string `json:"status"`
+		Name   string `json:"name"`
 	}
-	if derr := json.NewDecoder(r.Body).Decode(&req); derr != nil {
-		writeError(w, http.StatusBadRequest,
-			laberr.New(laberr.TypeNamespaceBindingInvalid, "invalid request body", nil))
-		return
+	namespaces := make(map[string]namespaceStatus, len(sctx.bindings))
+	allReady := true
+	anyFailed := false
+
+	for _, b := range sctx.bindings {
+		sr, err := cfg.SetupClient.GetSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key)
+		if err != nil {
+			if cfg.Logger != nil {
+				cfg.Logger.Warn("get SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
+			}
+			namespaces[b.Key] = namespaceStatus{Status: "pending", Name: ""}
+			allReady = false
+			continue
+		}
+		if sr == nil {
+			namespaces[b.Key] = namespaceStatus{Status: "pending", Name: ""}
+			allReady = false
+			continue
+		}
+		if sr.IsReady() && sr.TargetNamespace() != "" {
+			if cfg.Logger != nil {
+				cfg.Logger.Info("SpaceRequest ready", "name", b.Key, "namespace", sr.TargetNamespace())
+			}
+			namespaces[b.Key] = namespaceStatus{Status: "ready", Name: sr.TargetNamespace()}
+		} else if sr.IsFailed() {
+			if cfg.Logger != nil {
+				cfg.Logger.Error("SpaceRequest failed", "name", b.Key, "reason", sr.ReadyConditionReason())
+			}
+			namespaces[b.Key] = namespaceStatus{Status: "failed", Name: ""}
+			anyFailed = true
+			allReady = false
+		} else {
+			if cfg.Logger != nil {
+				cfg.Logger.Info("SpaceRequest pending", "name", b.Key, "reason", sr.ReadyConditionReason())
+			}
+			namespaces[b.Key] = namespaceStatus{Status: "pending", Name: ""}
+			allReady = false
+		}
 	}
 
-	if req.NamespaceBindings == nil || req.NamespaceBindings["releaseNamespace"] == "" {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeNamespaceBindingInvalid, "releaseNamespace binding is required", nil))
-		return
+	overallStatus := "provisioning"
+	if anyFailed {
+		overallStatus = "failed"
+	} else if allReady {
+		overallStatus = "ready"
 	}
 
-	loader := cfg.BundleLoader
-	if loader == nil {
-		writeError(w, http.StatusServiceUnavailable,
-			laberr.New(laberr.TypeRepositoryError, "bundle loader not configured", nil))
-		return
-	}
-	result, err := loader(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
-	if err != nil {
-		writeError(w, http.StatusBadGateway,
-			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
-		return
-	}
-
-	// Release name uses only static effective attributes — runtime attrs excluded.
-	staticAttrs := mergeAttributes(result.Manifest.Spec.Attributes, entry.AttributeOverrides)
-	name := helmReleaseName(subject, entry.Repository, entry.LabPath, entry.Branch, staticAttrs, req.NamespaceBindings)
-
-	// ponytail: Helm execution is STORY-4; stub returns success with derived release name.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"apiVersion":      "v1alpha1",
-		"kind":            "SetupResult",
+		"kind":            "SetupStatus",
+		"status":          overallStatus,
+		"namespaces":      namespaces,
 		"outcome":         "success",
 		"message":         "Lab setup complete",
-		"helmReleaseName": name,
+		"helmReleaseName": setup.HelmReleaseName(sctx.subject, sctx.entry.CatalogRef, sctx.bindings),
 	})
 }
 

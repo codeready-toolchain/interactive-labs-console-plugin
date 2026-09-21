@@ -61,18 +61,24 @@ Lab authors need inter-linked instructions without content executing code, escap
 
 **Dependencies:** STORY-1, STORY-3, STORY-9.
 
-## ☐ STORY-5: Select namespaces and deploy prerequisite charts
+## 🔧 STORY-5: Provision namespaces via SpaceRequests
 
-Labs with prerequisites need a namespace-selection policy that preserves user intent and current-user RBAC rather than browser-side or privileged Helm execution.
+Labs with prerequisites need namespace provisioning via SpaceRequests before the lab can be opened.
 
-**Goal:** Implement the namespace-selection policy once decided, then run bounded synchronous Helm setup before opening chart-backed labs.
+**Goal:** Automatically provision namespaces via CodeReady Toolchain SpaceRequests based on the lab's `values.schema.json` namespace declarations.
 
-**Planning status:** Explicit selection of existing namespaces, with `values.schema.json` namespace annotations, is a provisional direction. Namespace selection and lifecycle for single and multiple namespaces remain open.
+**Planning status:** Design agreed and documented in [lab-setup-design.md](../docs/lab-setup-design.md). Namespace provisioning via SpaceRequests and async setup flow (kick-and-poll) are implemented.
+
+**Implemented:**
+- Backend scans `setup/helm/values.schema.json` for `x-interactive-labs.kind: namespace-name` properties.
+- Creates SpaceRequests (one per namespace property) in the user's home namespace (`<username>-dev`) using the user's token.
+- `POST /setup` initiates provisioning and returns 202; `GET /setup/status` returns per-namespace and overall status.
+- Frontend calls `setupLab`, polls `getSetupStatus` with a spinner, and opens the lab once all namespaces are provisioned.
 
 **Acceptance criteria:**
-- Release namespace and annotated `values.schema.json` namespace inputs follow resolved, documented selection and lifecycle rules.
-- Backend revalidates bindings, ownership, catalog, and chart inputs; it derives Helm release identity server-side.
-- Helm setup runs with forwarded user's RBAC, waits within bounded timeout, and returns typed success, failure, or timeout results without automatic retry or cleanup.
+- `values.schema.json` namespace annotations drive SpaceRequest creation (idempotent).
+- Backend provisions namespaces using forwarded user's RBAC via SpaceRequests in the user's home namespace.
+- Async setup flow: POST initiates, GET polls status, frontend shows spinner until ready.
 
 **Dependencies:** STORY-1, STORY-3.
 

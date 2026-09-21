@@ -25,6 +25,7 @@ jest.mock('react-router-dom-v5-compat', () => ({
 const mockListCatalog = client.listCatalog as jest.MockedFunction<typeof client.listCatalog>;
 const mockLoadLabBundle = client.loadLabBundle as jest.MockedFunction<typeof client.loadLabBundle>;
 const mockSetupLab = client.setupLab as jest.MockedFunction<typeof client.setupLab>;
+const mockGetSetupStatus = client.getSetupStatus as jest.MockedFunction<typeof client.getSetupStatus>;
 const mockGetNavigablePagePaths = client.getNavigablePagePaths as jest.MockedFunction<
   typeof client.getNavigablePagePaths
 >;
@@ -41,6 +42,7 @@ beforeEach(() => {
   mockListCatalog.mockReset();
   mockLoadLabBundle.mockReset();
   mockSetupLab.mockReset();
+  mockGetSetupStatus.mockReset();
   mockGetNavigablePagePaths.mockReset();
   mockGetNavigablePagePaths.mockImplementation((pages) =>
     pages
@@ -119,6 +121,16 @@ const getButton = (name: RegExp): HTMLButtonElement => {
   ) as HTMLButtonElement | undefined;
   if (!button) throw new Error(`Missing button matching ${name}`);
   return button;
+};
+
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 };
 
 const renderCatalog = async () => {
@@ -268,7 +280,7 @@ describe('InteractiveLabsPage', () => {
     await act(async () => { launch.click(); });
 
     expect(mockLoadLabBundle).toHaveBeenCalledTimes(1);
-    expect(mockLoadLabBundle).toHaveBeenCalledWith('lab-1');
+    expect(mockLoadLabBundle).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
   });
 
   test('opens no-chart lab at lexical first navigable page without setup', async () => {
@@ -311,15 +323,163 @@ describe('InteractiveLabsPage', () => {
     );
   });
 
-  test('defers chart-backed lab setup without opening content or calling setupLab', async () => {
+  test('opens chart-backed drawer and defers page rendering while setup is pending', async () => {
+    const setup = deferred<Awaited<ReturnType<typeof client.setupLab>>>();
     mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockSetupLab.mockReturnValue(setup.promise);
+    await renderCatalog();
+
+    act(() => { getButton(/^Launch$/).click(); });
+    await act(async () => {});
+
+    const drawer = container.querySelector('[class*="drawer__panel"]')!;
+    expect(drawer.textContent).toContain('Setting up your lab environment...');
+    expect(drawer.querySelector('[aria-label="Setting up lab"]')).not.toBeNull();
+    expect(getButton(/previous page/i).disabled).toBe(true);
+    expect(getButton(/next page/i).disabled).toBe(true);
+    expect(mockFetchResourceText).not.toHaveBeenCalled();
+    expect(mockSetupLab).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
+  });
+
+  test('renders chart-backed first page after setup becomes ready', async () => {
+    const status = deferred<Awaited<ReturnType<typeof client.getSetupStatus>>>();
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockSetupLab.mockResolvedValue({
+      apiVersion: 'v1alpha1', kind: 'SetupResult', outcome: 'accepted', message: 'Lab setup initiated',
+    });
+    mockGetSetupStatus.mockReturnValue(status.promise);
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Ready page</p>', warnings: [] });
+    await renderCatalog();
+
+    act(() => { getButton(/^Launch$/).click(); });
+    await act(async () => {});
+    expect(mockFetchResourceText).not.toHaveBeenCalled();
+
+    await act(async () => {
+      status.resolve({
+        apiVersion: 'v1alpha1', kind: 'SetupStatus', status: 'ready',
+        namespaces: { gitea: { status: 'ready', name: 'user1-abc' } },
+      });
+    });
+
+    expect(mockGetSetupStatus).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
+    expect(mockFetchResourceText).toHaveBeenCalledWith(chartBundle.pages[2].url, expect.any(AbortSignal));
+    expect(container.textContent).toContain('Ready page');
+    expect(getButton(/previous page/i).disabled).toBe(true);
+    expect(getButton(/next page/i).disabled).toBe(false);
+  });
+
+  test('removes setup poll abort listener after normal delay', async () => {
+    jest.useFakeTimers();
+    try {
+      let addAbortListener!: jest.SpyInstance;
+      let removeAbortListener!: jest.SpyInstance;
+      mockLoadLabBundle.mockResolvedValue(chartBundle);
+      mockSetupLab.mockResolvedValue({
+        apiVersion: 'v1alpha1', kind: 'SetupResult', outcome: 'accepted', message: 'Lab setup initiated',
+      });
+      mockGetSetupStatus
+        .mockImplementationOnce((_catalogRef, signal) => {
+          addAbortListener = jest.spyOn(signal!, 'addEventListener');
+          removeAbortListener = jest.spyOn(signal!, 'removeEventListener');
+          return Promise.resolve({ apiVersion: 'v1alpha1', kind: 'SetupStatus', status: 'provisioning', namespaces: {} });
+        })
+        .mockResolvedValueOnce({ apiVersion: 'v1alpha1', kind: 'SetupStatus', status: 'ready', namespaces: {} });
+      await renderCatalog();
+
+      act(() => { getButton(/^Launch$/).click(); });
+      await act(async () => {});
+      const abortListener = addAbortListener.mock.calls.find(([type]) => type === 'abort')?.[1];
+      expect(abortListener).toEqual(expect.any(Function));
+
+      await act(async () => { jest.advanceTimersByTime(3000); });
+
+      expect(removeAbortListener).toHaveBeenCalledWith('abort', abortListener);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('shows chart setup failure inside its open drawer', async () => {
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockSetupLab.mockRejectedValue(new Error('Cluster setup failed'));
     await renderCatalog();
 
     await act(async () => { getButton(/^Launch$/).click(); });
 
-    expect(container.textContent).toMatch(/setup.*STORY-5|STORY-5.*setup/i);
-    expect(container.textContent).not.toContain('pages/a-first.adoc');
-    expect(mockSetupLab).not.toHaveBeenCalled();
+    const drawer = container.querySelector('[class*="drawer__panel"]')!;
+    expect(drawer.textContent).toContain('Cluster setup failed');
+    expect(mockFetchResourceText).not.toHaveBeenCalled();
+  });
+
+  test('aborts obsolete bundle request before a new launch', async () => {
+    const bundle = deferred<LabBundle>();
+    let firstSignal!: AbortSignal;
+    mockLoadLabBundle
+      .mockImplementationOnce((_catalogRef, signal) => {
+        firstSignal = signal!;
+        return bundle.promise;
+      })
+      .mockResolvedValueOnce({
+        ...noChartBundle,
+        manifest: {
+          ...noChartBundle.manifest,
+          metadata: { ...noChartBundle.manifest.metadata, displayName: 'Lab Two' },
+        },
+      });
+    await renderCatalog();
+
+    const launches = Array.from(container.querySelectorAll('button')).filter((button) => button.textContent === 'Launch');
+    act(() => { launches[0].click(); });
+    await act(async () => {});
+    act(() => { launches[1].click(); });
+    await act(async () => {});
+
+    expect(firstSignal.aborted).toBe(true);
+    expect(container.textContent).toContain('Lab Two');
+  });
+
+  test('aborts setup on close and ignores its stale completion', async () => {
+    const setup = deferred<Awaited<ReturnType<typeof client.setupLab>>>();
+    let setupSignal!: AbortSignal;
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockSetupLab.mockImplementation((_catalogRef, signal) => {
+      setupSignal = signal!;
+      return setup.promise;
+    });
+    await renderCatalog();
+
+    act(() => { getButton(/^Launch$/).click(); });
+    await act(async () => {});
+    act(() => { getButton(/close lab/i).click(); });
+    expect(setupSignal.aborted).toBe(true);
+
+    await act(async () => {
+      setup.resolve({ apiVersion: 'v1alpha1', kind: 'SetupResult', outcome: 'accepted', message: 'accepted' });
+    });
+
+    expect(container.querySelector('button[aria-label="Close lab"]')).toBeNull();
+    expect(mockGetSetupStatus).not.toHaveBeenCalled();
+  });
+
+  test('aborts pending setup status on unmount', async () => {
+    const status = deferred<Awaited<ReturnType<typeof client.getSetupStatus>>>();
+    let statusSignal!: AbortSignal;
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockSetupLab.mockResolvedValue({
+      apiVersion: 'v1alpha1', kind: 'SetupResult', outcome: 'accepted', message: 'Lab setup initiated',
+    });
+    mockGetSetupStatus.mockImplementation((_catalogRef, signal) => {
+      statusSignal = signal!;
+      return status.promise;
+    });
+    await renderCatalog();
+
+    act(() => { getButton(/^Launch$/).click(); });
+    await act(async () => {});
+    act(() => { ReactDOM.unmountComponentAtNode(container); });
+
+    expect(statusSignal.aborted).toBe(true);
   });
 
   test('passes bundle attributes unaltered to renderer and mounts only renderer-sanitized markup', async () => {
@@ -437,7 +597,7 @@ describe('InteractiveLabsPage', () => {
     await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
     document.removeEventListener('click', preventNavigation);
 
-    expect(mockLoadLabBundle).toHaveBeenCalledWith('lab-1');
+    expect(mockLoadLabBundle).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
     expect(container.textContent).toContain('pages/z-last.adoc');
     expect(mockFetchResourceText).toHaveBeenCalledWith(proxyNoChartBundle.pages[0].url, expect.any(AbortSignal));
   });

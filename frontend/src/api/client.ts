@@ -1,7 +1,7 @@
 import { consoleFetch } from "@openshift-console/dynamic-plugin-sdk";
 import type { CatalogEntry, CatalogList } from "../types/catalog";
 import type { LabBundle, LabManifest, LabPage } from "../types/manifest";
-import type { SetupResult } from "../types/setup";
+import type { SetupResult, SetupStatus } from "../types/setup";
 import { isKnownErrorType, type LabError } from "../types/errors";
 
 const PROXY_BASE = "/api/proxy/plugin/interactive-labs-console-plugin/backend";
@@ -40,8 +40,8 @@ export async function listCatalog(): Promise<CatalogList> {
   return validateCatalogList(await parseResponse<unknown>(res));
 }
 
-export async function loadLabBundle(catalogRef: string): Promise<LabBundle> {
-  const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/bundle`);
+export async function loadLabBundle(catalogRef: string, signal?: AbortSignal): Promise<LabBundle> {
+  const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/bundle`, { signal });
   return validateLabBundle(await parseResponse<unknown>(res), catalogRef);
 }
 
@@ -61,16 +61,17 @@ export async function fetchResourceText(resourceURL: string, signal: AbortSignal
   return res.text();
 }
 
-export async function setupLab(
-  catalogRef: string,
-  namespaceBindings: Record<string, string>,
-): Promise<SetupResult> {
+export async function setupLab(catalogRef: string, signal?: AbortSignal): Promise<SetupResult> {
   const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/setup`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ namespaceBindings }),
+    signal,
   });
   return parseResponse<SetupResult>(res);
+}
+
+export async function getSetupStatus(catalogRef: string, signal?: AbortSignal): Promise<SetupStatus> {
+  const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/setup/status`, { signal });
+  return parseResponse<SetupStatus>(res);
 }
 
 // --- Bundle validation ---

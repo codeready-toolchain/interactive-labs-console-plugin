@@ -14,12 +14,11 @@ import (
 
 // TestLoadFromDir loads from a pre-populated temp directory (no real git required).
 func TestLoadFromDir_ValidStructure(t *testing.T) {
-	dir := t.TempDir()
-	labPath := filepath.Join(dir, "lab")
+	repoRoot := t.TempDir()
+	labPath := filepath.Join(repoRoot, "lab")
 
 	// Create lab directory structure
 	require.NoError(t, os.MkdirAll(filepath.Join(labPath, "content"), 0o755))
-	require.NoError(t, os.MkdirAll(filepath.Join(labPath, "setup", "helm"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(labPath, "lab.yaml"), []byte(`apiVersion: v1alpha1
 kind: Lab
 metadata:
@@ -29,10 +28,11 @@ metadata:
 spec: {}`), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "010-intro.adoc"), []byte("= Intro\n\nHello."), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "_shared.adoc"), []byte("include"), 0o600))
-	// Minimal helm chart
-	require.NoError(t, os.WriteFile(filepath.Join(labPath, "setup", "helm", "Chart.yaml"), []byte("apiVersion: v2\nname: lab1\nversion: 0.1.0"), 0o600))
+	// Helm chart at repo root (shared by all labs)
+	require.NoError(t, os.MkdirAll(filepath.Join(repoRoot, "setup", "helm"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "setup", "helm", "Chart.yaml"), []byte("apiVersion: v2\nname: lab1\nversion: 0.1.0"), 0o600))
 
-	result, err := bundle.LoadFromDir(labPath)
+	result, err := bundle.LoadFromDir(labPath, repoRoot)
 	require.NoError(t, err)
 	assert.Equal(t, "lab1", result.Manifest.Metadata.Name)
 	assert.Equal(t, "Lab 1", result.Manifest.Metadata.DisplayName)
@@ -42,8 +42,8 @@ spec: {}`), 0o600))
 }
 
 func TestLoadFromDir_NoHelmChart(t *testing.T) {
-	dir := t.TempDir()
-	labPath := filepath.Join(dir, "lab")
+	repoRoot := t.TempDir()
+	labPath := filepath.Join(repoRoot, "lab")
 
 	require.NoError(t, os.MkdirAll(filepath.Join(labPath, "content"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(labPath, "lab.yaml"), []byte(`apiVersion: v1alpha1
@@ -54,7 +54,7 @@ metadata:
 spec: {}`), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(labPath, "content", "010-step.adoc"), []byte("= Step"), 0o600))
 
-	result, err := bundle.LoadFromDir(labPath)
+	result, err := bundle.LoadFromDir(labPath, repoRoot)
 	require.NoError(t, err)
 	assert.False(t, result.HelmChartAvailable)
 }
@@ -98,7 +98,7 @@ metadata:
   name: lab
   displayName: Lab
 spec: {}`), 0o600))
-	_, err := bundle.LoadFromDir(lab)
+	_, err := bundle.LoadFromDir(lab, lab)
 	require.ErrorIs(t, err, bundle.ErrLabInvalid)
 }
 
