@@ -308,16 +308,9 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 		writeError(w, http.StatusUnprocessableEntity, labErr)
 		return
 	}
-	type page struct {
-		Path string `json:"path"`
-		URL  string `json:"url"`
-	}
-	pages := make([]page, 0, len(result.Pages))
+	pages := make(map[string]string, len(result.Pages))
 	for _, pagePath := range result.Pages {
-		pages = append(pages, page{
-			Path: pagePath,
-			URL:  resourcePath(entry.CatalogRef, entry.LabPath, pagePath),
-		})
+		pages[pagePath] = resourcePath(entry.CatalogRef, entry.LabPath, pagePath)
 	}
 
 	// Merge attributes: manifest → catalog overrides → runtime attrs.
