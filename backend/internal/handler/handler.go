@@ -493,17 +493,17 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		if helmTimeout == 0 {
 			helmTimeout = 300 * time.Second
 		}
+		newState := &workerState{phase: "polling"}
 		startWorker := false
-		if val, loaded := activeSetups.Load(releaseName); loaded {
+		if val, loaded := activeSetups.LoadOrStore(releaseName, newState); loaded {
 			state := val.(*workerState)
 			if state.phase == "done" || state.phase == "failed" {
-				startWorker = true // previous run finished, allow restart
+				startWorker = activeSetups.CompareAndSwap(releaseName, val, newState)
 			}
 		} else {
 			startWorker = true
 		}
 		if startWorker {
-			activeSetups.Store(releaseName, &workerState{phase: "polling"})
 			go runSetupWorker(cfg, sctx.token, userNamespace, releaseName, sctx.result.HelmChartDir, sctx.bindings, helmTimeout) //nolint:gosec
 		}
 	}

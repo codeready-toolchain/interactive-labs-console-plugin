@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1086,6 +1088,101 @@ func TestSetupStatusHandler_NoGeneratedValuesWhenNoPasswords(t *testing.T) {
 	helmSection := body["helm"].(map[string]any)
 	assert.Equal(t, "deployed", helmSection["status"])
 	assert.Nil(t, helmSection["generatedValues"])
+}
+
+func TestSetupHandler_ConcurrentRequests_StartOnlyOneWorker(t *testing.T) {
+	var installCount atomic.Int32
+	blockInstall := make(chan struct{})
+	helm := &stubHelmManager{
+		statusErr: errors.New("not found"),
+		installErr: func() error {
+			// not actually called here — we intercept via wrapper below
+			return nil
+		}(),
+	}
+	originalInstall := helm.Install
+	_ = originalInstall
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			fmt.Fprintf(w, `{"metadata":{"name":"test"},"status":{"namespaceAccess":[{"name":"ns-abc","secretRef":"s"}],"conditions":[{"type":"Ready","status":"True"}]}}`)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	countingHelm := &countingHelmManager{
+		inner:        helm,
+		installCount: &installCount,
+		blockInstall: blockInstall,
+	}
+
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: goodCatalogCM,
+		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
+			return &bundle.Result{
+				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
+				Pages:              []string{"intro.adoc"},
+				HelmChartAvailable: true,
+				HelmChartDir:       t.TempDir(),
+				ValuesSchema:       testValuesSchema,
+			}, nil
+		},
+		SetupClient: &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL},
+		HelmManager: countingHelm,
+		HelmTimeout: 5 * time.Second,
+	})
+
+	ref := goodCatalogRef()
+	const concurrency = 5
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			rw := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
+			req.Header.Set("Authorization", "Bearer "+makeTestJWT("concurrent-test-user"))
+			router.ServeHTTP(rw, req)
+			assert.Equal(t, http.StatusAccepted, rw.Code)
+		}()
+	}
+	wg.Wait()
+
+	close(blockInstall)
+
+	assert.Eventually(t, func() bool {
+		return installCount.Load() >= 1
+	}, 5*time.Second, 50*time.Millisecond)
+
+	assert.Equal(t, int32(1), installCount.Load(), "expected exactly one Helm install across concurrent requests")
+}
+
+type countingHelmManager struct {
+	inner        *stubHelmManager
+	installCount *atomic.Int32
+	blockInstall chan struct{}
+}
+
+func (c *countingHelmManager) ReleaseStatus(ctx context.Context, release, ns, token string) (string, error) {
+	return c.inner.ReleaseStatus(ctx, release, ns, token)
+}
+
+func (c *countingHelmManager) Install(_ context.Context, opts setup.HelmInstallOpts) error {
+	<-c.blockInstall
+	c.installCount.Add(1)
+	return c.inner.installErr
+}
+
+func (c *countingHelmManager) ReleaseValues(ctx context.Context, release, ns, token string, paths []string) (map[string]string, error) {
+	return c.inner.ReleaseValues(ctx, release, ns, token, paths)
+}
+
+func (c *countingHelmManager) ListPods(ctx context.Context, token, ns string) ([]setup.PodSummary, error) {
+	return c.inner.ListPods(ctx, token, ns)
 }
 
 // --- Root-URL resolution in setup worker ---
