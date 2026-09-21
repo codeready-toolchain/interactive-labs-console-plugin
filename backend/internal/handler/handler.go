@@ -452,6 +452,12 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
+	if cfg.HelmManager == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			laberr.New(laberr.TypeConfigurationError, "Helm manager not configured", nil))
+		return
+	}
+
 	userNamespace := sctx.subject + "-dev"
 	tierName := cfg.SpaceRequestTierName
 	if tierName == "" {

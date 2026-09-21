@@ -80,6 +80,7 @@ func newSetupRouter(t *testing.T) http.Handler {
 			}, nil
 		},
 		SetupClient: client,
+		HelmManager: &stubHelmManager{statusErr: errors.New("not found")},
 	})
 }
 
