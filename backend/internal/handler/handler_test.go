@@ -45,7 +45,7 @@ func newRouter(t *testing.T) http.Handler {
 	t.Helper()
 	return handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate: func(_ context.Context, token string) (string, error) {
+		Authenticate: func(_ context.Context, _, token string) (string, error) {
 			return token, nil
 		},
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
@@ -67,7 +67,7 @@ func newSetupRouter(t *testing.T) http.Handler {
 	client, _ := stubSetupClient(t)
 	return handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate: func(_ context.Context, token string) (string, error) {
+		Authenticate: func(_ context.Context, _, token string) (string, error) {
 			return token, nil
 		},
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
@@ -325,7 +325,7 @@ func TestBundleHandler_AttributeMergeOrder(t *testing.T) {
     user: catalog-val
     catalog-only: yes`,
 		}),
-		Authenticate: func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate: func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest: &manifest.LabManifest{
@@ -374,7 +374,7 @@ func TestBundleHandler_RuntimeAttributesAreAllOrSafeFailure(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			router := handler.NewRouter(handler.Config{
 				CatalogSource: goodCatalogCM,
-				Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+				Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 				BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 					return &bundle.Result{Manifest: &manifest.LabManifest{}, Pages: []string{"intro.adoc"}}, nil
 				},
@@ -406,7 +406,7 @@ func TestSetupStatusHandler_AllReady(t *testing.T) {
 
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -440,7 +440,7 @@ func TestSetupStatusHandler_Provisioning(t *testing.T) {
 
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -473,7 +473,7 @@ func TestSetupStatusHandler_ReadyWithoutNamespaceAccessStaysProvisioning(t *test
 
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -506,7 +506,7 @@ func TestSetupStatusHandler_TerminalFailure(t *testing.T) {
 
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -629,7 +629,7 @@ func TestResourceHandler_SniffsContentTypeAfterLoading(t *testing.T) {
 	ref := goodCatalogRef()
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _ string, token string) (string, error) { return token, nil },
 		SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
 			return "abc123", nil
 		},
@@ -649,7 +649,7 @@ func TestResourceHandler_ReturnsNotModifiedBeforeLoadingResource(t *testing.T) {
 	ref := goodCatalogRef()
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _ string, token string) (string, error) { return token, nil },
 		SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
 			return "abc123", nil
 		},
@@ -765,7 +765,7 @@ func TestResourceHandler_DerivesSourceOnlyFromCatalogRef(t *testing.T) {
 - repository: https://github.com/redhat/selected
   branch: stable
   labPath: selected-lab`}),
-		Authenticate: func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate: func(_ context.Context, _, token string) (string, error) { return token, nil },
 		SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
 			return "abc123", nil
 		},
@@ -787,7 +787,7 @@ func resourceRouter(t *testing.T, catalogSource func(context.Context) (*corev1.C
 	t.Helper()
 	return handler.NewRouter(handler.Config{
 		CatalogSource: catalogSource,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
 			return etag, nil
 		},

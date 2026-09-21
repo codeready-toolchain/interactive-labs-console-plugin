@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	configv1 "github.com/openshift/api/config/v1"
@@ -167,7 +166,7 @@ func TestClusterIdentityResolverGetsCurrentUserFromPerRequestTypedClient(t *test
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 	var factoryTokens []string
 	var userClients []*userfake.Clientset
-	resolver := newClusterIdentityResolver(func(receivedToken string) (userclient.Interface, error) {
+	resolver := newClusterIdentityResolver(func(_ string, receivedToken string) (userclient.Interface, error) {
 		factoryTokens = append(factoryTokens, receivedToken)
 		client := userfake.NewSimpleClientset()
 		client.PrependReactor("get", "users", func(k8stesting.Action) (bool, runtime.Object, error) {
@@ -177,8 +176,8 @@ func TestClusterIdentityResolverGetsCurrentUserFromPerRequestTypedClient(t *test
 		return client, nil
 	})
 
-	subject, err := resolver(context.Background(), token)
-	nextSubject, nextErr := resolver(context.Background(), nextToken)
+	subject, err := resolver(context.Background(), "", token)
+	nextSubject, nextErr := resolver(context.Background(), "", nextToken)
 
 	require.NoError(t, err)
 	require.NoError(t, nextErr)
@@ -204,9 +203,9 @@ func TestClusterIdentityResolverPreservesCallerContextAndFailsSafely(t *testing.
 	client.PrependReactor("get", "users", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New(secret)
 	})
-	resolver := newClusterIdentityResolver(func(string) (userclient.Interface, error) { return client, nil })
+	resolver := newClusterIdentityResolver(func(string, string) (userclient.Interface, error) { return client, nil })
 
-	subject, err := resolver(context.Background(), token)
+	subject, err := resolver(context.Background(), "", token)
 
 	require.Empty(t, subject)
 	require.EqualError(t, err, "identity unavailable")
@@ -216,11 +215,11 @@ func TestClusterIdentityResolverPreservesCallerContextAndFailsSafely(t *testing.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	factoryCalls := 0
-	resolver = newClusterIdentityResolver(func(string) (userclient.Interface, error) {
+	resolver = newClusterIdentityResolver(func(string, string) (userclient.Interface, error) {
 		factoryCalls++
 		return userfake.NewSimpleClientset(), nil
 	})
-	subject, err = resolver(ctx, token)
+	subject, err = resolver(ctx, "", token)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Empty(t, subject)
 	require.Zero(t, factoryCalls)
