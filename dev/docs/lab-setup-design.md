@@ -209,9 +209,9 @@ This supports page refresh and re-launch without losing state.
 
 ### Background goroutine lifecycle
 
-- The goroutine is bounded by the configurable Helm timeout (default 300s). It uses a fresh context (not the HTTP request context).
-- Transient errors (network blips, API server 503) are retried with backoff until the timeout expires.
-- A **concurrency guard** prevents duplicate Helm installs: before starting, the goroutine checks if a Helm release already exists in any state.
+- The goroutine has two independent timeouts: SpaceRequest polling uses a separate 30-minute timeout, while the configurable Helm timeout (default 300s) applies only to the install phase. Both use fresh contexts (not the HTTP request context).
+- Transient errors (network blips, API server 503) are retried with backoff until the relevant phase timeout expires.
+- A **concurrency guard** prevents duplicate Helm installs: the handler first checks whether the release is already deployed (returning 200 immediately). Otherwise, an atomic `LoadOrStore`/`CompareAndSwap` on the in-memory worker registry ensures only one goroutine runs per release. A new worker may start after a prior worker reaches the `done` or `failed` phase.
 - If the process restarts while the goroutine is running, the goroutine is lost. The user can re-launch (POST again) to restart the flow. SpaceRequests and any partial Helm release persist in the cluster.
 
 ## Authentication and Permissions
