@@ -300,7 +300,7 @@ func inClusterIngressDomain(log *slog.Logger) string {
 	}
 	req.Header.Set("Authorization", "Bearer "+string(token))
 
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:gosec // URL built from in-cluster KUBERNETES_SERVICE_HOST/PORT env vars
 	if err != nil {
 		log.Warn("cluster ingress domain unavailable", "err", err)
 		return ""

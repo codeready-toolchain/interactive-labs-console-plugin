@@ -92,7 +92,7 @@ func TestNamespaceBindingPath(t *testing.T) {
 	}
 	assert.Equal(t, "namespaces.gitea", NamespaceBindingPath(bindings, "gitea"))
 	assert.Equal(t, "namespaces.lab", NamespaceBindingPath(bindings, "lab"))
-	assert.Equal(t, "", NamespaceBindingPath(bindings, "missing"))
+	assert.Empty(t, NamespaceBindingPath(bindings, "missing"))
 }
 
 func TestParseSchemaBindings_NoPasswords(t *testing.T) {
