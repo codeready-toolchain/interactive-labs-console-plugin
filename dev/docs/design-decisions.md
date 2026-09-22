@@ -28,11 +28,11 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 ## Q4 — Console guidance links
 
-**Decision:** typed Quick Start-compatible macro with supported same-Console route and optional symbolic target ID.
+**Decision:** `console:<quickstart-data-id>[label]` accepts only a fixed 25-ID Console registry; authors supply neither routes nor selectors. `resource:<apiVersion>/<Kind>[label,scope=namespaced|cluster,name=...,namespace=...]` requires two or three GVK components (`version/kind` or `group/version/kind`) and uses one ordinary attribute list with the label first and optional named fields after it. It accepts literals, full final-attribute references, or safe mixed `{attribute}` interpolation in `name` and `namespace`; scope and attribute schema remain enforced, cluster scope rejects `namespace`, and every GVK component and nonempty supplied selector is URI-encoded into fixed derived Console list or details paths. Console resolves resource existence; authors control neither routes nor filter syntax.
 
-**Why:** avoids author-controlled raw routes/selectors and relies on supported `data-quickstart-id` addressing. Missing or unsupported targets use route-only fallback.
+**Why:** avoids author-controlled routes/selectors while preserving ordinary same-origin Console links. Route-backed IDs navigate once before waiting; visible-only IDs never infer or navigate a route. Missing targets announce unavailability, with route-backed targets left at their fixed route.
 
-**Deferred:** macro parser, target validation, and spotlight implementation.
+**Implemented and verified:** renderer emits registry-derived Console anchors with per-render provenance metadata and validated resource URLs. Guidance revalidates that metadata, ID, and href before querying exact visible `data-quickstart-id` nodes; it uses a non-modal spotlight, dismissal/cancellation, and conditional persistent drawer minimization. No private Console imports, target activation, route discovery, selector input, backend API, or client-side resource/RBAC query was added.
 
 ## Q5 — Completion evidence, checkpoints, and section solving
 
