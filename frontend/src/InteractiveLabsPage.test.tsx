@@ -350,19 +350,7 @@ describe('InteractiveLabsPage', () => {
       spaceRequests: { status: 'provisioning', namespaces: null },
       helm: { status: 'pending', releaseName: 'il-abc123' },
     });
-    mockGetSetupStatus.mockResolvedValue({
-      apiVersion: 'v1alpha1',
-      kind: 'SetupStatus',
-      outcome: 'accepted', 
-      message: 'Lab setup initiated',
-      spaceRequests: {
-        status: 'ready',
-        namespaces: { gitea: { status: 'ready', name: 'user1-abc' } },
-      },
-      helm: { status: 'deployed', releaseName: 'il-abc123' },
-      
-    });
-    mockGetSetupStatus.mockReturnValue(status.promise);
+    mockGetSetupStatus.mockReturnValueOnce(status.promise);
     mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Ready page</p>', warnings: [] });
     await renderCatalog();
 
@@ -372,12 +360,13 @@ describe('InteractiveLabsPage', () => {
 
     await act(async () => {
       status.resolve({
-        apiVersion: 'v1alpha1', kind: 'SetupStatus', status: 'ready',
-        namespaces: { gitea: { status: 'ready', name: 'user1-abc' } },
+        apiVersion: 'v1alpha1', kind: 'SetupStatus',
+        spaceRequests: { status: 'ready', namespaces: { gitea: { status: 'ready', name: 'user1-abc' } } },
+        helm: { status: 'deployed', releaseName: 'il-abc123' },
       });
     });
 
-    expect(mockGetSetupStatus).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
+    expect(mockGetSetupStatus).toHaveBeenCalledWith('lab-1');
     expect(mockFetchResourceText).toHaveBeenCalledWith(chartBundle.pages[2].url, expect.any(AbortSignal));
     expect(container.textContent).toContain('Ready page');
     expect(getButton(/previous page/i).disabled).toBe(true);
@@ -390,21 +379,31 @@ describe('InteractiveLabsPage', () => {
       let addAbortListener!: jest.SpyInstance;
       let removeAbortListener!: jest.SpyInstance;
       mockLoadLabBundle.mockResolvedValue(chartBundle);
-      mockSetupLab.mockResolvedValue({
-        apiVersion: 'v1alpha1', kind: 'SetupResult', outcome: 'accepted', message: 'Lab setup initiated',
+      mockSetupLab.mockImplementation((_catalogRef, signal) => {
+        addAbortListener = jest.spyOn(signal!, 'addEventListener');
+        removeAbortListener = jest.spyOn(signal!, 'removeEventListener');
+        return Promise.resolve({
+          apiVersion: 'v1alpha1' as const, kind: 'SetupStatus' as const,
+          spaceRequests: { status: 'provisioning' as const, namespaces: null },
+          helm: { status: 'pending' as const, releaseName: 'il-abc123' },
+        });
       });
       mockGetSetupStatus
-        .mockImplementationOnce((_catalogRef, signal) => {
-          addAbortListener = jest.spyOn(signal!, 'addEventListener');
-          removeAbortListener = jest.spyOn(signal!, 'removeEventListener');
-          return Promise.resolve({ apiVersion: 'v1alpha1', kind: 'SetupStatus', status: 'provisioning', namespaces: {} });
+        .mockResolvedValueOnce({
+          apiVersion: 'v1alpha1', kind: 'SetupStatus',
+          spaceRequests: { status: 'provisioning', namespaces: null },
+          helm: { status: 'pending', releaseName: 'il-abc123' },
         })
-        .mockResolvedValueOnce({ apiVersion: 'v1alpha1', kind: 'SetupStatus', status: 'ready', namespaces: {} });
+        .mockResolvedValueOnce({
+          apiVersion: 'v1alpha1', kind: 'SetupStatus',
+          spaceRequests: { status: 'ready', namespaces: { gitea: { status: 'ready', name: 'user1-abc' } } },
+          helm: { status: 'deployed', releaseName: 'il-abc123' },
+        });
       await renderCatalog();
 
       act(() => { getButton(/^Launch$/).click(); });
       await act(async () => {});
-      const abortListener = addAbortListener.mock.calls.find(([type]) => type === 'abort')?.[1];
+      const abortListener = addAbortListener.mock.calls.find(([type]: [string]) => type === 'abort')?.[1];
       expect(abortListener).toEqual(expect.any(Function));
 
       await act(async () => { jest.advanceTimersByTime(3000); });
@@ -470,7 +469,11 @@ describe('InteractiveLabsPage', () => {
     expect(setupSignal.aborted).toBe(true);
 
     await act(async () => {
-      setup.resolve({ apiVersion: 'v1alpha1', kind: 'SetupResult', outcome: 'accepted', message: 'accepted' });
+      setup.resolve({
+        apiVersion: 'v1alpha1', kind: 'SetupStatus',
+        spaceRequests: { status: 'provisioning', namespaces: null },
+        helm: { status: 'pending', releaseName: 'il-abc123' },
+      });
     });
 
     expect(container.querySelector('button[aria-label="Close lab"]')).toBeNull();
@@ -479,22 +482,24 @@ describe('InteractiveLabsPage', () => {
 
   test('aborts pending setup status on unmount', async () => {
     const status = deferred<Awaited<ReturnType<typeof client.getSetupStatus>>>();
-    let statusSignal!: AbortSignal;
+    let launchSignal!: AbortSignal;
     mockLoadLabBundle.mockResolvedValue(chartBundle);
-    mockSetupLab.mockResolvedValue({
-      apiVersion: 'v1alpha1', kind: 'SetupResult', outcome: 'accepted', message: 'Lab setup initiated',
+    mockSetupLab.mockImplementation((_catalogRef, signal) => {
+      launchSignal = signal!;
+      return Promise.resolve({
+        apiVersion: 'v1alpha1' as const, kind: 'SetupStatus' as const,
+        spaceRequests: { status: 'provisioning' as const, namespaces: null },
+        helm: { status: 'pending' as const, releaseName: 'il-abc123' },
+      });
     });
-    mockGetSetupStatus.mockImplementation((_catalogRef, signal) => {
-      statusSignal = signal!;
-      return status.promise;
-    });
+    mockGetSetupStatus.mockReturnValue(status.promise);
     await renderCatalog();
 
     act(() => { getButton(/^Launch$/).click(); });
     await act(async () => {});
     act(() => { ReactDOM.unmountComponentAtNode(container); });
 
-    expect(statusSignal.aborted).toBe(true);
+    expect(launchSignal.aborted).toBe(true);
   });
 
   test('passes bundle attributes unaltered to renderer and mounts only renderer-sanitized markup', async () => {

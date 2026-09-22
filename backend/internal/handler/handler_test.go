@@ -900,7 +900,7 @@ func TestSetupHandler_AlreadyDeployed_Returns200(t *testing.T) {
 	helm := &stubHelmManager{status: "deployed"}
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -937,7 +937,7 @@ func TestSetupStatusHandler_WithHelmDeployed(t *testing.T) {
 	helm := &stubHelmManager{status: "deployed"}
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -975,7 +975,7 @@ func TestSetupStatusHandler_WithHelmInstalling(t *testing.T) {
 	helm := &stubHelmManager{status: "pending-install"}
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -1037,7 +1037,7 @@ func TestSetupStatusHandler_WithGeneratedValues(t *testing.T) {
 	}
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -1075,7 +1075,7 @@ func TestSetupStatusHandler_NoGeneratedValuesWhenNoPasswords(t *testing.T) {
 	helm := &stubHelmManager{status: "deployed"}
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -1133,7 +1133,7 @@ func TestSetupHandler_ConcurrentRequests_StartOnlyOneWorker(t *testing.T) {
 
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, token string) (string, error) { return token, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -1265,7 +1265,7 @@ func TestSetupWorker_RootURL_ResolvesNamespace(t *testing.T) {
 	}
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, tok string) (string, error) { return tok, nil },
+		Authenticate:  func(_ context.Context, _, tok string) (string, error) { return tok, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -1304,7 +1304,7 @@ func TestSetupWorker_RootURL_MissingIngressDomain(t *testing.T) {
 	helm := &stubHelmManager{statusErr: errors.New("not found")}
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, tok string) (string, error) { return tok, nil },
+		Authenticate:  func(_ context.Context, _, tok string) (string, error) { return tok, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
@@ -1354,7 +1354,7 @@ func TestSetupWorker_RootURL_UnknownNamespaceRef(t *testing.T) {
 	helm := &stubHelmManager{statusErr: errors.New("not found")}
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
-		Authenticate:  func(_ context.Context, tok string) (string, error) { return tok, nil },
+		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
 				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
