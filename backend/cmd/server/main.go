@@ -103,25 +103,26 @@ func combinedHandler(api http.Handler, assets string) http.Handler {
 
 // inClusterIdentityResolver verifies each forwarded user token through a request-local typed client.
 // The token lives only in this request and is never logged or retained.
-func inClusterIdentityResolver() func(context.Context, string) (string, error) {
+func inClusterIdentityResolver() func(context.Context, string, string) (string, error) {
 	baseConfig, err := rest.InClusterConfig()
 	if err != nil {
-		return newClusterIdentityResolver(func(string) (userclient.Interface, error) { return nil, err })
+		return newClusterIdentityResolver(func(string, string) (userclient.Interface, error) { return nil, err })
 	}
-	return newClusterIdentityResolver(func(token string) (userclient.Interface, error) {
+	return newClusterIdentityResolver(func(impersonateUsername, token string) (userclient.Interface, error) {
 		config := rest.CopyConfig(baseConfig)
 		config.BearerToken = token
 		config.BearerTokenFile = ""
+		config.Impersonate.UserName = impersonateUsername
 		return userclient.NewForConfig(config)
 	})
 }
 
-func newClusterIdentityResolver(newClient func(string) (userclient.Interface, error)) func(context.Context, string) (string, error) {
-	return func(ctx context.Context, token string) (string, error) {
+func newClusterIdentityResolver(newClient func(string, string) (userclient.Interface, error)) func(context.Context, string, string) (string, error) {
+	return func(ctx context.Context, impersonateUsername, token string) (string, error) {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		client, err := newClient(token)
+		client, err := newClient(impersonateUsername, token)
 		if err != nil || client == nil {
 			return "", fmt.Errorf("identity unavailable")
 		}
