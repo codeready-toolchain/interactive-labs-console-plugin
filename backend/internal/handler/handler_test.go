@@ -198,7 +198,7 @@ func prepareSetupClient(t *testing.T) *setup.SpaceRequestClient {
 		if r.Method == http.MethodGet {
 			w.Header().Set("Content-Type", "application/json")
 			name := filepath.Base(r.URL.Path)
-			fmt.Fprintf(w, `{"metadata":{"name":%q},"status":{"namespaceAccess":[{"name":"ns-%s","secretRef":"s"}],"conditions":[{"type":"Ready","status":"True"}]}}`, name, name)
+			fmt.Fprintf(w, `{"metadata":{"name":%q},"status":{"namespaceAccess":[{"name":"ns-%s","secretRef":"s"}],"conditions":[{"type":"Ready","status":"True"}]}}`, name, name) //nolint:gosec
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
@@ -1183,7 +1183,7 @@ func (c *countingHelmManager) ReleaseStatus(ctx context.Context, release, ns, to
 	return c.inner.ReleaseStatus(ctx, release, ns, token)
 }
 
-func (c *countingHelmManager) Install(_ context.Context, opts setup.HelmInstallOpts) error {
+func (c *countingHelmManager) Install(_ context.Context, _ setup.HelmInstallOpts) error {
 	<-c.blockInstall
 	c.installCount.Add(1)
 	return c.inner.installErr

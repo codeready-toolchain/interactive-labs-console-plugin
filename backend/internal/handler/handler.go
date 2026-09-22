@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -67,6 +68,9 @@ type Config struct {
 
 // NewRouter returns an http.Handler with all three MVP routes registered.
 func NewRouter(cfg Config) http.Handler {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/v1alpha1/catalog", func(w http.ResponseWriter, r *http.Request) {
@@ -443,9 +447,7 @@ func isSafeResourceContentType(contentType string) bool {
 }
 
 func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
-	if cfg.Logger != nil {
-		cfg.Logger.Info("setup request received", "catalogRef", r.PathValue("catalogRef"))
-	}
+	cfg.Logger.Info("setup request received", "catalogRef", r.PathValue("catalogRef"))
 
 	sctx, ok := resolveSetupContext(w, r, cfg)
 	if !ok {
@@ -466,9 +468,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 
 	for _, b := range sctx.bindings.Namespaces {
 		if err := cfg.SetupClient.EnsureSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key, tierName); err != nil {
-			if cfg.Logger != nil {
-				cfg.Logger.Error("create SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
-			}
+			cfg.Logger.Error("create SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
 			writeError(w, http.StatusBadGateway,
 				laberr.New(laberr.TypeConfigurationError, "failed to create SpaceRequest", nil))
 			return
@@ -533,23 +533,17 @@ func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, 
 		var err error
 		nsValues, err = setup.MapBindingsToValues(pollCtx, cfg.SetupClient, token, namespace, bindings.Namespaces)
 		if err == nil {
-			if cfg.Logger != nil {
-				for path, nsName := range nsValues {
-					cfg.Logger.Info("namespace ready", "release", releaseName, "binding", path, "namespace", nsName)
-				}
+			for path, nsName := range nsValues {
+				cfg.Logger.Info("namespace ready", "release", releaseName, "binding", path, "namespace", nsName)
 			}
 			break
 		}
 
-		if cfg.Logger != nil {
-			cfg.Logger.Info("SpaceRequests not ready, retrying", "release", releaseName)
-		}
+		cfg.Logger.Info("SpaceRequests not ready, retrying", "release", releaseName)
 
 		select {
 		case <-pollCtx.Done():
-			if cfg.Logger != nil {
-				cfg.Logger.Error("setup worker timed out waiting for SpaceRequests", "release", releaseName)
-			}
+			cfg.Logger.Error("setup worker timed out waiting for SpaceRequests", "release", releaseName)
 			setState("failed", "timed out waiting for SpaceRequests")
 			return
 		case <-time.After(setupWorkerPollInterval):
@@ -566,30 +560,22 @@ func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, 
 		for i, b := range bindings.Passwords {
 			pwPaths[i] = b.Path
 		}
-		if cfg.Logger != nil {
-			cfg.Logger.Info("generating passwords", "release", releaseName, "paths", pwPaths)
-		}
+		cfg.Logger.Info("generating passwords", "release", releaseName, "paths", pwPaths)
 		pwValues, err := setup.GeneratePasswordValues(bindings.Passwords)
 		if err != nil {
-			if cfg.Logger != nil {
-				cfg.Logger.Error("password generation failed", "release", releaseName, "err", err)
-			}
+			cfg.Logger.Error("password generation failed", "release", releaseName, "err", err)
 			setState("failed", "password generation failed")
 			return
 		}
 		for k, v := range pwValues {
 			values[k] = v
 		}
-		if cfg.Logger != nil {
-			cfg.Logger.Info("passwords generated", "release", releaseName, "count", len(pwValues))
-		}
+		cfg.Logger.Info("passwords generated", "release", releaseName, "count", len(pwValues))
 	}
 
 	for _, b := range bindings.RootURLs {
 		if cfg.ClusterIngressDomain == "" {
-			if cfg.Logger != nil {
-				cfg.Logger.Error("cluster ingress domain not configured but required by schema", "release", releaseName, "path", b.Path)
-			}
+			cfg.Logger.Error("cluster ingress domain not configured but required by schema", "release", releaseName, "path", b.Path)
 			setState("failed", "cluster ingress domain not configured")
 			return
 		}
@@ -600,9 +586,7 @@ func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, 
 			for i, nb := range bindings.Namespaces {
 				availableKeys[i] = nb.Key
 			}
-			if cfg.Logger != nil {
-				cfg.Logger.Error("root-url references unknown namespace binding", "release", releaseName, "namespaceRef", b.NamespaceRef, "nsPath", nsPath, "availableKeys", availableKeys, "nsValues", nsValues)
-			}
+			cfg.Logger.Error("root-url references unknown namespace binding", "release", releaseName, "namespaceRef", b.NamespaceRef, "nsPath", nsPath, "availableKeys", availableKeys, "nsValues", nsValues)
 			setState("failed", "root-url references unknown namespace binding: "+b.NamespaceRef)
 			return
 		}
@@ -614,9 +598,7 @@ func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, 
 	for k := range values {
 		valueKeys = append(valueKeys, k)
 	}
-	if cfg.Logger != nil {
-		cfg.Logger.Info("all SpaceRequests ready, installing Helm chart", "release", releaseName, "valueKeys", valueKeys)
-	}
+	cfg.Logger.Info("all SpaceRequests ready, installing Helm chart", "release", releaseName, "valueKeys", valueKeys)
 	setState("installing", "")
 
 	// Give the context extra margin so Helm's own --wait timeout fires first
@@ -632,21 +614,17 @@ func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, 
 		Values:      values,
 		Timeout:     helmTimeout,
 	}); err != nil {
-		if cfg.Logger != nil {
-			cfg.Logger.Error("Helm install failed", "release", releaseName, "err", err)
-		}
+		cfg.Logger.Error("Helm install failed", "release", releaseName, "err", err)
 		logPodDiagnostics(cfg, token, nsValues)
 		setState("failed", err.Error())
 	} else {
-		if cfg.Logger != nil {
-			cfg.Logger.Info("Helm install completed", "release", releaseName)
-		}
+		cfg.Logger.Info("Helm install completed", "release", releaseName)
 		setState("done", "")
 	}
 }
 
 func logPodDiagnostics(cfg Config, token string, nsValues map[string]string) {
-	if cfg.Logger == nil || cfg.HelmManager == nil {
+	if cfg.HelmManager == nil {
 		return
 	}
 	for binding, nsName := range nsValues {
@@ -680,9 +658,7 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 	for _, b := range sctx.bindings.Namespaces {
 		sr, err := cfg.SetupClient.GetSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key)
 		if err != nil {
-			if cfg.Logger != nil {
-				cfg.Logger.Warn("get SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
-			}
+			cfg.Logger.Warn("get SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
 			namespaces[b.Key] = namespaceStatus{Status: "pending", Name: b.Key}
 			allReady = false
 			continue
@@ -693,9 +669,7 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 			continue
 		}
 		if sr.IsReady() && sr.TargetNamespace() != "" {
-			if cfg.Logger != nil {
-				cfg.Logger.Info("SpaceRequest ready", "name", b.Key, "namespace", sr.TargetNamespace())
-			}
+			cfg.Logger.Info("SpaceRequest ready", "name", b.Key, "namespace", sr.TargetNamespace())
 			namespaces[b.Key] = namespaceStatus{Status: "ready", Name: sr.TargetNamespace()}
 		} else if sr.IsFailed() {
 			namespaces[b.Key] = namespaceStatus{Status: "failed", Name: b.Key}
@@ -783,9 +757,7 @@ func omittedLabReason(err error) string {
 }
 
 func recordCatalogOmission(ctx context.Context, cfg Config, catalogRef, reason string) {
-	if cfg.Logger != nil {
-		cfg.Logger.Warn("catalog lab omitted", "catalogRef", catalogRef, "reason", reason)
-	}
+	cfg.Logger.Warn("catalog lab omitted", "catalogRef", catalogRef, "reason", reason)
 	if cfg.CatalogLabOmitted != nil {
 		cfg.CatalogLabOmitted(ctx, catalogRef, reason)
 	}
