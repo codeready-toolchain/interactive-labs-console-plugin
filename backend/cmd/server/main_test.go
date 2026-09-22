@@ -37,200 +37,206 @@ const (
 	ingressDomain = "apps.example.test"
 )
 
-func TestRuntimeAttributesReadsTypedClusterConfig(t *testing.T) {
-	client := typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain})
-	var configClient configclient.Interface = client
+func TestRuntimeAttributes(t *testing.T) {
+	t.Run("reads typed cluster config", func(t *testing.T) {
+		client := typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain})
+		var configClient configclient.Interface = client
 
-	attributes, err := newClusterRuntimeAttributes(configClient, nil)(httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil), "alice")
+		attributes, err := newClusterRuntimeAttributes(configClient, nil)(httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil), "alice")
 
-	require.NoError(t, err)
-	require.Equal(t, map[string]string{
-		"user":                             "alice",
-		"openshift_api_url":                apiServerURL,
-		"openshift_console_url":            consoleURL,
-		"openshift_cluster_ingress_domain": ingressDomain,
-	}, attributes)
-}
-
-func TestRuntimeAttributesPreservesCallerContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	client := typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain})
-	var configClient configclient.Interface = client
-
-	attributes, err := newClusterRuntimeAttributes(configClient, nil)(httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil), "alice")
-
-	require.ErrorIs(t, err, context.Canceled)
-	require.Nil(t, attributes)
-	require.Empty(t, client.Actions())
-}
-
-func TestRuntimeAttributeFailuresAreAtomicAndSafeToLog(t *testing.T) {
-	for _, tc := range []struct {
-		name, attribute string
-		client          *configfake.Clientset
-	}{
-		{
-			name:      "missing API URL",
-			attribute: "openshift_api_url",
-			client:    typedConfigClient(configv1.InfrastructureStatus{}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain}),
-		},
-		{
-			name:      "missing console URL",
-			attribute: "openshift_console_url",
-			client:    typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{}, configv1.IngressSpec{Domain: ingressDomain}),
-		},
-		{
-			name:      "missing ingress domain",
-			attribute: "openshift_cluster_ingress_domain",
-			client:    typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{}),
-		},
-		{
-			name:      "typed client error",
-			attribute: "openshift_console_url",
-			client: func() *configfake.Clientset {
-				client := typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain})
-				client.PrependReactor("get", "consoles", func(k8stesting.Action) (bool, runtime.Object, error) {
-					return true, nil, errors.New("console credential leak")
-				})
-				return client
-			}(),
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var logs bytes.Buffer
-			var configClient configclient.Interface = tc.client
-
-			attributes, err := newClusterRuntimeAttributes(configClient, slog.New(slog.NewTextHandler(&logs, nil)))(httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil), "alice@example.test")
-
-			require.Error(t, err)
-			require.Nil(t, attributes)
-			require.Contains(t, logs.String(), "attribute="+tc.attribute)
-			require.NotContains(t, logs.String(), "alice@example.test")
-			require.NotContains(t, logs.String(), apiServerURL)
-			require.NotContains(t, logs.String(), consoleURL)
-			require.NotContains(t, logs.String(), ingressDomain)
-			require.NotContains(t, logs.String(), "console credential leak")
-		})
-	}
-}
-
-func TestClusterCatalogSourceGetsTypedConfigMap(t *testing.T) {
-	const namespace = "interactive-labs-console-plugin"
-	client := k8sfake.NewSimpleClientset(&corev1.ConfigMap{
-		Namespace: namespace, Name: "interactive-labs-catalog",
-		Data: map[string]string{"catalog.yaml": "labs: []"},
+		require.NoError(t, err)
+		require.Equal(t, map[string]string{
+			"user":                             "alice",
+			"openshift_api_url":                apiServerURL,
+			"openshift_console_url":            consoleURL,
+			"openshift_cluster_ingress_domain": ingressDomain,
+		}, attributes)
 	})
 
-	configMap, err := newClusterCatalogSource(client, namespace)(context.Background())
+	t.Run("preserves caller context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		client := typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain})
+		var configClient configclient.Interface = client
 
-	require.NoError(t, err)
-	require.Equal(t, "labs: []", configMap.Data["catalog.yaml"])
-	require.Len(t, client.Actions(), 1)
-	action := client.Actions()[0]
-	require.Equal(t, "get", action.GetVerb())
-	require.Equal(t, "configmaps", action.GetResource().Resource)
-	require.Equal(t, namespace, action.GetNamespace())
-}
+		attributes, err := newClusterRuntimeAttributes(configClient, nil)(httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil), "alice")
 
-func TestClusterCatalogSourcePreservesCallerContextAndFailsSafely(t *testing.T) {
-	const secret = "catalog credential leak" // #nosec G101
-	client := k8sfake.NewSimpleClientset()
-	client.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
-		return true, nil, errors.New(secret)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, attributes)
+		require.Empty(t, client.Actions())
 	})
 
-	configMap, err := newClusterCatalogSource(client, "ns")(context.Background())
+	t.Run("failures are atomic and safe to log", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, attribute string
+			client          *configfake.Clientset
+		}{
+			{
+				name:      "missing API URL",
+				attribute: "openshift_api_url",
+				client:    typedConfigClient(configv1.InfrastructureStatus{}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain}),
+			},
+			{
+				name:      "missing console URL",
+				attribute: "openshift_console_url",
+				client:    typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{}, configv1.IngressSpec{Domain: ingressDomain}),
+			},
+			{
+				name:      "missing ingress domain",
+				attribute: "openshift_cluster_ingress_domain",
+				client:    typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{}),
+			},
+			{
+				name:      "typed client error",
+				attribute: "openshift_console_url",
+				client: func() *configfake.Clientset {
+					client := typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain})
+					client.PrependReactor("get", "consoles", func(k8stesting.Action) (bool, runtime.Object, error) {
+						return true, nil, errors.New("console credential leak")
+					})
+					return client
+				}(),
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var logs bytes.Buffer
+				var configClient configclient.Interface = tc.client
 
-	require.Nil(t, configMap)
-	require.EqualError(t, err, "catalog unavailable")
-	require.NotContains(t, err.Error(), secret)
+				attributes, err := newClusterRuntimeAttributes(configClient, slog.New(slog.NewTextHandler(&logs, nil)))(httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil), "alice@example.test")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	cancelledClient := k8sfake.NewSimpleClientset()
-	configMap, err = newClusterCatalogSource(cancelledClient, "ns")(ctx)
-	require.ErrorIs(t, err, context.Canceled)
-	require.Nil(t, configMap)
-	require.Empty(t, cancelledClient.Actions())
-}
-
-func TestClusterIdentityResolverGetsCurrentUserFromPerRequestTypedClient(t *testing.T) {
-	const (
-		directToken       = "forwarded-token"
-		impersonatedToken = "next-forwarded-token"
-		directUser        = "alice"
-		impersonatedUser  = "admin-alice"
-	)
-	var logs bytes.Buffer
-	previousLogger := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	t.Cleanup(func() { slog.SetDefault(previousLogger) })
-	var factoryImpersonateUsers, factoryTokens []string
-	var userClients []*userfake.Clientset
-	resolver := newClusterIdentityResolver(func(receivedImpersonateUser, receivedToken string) (userclient.Interface, error) {
-		factoryImpersonateUsers = append(factoryImpersonateUsers, receivedImpersonateUser)
-		factoryTokens = append(factoryTokens, receivedToken)
-		userName := directUser
-		if receivedImpersonateUser != "" {
-			userName = receivedImpersonateUser
+				require.Error(t, err)
+				require.Nil(t, attributes)
+				require.Contains(t, logs.String(), "attribute="+tc.attribute)
+				require.NotContains(t, logs.String(), "alice@example.test")
+				require.NotContains(t, logs.String(), apiServerURL)
+				require.NotContains(t, logs.String(), consoleURL)
+				require.NotContains(t, logs.String(), ingressDomain)
+				require.NotContains(t, logs.String(), "console credential leak")
+			})
 		}
-		client := userfake.NewSimpleClientset()
-		client.PrependReactor("get", "users", func(k8stesting.Action) (bool, runtime.Object, error) {
-			return true, &userv1.User{ObjectMeta: metav1.ObjectMeta{Name: userName}}, nil
-		})
-		userClients = append(userClients, client)
-		return client, nil
 	})
+}
 
-	directSubject, err := resolver(context.Background(), "", directToken)
-	impersonatedSubject, impersonatedErr := resolver(context.Background(), impersonatedUser, impersonatedToken)
+func TestClusterCatalogSource(t *testing.T) {
+	t.Run("gets typed config map", func(t *testing.T) {
+		const namespace = "interactive-labs-console-plugin"
+		client := k8sfake.NewSimpleClientset(&corev1.ConfigMap{
+			Namespace: namespace, Name: "interactive-labs-catalog",
+			Data: map[string]string{"catalog.yaml": "labs: []"},
+		})
 
-	require.NoError(t, err)
-	require.NoError(t, impersonatedErr)
-	require.Equal(t, directUser, directSubject)
-	require.Equal(t, impersonatedUser, impersonatedSubject)
-	require.Equal(t, []string{"", impersonatedUser}, factoryImpersonateUsers)
-	require.Equal(t, []string{directToken, impersonatedToken}, factoryTokens)
-	require.NotContains(t, logs.String(), directToken)
-	require.NotContains(t, logs.String(), impersonatedToken)
-	require.Len(t, userClients, 2)
-	for _, client := range userClients {
+		configMap, err := newClusterCatalogSource(client, namespace)(context.Background())
+
+		require.NoError(t, err)
+		require.Equal(t, "labs: []", configMap.Data["catalog.yaml"])
 		require.Len(t, client.Actions(), 1)
 		action := client.Actions()[0]
 		require.Equal(t, "get", action.GetVerb())
-		require.Equal(t, "users", action.GetResource().Resource)
-		require.Equal(t, "~", action.(k8stesting.GetAction).GetName())
-	}
+		require.Equal(t, "configmaps", action.GetResource().Resource)
+		require.Equal(t, namespace, action.GetNamespace())
+	})
+
+	t.Run("preserves caller context and fails safely", func(t *testing.T) {
+		const secret = "catalog credential leak" // #nosec G101
+		client := k8sfake.NewSimpleClientset()
+		client.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New(secret)
+		})
+
+		configMap, err := newClusterCatalogSource(client, "ns")(context.Background())
+
+		require.Nil(t, configMap)
+		require.EqualError(t, err, "catalog unavailable")
+		require.NotContains(t, err.Error(), secret)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		cancelledClient := k8sfake.NewSimpleClientset()
+		configMap, err = newClusterCatalogSource(cancelledClient, "ns")(ctx)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, configMap)
+		require.Empty(t, cancelledClient.Actions())
+	})
 }
 
-func TestClusterIdentityResolverPreservesCallerContextAndFailsSafely(t *testing.T) {
-	const token = "forwarded-token"
-	const secret = "identity credential leak"
-	client := userfake.NewSimpleClientset()
-	client.PrependReactor("get", "users", func(k8stesting.Action) (bool, runtime.Object, error) {
-		return true, nil, errors.New(secret)
+func TestClusterIdentityResolver(t *testing.T) {
+	t.Run("gets current user from per request typed client", func(t *testing.T) {
+		const (
+			directToken       = "forwarded-token"
+			impersonatedToken = "next-forwarded-token"
+			directUser        = "alice"
+			impersonatedUser  = "admin-alice"
+		)
+		var logs bytes.Buffer
+		previousLogger := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+		t.Cleanup(func() { slog.SetDefault(previousLogger) })
+		var factoryImpersonateUsers, factoryTokens []string
+		var userClients []*userfake.Clientset
+		resolver := newClusterIdentityResolver(func(receivedImpersonateUser, receivedToken string) (userclient.Interface, error) {
+			factoryImpersonateUsers = append(factoryImpersonateUsers, receivedImpersonateUser)
+			factoryTokens = append(factoryTokens, receivedToken)
+			userName := directUser
+			if receivedImpersonateUser != "" {
+				userName = receivedImpersonateUser
+			}
+			client := userfake.NewSimpleClientset()
+			client.PrependReactor("get", "users", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, &userv1.User{ObjectMeta: metav1.ObjectMeta{Name: userName}}, nil
+			})
+			userClients = append(userClients, client)
+			return client, nil
+		})
+
+		directSubject, err := resolver(context.Background(), "", directToken)
+		impersonatedSubject, impersonatedErr := resolver(context.Background(), impersonatedUser, impersonatedToken)
+
+		require.NoError(t, err)
+		require.NoError(t, impersonatedErr)
+		require.Equal(t, directUser, directSubject)
+		require.Equal(t, impersonatedUser, impersonatedSubject)
+		require.Equal(t, []string{"", impersonatedUser}, factoryImpersonateUsers)
+		require.Equal(t, []string{directToken, impersonatedToken}, factoryTokens)
+		require.NotContains(t, logs.String(), directToken)
+		require.NotContains(t, logs.String(), impersonatedToken)
+		require.Len(t, userClients, 2)
+		for _, client := range userClients {
+			require.Len(t, client.Actions(), 1)
+			action := client.Actions()[0]
+			require.Equal(t, "get", action.GetVerb())
+			require.Equal(t, "users", action.GetResource().Resource)
+			require.Equal(t, "~", action.(k8stesting.GetAction).GetName())
+		}
 	})
-	resolver := newClusterIdentityResolver(func(string, string) (userclient.Interface, error) { return client, nil })
 
-	subject, err := resolver(context.Background(), "", token)
+	t.Run("preserves caller context and fails safely", func(t *testing.T) {
+		const token = "forwarded-token"
+		const secret = "identity credential leak"
+		client := userfake.NewSimpleClientset()
+		client.PrependReactor("get", "users", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New(secret)
+		})
+		resolver := newClusterIdentityResolver(func(string, string) (userclient.Interface, error) { return client, nil })
 
-	require.Empty(t, subject)
-	require.EqualError(t, err, "identity unavailable")
-	require.NotContains(t, err.Error(), token)
-	require.NotContains(t, err.Error(), secret)
+		subject, err := resolver(context.Background(), "", token)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	factoryCalls := 0
-	resolver = newClusterIdentityResolver(func(string, string) (userclient.Interface, error) {
-		factoryCalls++
-		return userfake.NewSimpleClientset(), nil
+		require.Empty(t, subject)
+		require.EqualError(t, err, "identity unavailable")
+		require.NotContains(t, err.Error(), token)
+		require.NotContains(t, err.Error(), secret)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		factoryCalls := 0
+		resolver = newClusterIdentityResolver(func(string, string) (userclient.Interface, error) {
+			factoryCalls++
+			return userfake.NewSimpleClientset(), nil
+		})
+		subject, err = resolver(ctx, "", token)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Empty(t, subject)
+		require.Zero(t, factoryCalls)
 	})
-	subject, err = resolver(ctx, "", token)
-	require.ErrorIs(t, err, context.Canceled)
-	require.Empty(t, subject)
-	require.Zero(t, factoryCalls)
 }
 
 func typedConfigClient(infrastructure configv1.InfrastructureStatus, console configv1.ConsoleStatus, ingress configv1.IngressSpec) *configfake.Clientset {
