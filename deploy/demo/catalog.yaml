@@ -4,12 +4,12 @@ metadata:
   name: interactive-labs-catalog
 data:
   catalog.yaml: |
-    - repository: https://github.com/metlos/devsandbox-ocp-getting-started-lab.git
-      branch: master
+    - repository: https://github.com/xcoulon/devsandbox-ocp-getting-started-lab.git
+      branch: postgres-gitea-passwords
       labPath: lab-01
     - repository: https://github.com/xcoulon/devsandbox-ocp-getting-started-lab.git
-      branch: master
+      branch: postgres-gitea-passwords
       labPath: lab-02
-    - repository: https://github.com/metlos/devsandbox-ocp-getting-started-lab.git
-      branch: master
+    - repository: https://github.com/xcoulon/devsandbox-ocp-getting-started-lab.git
+      branch: postgres-gitea-passwords
       labPath: lab-03

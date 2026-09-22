@@ -293,11 +293,17 @@ func TestBundleHandler_ReturnsSortedNavigablePageDescriptors(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rw.Code)
 	var body struct {
-		Pages map[string]string `json:"pages"`
+		Pages []struct {
+			Path string `json:"path"`
+			URL  string `json:"url"`
+		} `json:"pages"`
 	}
 	require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
-	assert.Equal(t, map[string]string{
-		"intro.adoc": "api/v1alpha1/labs/" + ref + "/resources/lab/content/intro.adoc",
+	assert.Equal(t, []struct {
+		Path string `json:"path"`
+		URL  string `json:"url"`
+	}{
+		{Path: "intro.adoc", URL: "api/v1alpha1/labs/" + ref + "/resources/lab/content/intro.adoc"},
 	}, body.Pages)
 	assert.NotContains(t, rw.Body.String(), "= Intro")
 }
