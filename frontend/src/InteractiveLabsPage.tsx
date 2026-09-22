@@ -39,6 +39,7 @@ import type { CatalogEntry } from "./types/catalog";
 import type { LabError } from "./types/errors";
 import type { PersistedSession } from "./types/session";
 import type { LabPage } from "./types/manifest";
+import type { SetupStatus } from "./types/setup";
 import { sanitizeTitle } from "./sanitizer";
 
 type PageState =
@@ -189,7 +190,7 @@ const saveSession = (panel: ActivePanel): void => {
 
 const SETUP_POLL_INTERVAL_MS = 3000;
 
-const pollSetupUntilReady = async (catalogRef: string, signal: AbortSignal): Promise<void> => {
+const pollSetupUntilReady = async (catalogRef: string, signal: AbortSignal): Promise<SetupStatus> => {
   while (!signal.aborted) {
     const status = await getSetupStatus(catalogRef);
     if (status.spaceRequests.status === "failed") {
@@ -199,7 +200,7 @@ const pollSetupUntilReady = async (catalogRef: string, signal: AbortSignal): Pro
       throw new Error(status.helm.message || "Lab setup failed.");
     }
     if (status.spaceRequests.status === "ready" && status.helm.status === "deployed") {
-      return;
+      return status;
     }
     await new Promise<void>((resolve, reject) => {
       if (signal.aborted) {
@@ -302,8 +303,14 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
 
       if (needsSetup) {
         await setupLab(catalogRef, controller.signal);
-        await pollSetupUntilReady(catalogRef, controller.signal);
+        const finalStatus = await pollSetupUntilReady(catalogRef, controller.signal);
         if (!isCurrentLaunch()) return;
+        if (finalStatus.attributes) {
+          setActivePanel((current) => current ? {
+            ...current,
+            attributes: { ...current.attributes, ...finalStatus.attributes },
+          } : current);
+        }
         setSetupState(undefined);
       }
     } catch (err: unknown) {

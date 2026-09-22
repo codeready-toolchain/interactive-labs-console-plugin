@@ -98,6 +98,31 @@ describe("SetupStatus shape", () => {
     expect(s.spaceRequests.namespaces?.gitea.name).toBe("user1-abc");
     expect(s.helm.status).toBe("deployed");
   });
+
+  it("supports optional attributes map", () => {
+    const s: SetupStatus = {
+      apiVersion: "v1alpha1",
+      kind: "SetupStatus",
+      spaceRequests: {
+        status: "ready",
+        namespaces: { gitea: { status: "ready", name: "ns-abc" } },
+      },
+      helm: { status: "deployed", releaseName: "il-abc123" },
+      attributes: { "gitea-namespace": "ns-abc", postgres: "secret" },
+    };
+    expect(s.attributes?.["gitea-namespace"]).toBe("ns-abc");
+    expect(s.attributes?.postgres).toBe("secret");
+  });
+
+  it("attributes is optional", () => {
+    const s: SetupStatus = {
+      apiVersion: "v1alpha1",
+      kind: "SetupStatus",
+      spaceRequests: { status: "provisioning", namespaces: null },
+      helm: { status: "pending", releaseName: "il-abc123" },
+    };
+    expect(s.attributes).toBeUndefined();
+  });
 });
 
 type IsExact<Left, Right> = (

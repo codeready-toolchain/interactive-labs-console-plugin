@@ -5,11 +5,11 @@ metadata:
 data:
   catalog.yaml: |
     - repository: https://github.com/xcoulon/devsandbox-ocp-getting-started-lab.git
-      branch: postgres-gitea-passwords
+      branch: update-runtime-attributes
       labPath: lab-01
     - repository: https://github.com/xcoulon/devsandbox-ocp-getting-started-lab.git
-      branch: postgres-gitea-passwords
+      branch: update-runtime-attributes
       labPath: lab-02
     - repository: https://github.com/xcoulon/devsandbox-ocp-getting-started-lab.git
-      branch: postgres-gitea-passwords
+      branch: update-runtime-attributes
       labPath: lab-03
