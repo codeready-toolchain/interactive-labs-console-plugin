@@ -4,7 +4,7 @@ import * as client from "../client";
 
 const { validateManifest } = client;
 const getNavigablePagePaths = (client as typeof client & {
-  getNavigablePagePaths: (pages: Record<string, string>) => string[];
+  getNavigablePagePaths: (pages: unknown) => string[];
 }).getNavigablePagePaths;
 
 describe("validateManifest", () => {
@@ -84,12 +84,12 @@ describe("validateManifest", () => {
 
 describe("bundle page normalization", () => {
   it("excludes paths with underscore-prefixed segments from lexical navigation", () => {
-    const pages = {
-      "020-install.adoc": "content",
-      "010-intro.adoc": "content",
-      "chapter/_shared/notice.adoc": "include",
-      "_shared/appendix.adoc": "include",
-    };
+    const pages = [
+      { path: "020-install.adoc", url: "api/v1alpha1/labs/l1/resources/lab/content/020-install.adoc" },
+      { path: "010-intro.adoc", url: "api/v1alpha1/labs/l1/resources/lab/content/010-intro.adoc" },
+      { path: "chapter/_shared/notice.adoc", url: "api/v1alpha1/labs/l1/resources/lab/content/chapter/_shared/notice.adoc" },
+      { path: "_shared/appendix.adoc", url: "api/v1alpha1/labs/l1/resources/lab/content/_shared/appendix.adoc" },
+    ];
 
     const navigablePaths = getNavigablePagePaths(pages);
 

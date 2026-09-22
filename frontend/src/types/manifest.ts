@@ -23,12 +23,17 @@ export interface RuntimeContext {
   helmChartAvailable: boolean;
 }
 
+export interface LabPage {
+  path: string;
+  url: string;
+}
+
 export interface LabBundle {
   apiVersion: "v1alpha1";
   kind: "LabBundle";
   manifest: LabManifest;
-  /** pagePath → AsciiDoc source */
-  pages: Record<string, string>;
+  /** Sorted content-relative paths with proxy-resolved source URLs. */
+  pages: LabPage[];
   runtimeContext: RuntimeContext;
 }
 

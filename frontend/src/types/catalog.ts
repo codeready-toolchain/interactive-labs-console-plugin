@@ -2,6 +2,7 @@ export interface CatalogEntry {
   catalogRef: string;
   displayName: string;
   description?: string;
+  labPath: string;
 }
 
 export interface CatalogList {

@@ -47,7 +47,7 @@ type Config struct {
 	// Logger receives safe operational fields only; tokens must never be passed to it.
 	Logger *slog.Logger
 	// Authenticate resolves a forwarded user token to its server-verified subject.
-	Authenticate func(context.Context, string) (string, error)
+	Authenticate func(context.Context, string, string) (string, error)
 	// RuntimeAttributes returns request-scoped attributes merged on top of static ones.
 	// nil means no runtime attrs. The subject is the authenticated user identifier.
 	// Production default may be nil while the key list is TBD.
@@ -171,7 +171,7 @@ func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*s
 		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication required", nil))
 		return nil, false
 	}
-	subject, err := cfg.Authenticate(r.Context(), token)
+	subject, err := cfg.Authenticate(r.Context(), r.Header.Get("Impersonate-User"), token)
 	if err != nil || subject == "" {
 		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication failed", nil))
 		return nil, false
@@ -302,7 +302,7 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication required", nil))
 		return
 	}
-	subject, err := cfg.Authenticate(r.Context(), token)
+	subject, err := cfg.Authenticate(r.Context(), r.Header.Get("Impersonate-User"), token)
 	if err != nil || subject == "" {
 		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication failed", nil))
 		return
@@ -372,7 +372,7 @@ func handleResource(w http.ResponseWriter, r *http.Request, cfg Config) {
 		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication required", nil))
 		return
 	}
-	if subject, err := cfg.Authenticate(r.Context(), token); err != nil || subject == "" {
+	if subject, err := cfg.Authenticate(r.Context(), r.Header.Get("Impersonate-User"), token); err != nil || subject == "" {
 		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication failed", nil))
 		return
 	}

@@ -1,6 +1,6 @@
 import { consoleFetch } from "@openshift-console/dynamic-plugin-sdk";
-import type { CatalogList } from "../types/catalog";
-import type { LabBundle, LabManifest } from "../types/manifest";
+import type { CatalogEntry, CatalogList } from "../types/catalog";
+import type { LabBundle, LabManifest, LabPage } from "../types/manifest";
 import type { SetupResult, SetupStatus } from "../types/setup";
 import { isKnownErrorType, type LabError } from "../types/errors";
 
@@ -37,23 +37,40 @@ async function parseResponse<T>(res: Response): Promise<T> {
 
 export async function listCatalog(): Promise<CatalogList> {
   const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/catalog`);
-  return parseResponse<CatalogList>(res);
+  return validateCatalogList(await parseResponse<unknown>(res));
 }
 
-export async function loadLabBundle(catalogRef: string): Promise<LabBundle> {
-  const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/bundle`);
+export async function loadLabBundle(catalogRef: string, signal?: AbortSignal): Promise<LabBundle> {
+  const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/bundle`, { signal });
   return validateLabBundle(await parseResponse<unknown>(res), catalogRef);
 }
 
-export async function setupLab(catalogRef: string): Promise<SetupResult> {
+export async function fetchResourceText(resourceURL: string, signal: AbortSignal): Promise<string> {
+  const base = new URL(`${PROXY_BASE}/`, window.location.origin);
+  const resolved = new URL(resourceURL, window.location.origin);
+  if (
+    resolved.origin !== base.origin ||
+    !/^\/api\/proxy\/plugin\/interactive-labs-console-plugin\/backend\/api\/v1alpha1\/labs\/[^/]+\/resources\//.test(resolved.pathname) ||
+    resolved.search ||
+    resolved.hash
+  ) {
+    throw new Error("resource_invalid: invalid resource URL");
+  }
+  const res = await consoleFetch(resolved.pathname, { signal });
+  if (!res.ok) throw parseLabError(await res.json());
+  return res.text();
+}
+
+export async function setupLab(catalogRef: string, signal?: AbortSignal): Promise<SetupResult> {
   const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/setup`, {
     method: "POST",
+    signal,
   });
   return parseResponse<SetupResult>(res);
 }
 
-export async function getSetupStatus(catalogRef: string): Promise<SetupStatus> {
-  const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/setup/status`);
+export async function getSetupStatus(catalogRef: string, signal?: AbortSignal): Promise<SetupStatus> {
+  const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/setup/status`, { signal });
   return parseResponse<SetupStatus>(res);
 }
 
@@ -63,10 +80,62 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-export function getNavigablePagePaths(pages: Record<string, string>): string[] {
-  return Object.keys(pages)
+export function getNavigablePagePaths(pages: LabPage[]): string[] {
+  return pages
+    .map((page) => page.path)
     .filter((pagePath) => pagePath.split("/").every((segment) => !segment.startsWith("_")))
     .sort();
+}
+
+function isNormalizedRelativePath(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value !== "" &&
+    (value === "." ||
+      (!value.startsWith("/") &&
+        !value.endsWith("/") &&
+        value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..")))
+  );
+}
+
+function resolveProxyURL(value: unknown): string {
+  if (typeof value !== "string" || !value || value.startsWith("/")) {
+    throw new Error("bundle_invalid: invalid page URL");
+  }
+  const base = new URL(`${PROXY_BASE}/`, "https://console.invalid");
+  const resolved = new URL(value, base);
+  if (
+    resolved.origin !== base.origin ||
+    !resolved.pathname.startsWith(`${PROXY_BASE}/`) ||
+    resolved.search ||
+    resolved.hash
+  ) {
+    throw new Error("bundle_invalid: invalid page URL");
+  }
+  return resolved.pathname;
+}
+
+function validateCatalogList(raw: unknown): CatalogList {
+  if (raw === null || typeof raw !== "object") throw new Error("catalog_invalid: invalid envelope");
+  const list = raw as Record<string, unknown>;
+  if (list["apiVersion"] !== "v1alpha1" || list["kind"] !== "CatalogList" || !Array.isArray(list["items"])) {
+    throw new Error("catalog_invalid: invalid envelope");
+  }
+  const items: CatalogEntry[] = list["items"].map((rawItem) => {
+    if (!isRecord(rawItem) || typeof rawItem["catalogRef"] !== "string" || !rawItem["catalogRef"] ||
+      typeof rawItem["displayName"] !== "string" || !rawItem["displayName"] ||
+      !isNormalizedRelativePath(rawItem["labPath"]) ||
+      (rawItem["description"] !== undefined && typeof rawItem["description"] !== "string")) {
+      throw new Error("catalog_invalid: invalid item");
+    }
+    return {
+      catalogRef: rawItem["catalogRef"],
+      displayName: rawItem["displayName"],
+      ...(rawItem["description"] === undefined ? {} : { description: rawItem["description"] }),
+      labPath: rawItem["labPath"],
+    };
+  });
+  return { apiVersion: "v1alpha1", kind: "CatalogList", items };
 }
 
 export function validateManifest(raw: unknown): LabManifest {
@@ -130,13 +199,30 @@ function validateLabBundle(raw: unknown, catalogRef: string): LabBundle {
     throw new Error("bundle_invalid: invalid runtime context");
   }
 
-  const pages = raw["pages"];
-  if (!isRecord(pages) || Object.values(pages).some((source) => typeof source !== "string")) {
-    throw new Error("bundle_invalid: invalid pages");
-  }
-  if (getNavigablePagePaths(pages as Record<string, string>).length === 0) {
-    throw new Error("bundle_invalid: no navigable pages");
-  }
+  const rawPages = raw["pages"];
+  if (!Array.isArray(rawPages)) throw new Error("bundle_invalid: invalid pages");
+  const pagePaths = new Set<string>();
+  const pages: LabPage[] = rawPages.map((rawPage) => {
+    if (!isRecord(rawPage) || !isNormalizedRelativePath(rawPage["path"]) ||
+      rawPage["path"] === "." || !rawPage["path"].endsWith(".adoc") ||
+      rawPage["path"].split("/").some((segment) => segment.startsWith("_")) ||
+      pagePaths.has(rawPage["path"])) {
+      throw new Error("bundle_invalid: invalid page descriptor");
+    }
+    pagePaths.add(rawPage["path"]);
+    return { path: rawPage["path"], url: resolveProxyURL(rawPage["url"]) };
+  });
+  if (pages.length === 0) throw new Error("bundle_invalid: no navigable pages");
 
-  return raw as unknown as LabBundle;
+  return {
+    apiVersion: "v1alpha1",
+    kind: "LabBundle",
+    manifest: validateManifest(raw["manifest"]),
+    pages,
+    runtimeContext: {
+      catalogRef: runtimeContext["catalogRef"],
+      branch: runtimeContext["branch"],
+      helmChartAvailable: runtimeContext["helmChartAvailable"],
+    },
+  };
 }
