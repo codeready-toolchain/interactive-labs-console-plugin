@@ -13,7 +13,8 @@ import (
 func TestSetupHandler_RejectsMissingAuthorization(t *testing.T) {
 	rw := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
-	newSetupRouter(t).ServeHTTP(rw, req)
+	router, _ := newSetupRouter(t)
+	router.ServeHTTP(rw, req)
 
 	require.Equal(t, http.StatusUnauthorized, rw.Code)
 	var body map[string]string

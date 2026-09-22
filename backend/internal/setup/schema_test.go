@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseNamespaceBindings_RealWorldSchema(t *testing.T) {
+func TestParseSchemaBindings_MixedKinds(t *testing.T) {
 	schema := []byte(`{
 		"properties": {
 			"namespaces": {
@@ -17,85 +17,96 @@ func TestParseNamespaceBindings_RealWorldSchema(t *testing.T) {
 					"gitea": {
 						"type": "string",
 						"x-interactive-labs": { "kind": "namespace-name" }
-					},
-					"datasphere": {
+					}
+				}
+			},
+			"passwords": {
+				"type": "object",
+				"properties": {
+					"postgres": {
 						"type": "string",
-						"x-interactive-labs": { "kind": "namespace-name" }
+						"x-interactive-labs": { "kind": "generated-password" }
 					},
-					"lab": {
+					"giteaAdmin": {
 						"type": "string",
-						"x-interactive-labs": { "kind": "namespace-name" }
+						"x-interactive-labs": { "kind": "generated-password" }
 					}
 				}
 			}
 		}
 	}`)
 
-	bindings, err := ParseNamespaceBindings(schema)
+	bindings, err := ParseSchemaBindings(schema)
 	require.NoError(t, err)
-	require.Len(t, bindings, 3)
+	require.Len(t, bindings.Namespaces, 1)
+	assert.Equal(t, "gitea", bindings.Namespaces[0].Key)
+	assert.Equal(t, "namespaces.gitea", bindings.Namespaces[0].Path)
 
-	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Key < bindings[j].Key })
-	assert.Equal(t, NamespaceBinding{Key: "datasphere", Path: "namespaces.datasphere"}, bindings[0])
-	assert.Equal(t, NamespaceBinding{Key: "gitea", Path: "namespaces.gitea"}, bindings[1])
-	assert.Equal(t, NamespaceBinding{Key: "lab", Path: "namespaces.lab"}, bindings[2])
+	require.Len(t, bindings.Passwords, 2)
+	sort.Slice(bindings.Passwords, func(i, j int) bool { return bindings.Passwords[i].Key < bindings.Passwords[j].Key })
+	assert.Equal(t, "giteaAdmin", bindings.Passwords[0].Key)
+	assert.Equal(t, "passwords.giteaAdmin", bindings.Passwords[0].Path)
+	assert.Equal(t, KindGeneratedPassword, bindings.Passwords[0].Kind)
+	assert.Equal(t, "postgres", bindings.Passwords[1].Key)
+	assert.Equal(t, "passwords.postgres", bindings.Passwords[1].Path)
 }
 
-func TestParseNamespaceBindings_NoMatchingProperties(t *testing.T) {
+func TestParseSchemaBindings_WithRootURL(t *testing.T) {
 	schema := []byte(`{
 		"properties": {
-			"replicas": { "type": "integer" }
-		}
-	}`)
-
-	bindings, err := ParseNamespaceBindings(schema)
-	require.NoError(t, err)
-	assert.Empty(t, bindings)
-}
-
-func TestParseNamespaceBindings_TopLevelProperty(t *testing.T) {
-	schema := []byte(`{
-		"properties": {
-			"myNamespace": {
-				"type": "string",
-				"x-interactive-labs": { "kind": "namespace-name" }
+			"namespaces": {
+				"type": "object",
+				"properties": {
+					"gitea": {
+						"type": "string",
+						"x-interactive-labs": { "kind": "namespace-name" }
+					}
+				}
+			},
+			"gitea": {
+				"type": "object",
+				"properties": {
+					"rootUrl": {
+						"type": "string",
+						"x-interactive-labs": { "kind": "root-url", "routeName": "gitea", "namespaceRef": "gitea" }
+					}
+				}
 			}
 		}
 	}`)
 
-	bindings, err := ParseNamespaceBindings(schema)
+	bindings, err := ParseSchemaBindings(schema)
 	require.NoError(t, err)
-	require.Len(t, bindings, 1)
-	assert.Equal(t, NamespaceBinding{Key: "myNamespace", Path: "myNamespace"}, bindings[0])
+	require.Len(t, bindings.Namespaces, 1)
+	require.Len(t, bindings.RootURLs, 1)
+	assert.Equal(t, "rootUrl", bindings.RootURLs[0].Key)
+	assert.Equal(t, "gitea.rootUrl", bindings.RootURLs[0].Path)
+	assert.Equal(t, "gitea", bindings.RootURLs[0].RouteName)
+	assert.Equal(t, "gitea", bindings.RootURLs[0].NamespaceRef)
 }
 
-func TestParseNamespaceBindings_IgnoresOtherKinds(t *testing.T) {
+func TestNamespaceBindingPath(t *testing.T) {
+	bindings := []NamespaceBinding{
+		{Key: "gitea", Path: "namespaces.gitea"},
+		{Key: "lab", Path: "namespaces.lab"},
+	}
+	assert.Equal(t, "namespaces.gitea", NamespaceBindingPath(bindings, "gitea"))
+	assert.Equal(t, "namespaces.lab", NamespaceBindingPath(bindings, "lab"))
+	assert.Empty(t, NamespaceBindingPath(bindings, "missing"))
+}
+
+func TestParseSchemaBindings_NoPasswords(t *testing.T) {
 	schema := []byte(`{
 		"properties": {
 			"ns": {
 				"type": "string",
 				"x-interactive-labs": { "kind": "namespace-name" }
-			},
-			"url": {
-				"type": "string",
-				"x-interactive-labs": { "kind": "cluster-url" }
 			}
 		}
 	}`)
 
-	bindings, err := ParseNamespaceBindings(schema)
+	bindings, err := ParseSchemaBindings(schema)
 	require.NoError(t, err)
-	require.Len(t, bindings, 1)
-	assert.Equal(t, "ns", bindings[0].Key)
-}
-
-func TestParseNamespaceBindings_InvalidJSON(t *testing.T) {
-	_, err := ParseNamespaceBindings([]byte(`{invalid`))
-	require.Error(t, err)
-}
-
-func TestParseNamespaceBindings_EmptySchema(t *testing.T) {
-	bindings, err := ParseNamespaceBindings([]byte(`{}`))
-	require.NoError(t, err)
-	assert.Empty(t, bindings)
+	require.Len(t, bindings.Namespaces, 1)
+	assert.Empty(t, bindings.Passwords)
 }

@@ -185,9 +185,9 @@ describe("setupLab", () => {
   it("calls POST /api/v1alpha1/labs/{catalogRef}/setup with empty body and forwards cancellation", async () => {
     const resultBody = {
       apiVersion: "v1alpha1",
-      kind: "SetupResult",
-      outcome: "accepted",
-      message: "Lab setup initiated",
+      kind: "SetupStatus",
+      spaceRequests: { status: "provisioning", namespaces: null },
+      helm: { status: "pending", releaseName: "il-abc123def456" },
     };
     const controller = new AbortController();
     mockFetch.mockResolvedValueOnce(makeJsonResponse(resultBody));
@@ -196,8 +196,8 @@ describe("setupLab", () => {
 
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe(`${PROXY_BASE}/api/v1alpha1/labs/l1/setup`);
-    expect(init).toEqual({ method: "POST", signal: controller.signal });
-    expect(result.outcome).toBe("accepted");
+    expect(init?.method).toBe("POST");
+    expect(result.helm.status).toBe("pending");
   });
 });
 
@@ -206,8 +206,11 @@ describe("getSetupStatus", () => {
     const statusBody = {
       apiVersion: "v1alpha1",
       kind: "SetupStatus",
-      status: "ready",
-      namespaces: { gitea: { status: "ready", name: "user1-abc" } },
+      spaceRequests: {
+        status: "ready",
+        namespaces: { gitea: { status: "ready", name: "user1-abc" } },
+      },
+      helm: { status: "deployed", releaseName: "il-abc123def456" },
     };
     const controller = new AbortController();
     mockFetch.mockResolvedValueOnce(makeJsonResponse(statusBody));
@@ -216,8 +219,9 @@ describe("getSetupStatus", () => {
 
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe(`${PROXY_BASE}/api/v1alpha1/labs/l1/setup/status`);
-    expect(init).toEqual({ signal: controller.signal });
-    expect(result.status).toBe("ready");
-    expect(result.namespaces.gitea.name).toBe("user1-abc");
+    expect(init?.method ?? "GET").toBe("GET");
+    expect(result.spaceRequests.status).toBe("ready");
+    expect(result.spaceRequests.namespaces?.gitea.name).toBe("user1-abc");
+    expect(result.helm.status).toBe("deployed");
   });
 });

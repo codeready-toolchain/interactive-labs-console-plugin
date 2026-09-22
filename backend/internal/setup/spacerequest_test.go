@@ -137,6 +137,25 @@ func TestSpaceRequestResult_IsReady(t *testing.T) {
 	}
 }
 
+func TestSpaceRequestResult_ReadyConditionReason(t *testing.T) {
+	tests := []struct {
+		name       string
+		conditions []SpaceRequestCondition
+		expected   string
+	}{
+		{"has reason", []SpaceRequestCondition{{Type: "Ready", Status: "False", Reason: "Provisioning"}}, "Provisioning"},
+		{"ready with no reason", []SpaceRequestCondition{{Type: "Ready", Status: "True"}}, ""},
+		{"no conditions", nil, ""},
+		{"other condition only", []SpaceRequestCondition{{Type: "Approved", Status: "True", Reason: "Auto"}}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &SpaceRequestResult{Conditions: tt.conditions}
+			assert.Equal(t, tt.expected, r.ReadyConditionReason())
+		})
+	}
+}
+
 func TestSpaceRequestResult_IsFailed(t *testing.T) {
 	tests := []struct {
 		name       string

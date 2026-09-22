@@ -72,27 +72,31 @@ describe("LabBundle shape", () => {
 });
 
 describe("SetupResult shape", () => {
-  it("has outcome union", () => {
+  it("has spaceRequests and helm status", () => {
     const r: SetupResult = {
       apiVersion: "v1alpha1",
-      kind: "SetupResult",
-      outcome: "accepted",
-      message: "Lab setup initiated",
+      kind: "SetupStatus",
+      spaceRequests: { status: "provisioning", namespaces: null },
+      helm: { status: "pending", releaseName: "il-abc123" },
     };
-    expect(r.outcome).toBe("accepted");
+    expect(r.helm.status).toBe("pending");
   });
 });
 
 describe("SetupStatus shape", () => {
-  it("has status and namespaces", () => {
+  it("has spaceRequests and helm status", () => {
     const s: SetupStatus = {
       apiVersion: "v1alpha1",
       kind: "SetupStatus",
-      status: "ready",
-      namespaces: { gitea: { status: "ready", name: "user1-abc" } },
+      spaceRequests: {
+        status: "ready",
+        namespaces: { gitea: { status: "ready", name: "user1-abc" } },
+      },
+      helm: { status: "deployed", releaseName: "il-abc123" },
     };
-    expect(s.status).toBe("ready");
-    expect(s.namespaces.gitea.name).toBe("user1-abc");
+    expect(s.spaceRequests.status).toBe("ready");
+    expect(s.spaceRequests.namespaces?.gitea.name).toBe("user1-abc");
+    expect(s.helm.status).toBe("deployed");
   });
 });
 
