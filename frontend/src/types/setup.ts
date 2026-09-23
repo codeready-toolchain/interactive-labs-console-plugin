@@ -27,4 +27,5 @@ export interface SetupStatus {
   kind: "SetupStatus";
   spaceRequests: SpaceRequestsStatus;
   helm: HelmStatus;
+  attributes?: Record<string, string>;
 }

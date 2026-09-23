@@ -490,7 +490,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		if err == nil && status == "deployed" {
 			writeJSON(w, http.StatusOK, buildSetupStatusResponse(
 				"ready", nil, // SpaceRequests assumed ready if Helm is deployed
-				"deployed", releaseName, "", nil,
+				"deployed", releaseName, "", nil, nil,
 			))
 			return
 		}
@@ -517,7 +517,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 
 	writeJSON(w, http.StatusAccepted, buildSetupStatusResponse(
 		"provisioning", nil,
-		"pending", releaseName, "", nil,
+		"pending", releaseName, "", nil, nil,
 	))
 }
 
@@ -725,10 +725,33 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, buildSetupStatusResponse(srStatus, namespaces, helmStatus, releaseName, helmMessage, generatedValues))
+	var attributes map[string]string
+	if allReady && helmStatus == "deployed" {
+		attributes = make(map[string]string, len(sctx.bindings.Namespaces)+len(sctx.bindings.Passwords)+len(sctx.bindings.RootURLs))
+		for _, b := range sctx.bindings.Namespaces {
+			attributes[strings.ReplaceAll(b.Key, ".", "-")] = namespaces[b.Key].Name
+		}
+		for _, b := range sctx.bindings.Passwords {
+			if v, ok := generatedValues[b.Path]; ok {
+				attributes[strings.ReplaceAll(b.Key, ".", "-")] = v
+			}
+		}
+		for _, b := range sctx.bindings.RootURLs {
+			if cfg.ClusterIngressDomain == "" {
+				continue
+			}
+			ns, ok := namespaces[b.NamespaceRef]
+			if !ok {
+				continue
+			}
+			attributes[strings.ReplaceAll(b.Key, ".", "-")] = fmt.Sprintf("%s-%s.%s", b.RouteName, ns.Name, cfg.ClusterIngressDomain)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, buildSetupStatusResponse(srStatus, namespaces, helmStatus, releaseName, helmMessage, generatedValues, attributes))
 }
 
-func buildSetupStatusResponse(srStatus string, namespaces any, helmStatus, releaseName, helmMessage string, generatedValues map[string]string) map[string]any {
+func buildSetupStatusResponse(srStatus string, namespaces any, helmStatus, releaseName, helmMessage string, generatedValues, attributes map[string]string) map[string]any {
 	helm := map[string]any{
 		"status":      helmStatus,
 		"releaseName": releaseName,
@@ -739,7 +762,7 @@ func buildSetupStatusResponse(srStatus string, namespaces any, helmStatus, relea
 	if len(generatedValues) > 0 {
 		helm["generatedValues"] = generatedValues
 	}
-	return map[string]any{
+	resp := map[string]any{
 		"apiVersion": "v1alpha1",
 		"kind":       "SetupStatus",
 		"spaceRequests": map[string]any{
@@ -748,6 +771,10 @@ func buildSetupStatusResponse(srStatus string, namespaces any, helmStatus, relea
 		},
 		"helm": helm,
 	}
+	if len(attributes) > 0 {
+		resp["attributes"] = attributes
+	}
+	return resp
 }
 
 func omittedLabReason(err error) string {
