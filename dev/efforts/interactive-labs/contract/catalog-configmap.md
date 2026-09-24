@@ -1,13 +1,14 @@
 # Catalog ConfigMap Contract
 
-**ConfigMap name:** `interactive-labs-catalog`  
+**ConfigMap name:** `interactive-labs-catalog`
+
 **Namespace:** `interactive-labs-console-plugin`
 
 The ConfigMap must contain a single key `catalog.yaml` whose value is a top-level YAML sequence. Each item supplies one approved lab source locator. The declared sequence order is the order returned by the `CatalogList` API for successfully resolved labs.
 
 ## Derived `catalogRef`
 
-Each entry has no explicit `id` field. The backend derives an opaque, URL-safe `catalogRef` from the stable identity fields: `repository`, `branch`, `labPath`, and `attributeOverrides`. The ref is the SHA-256 hex digest of canonical JSON over those four fields. Legacy display fields (`displayName`, `description`) and request-runtime attributes are ignored and excluded from the hash.
+Each entry has no explicit `id` field. The backend derives an opaque, URL-safe `catalogRef` from the stable identity fields: `repository`, `branch`, `labPath`, and `attributeOverrides`. The ref is the SHA-256 hex digest of canonical JSON over those four fields. Legacy ConfigMap display fields (`displayName`, `description`), manifest title/description, and request-runtime attributes are excluded from the hash.
 
 `catalogRef` is returned in `CatalogList` items and in `runtimeContext.catalogRef` of `LabBundle`. It is used as the `{catalogRef}` path segment in lab API URLs.
 
@@ -55,7 +56,8 @@ data:
 - Empty or whitespace-only `catalog.yaml` value → empty catalog (same as `[]`)
 - Invalid YAML → `configuration_error`
 - Missing or empty `repository`, `branch`, or `labPath` → `configuration_error`
-- Repository must be a plain HTTPS URL; branch and `labPath` must be safe. Unsafe source locators → `configuration_error` for the whole catalog.
+- Repository must be a plain HTTPS URL; branch and `labPath` must be safe. `labPath` rejects backslashes, control characters, and literal percent-escape sequences (`%xx`), but permits `#` and `?` as filesystem characters. Unsafe source locators → `configuration_error` for the whole catalog.
 - Two entries with identical `repository`, `branch`, `labPath`, and `attributeOverrides` → `configuration_error` (duplicate `catalogRef`)
-- For each safely configured lab, backend reads validated `lab.yaml` metadata for catalog `displayName` and optional `description`. An unavailable repository, missing manifest, or invalid lab omits only that entry.
+- For each safely configured lab, backend reads validated `lab.yaml` `metadata.title` for catalog `title` and optional `metadata.description` for catalog `description`. ConfigMap display fields are ignored. An unavailable repository, missing manifest, or invalid lab omits only that entry.
+- Valid labs require modules with navigable pages; root `content/` may coexist with valid modules, but flat labs without required modules remain invalid even though `apiVersion` remains `v1alpha1`. Convert before rollout. Old cached snapshots are not auto-refreshed and are safely omitted until cache is replaced or lost. See [lab content contract](../../../docs/lab-content-contract.md).
 - ConfigMap size limit: 1 MiB (Kubernetes default)

@@ -8,17 +8,17 @@ import type { PersistedSession } from "../session";
 import type { LabError, LabErrorType } from "../errors";
 
 describe("CatalogEntry shape", () => {
-  it("requires catalogRef and displayName; description is optional", () => {
-    const e: CatalogEntry = { catalogRef: "x", displayName: "X", labPath: "lab" };
+  it("requires catalogRef and title; description is optional", () => {
+    const e: CatalogEntry = { catalogRef: "x", title: "X", labPath: "lab" };
     expect(e.catalogRef).toBe("x");
-    const withDesc: CatalogEntry = { catalogRef: "y", displayName: "Y", description: "d", labPath: "lab" };
+    const withDesc: CatalogEntry = { catalogRef: "y", title: "Y", description: "d", labPath: "lab" };
     expect(withDesc.description).toBe("d");
   });
 });
 
 describe("CatalogList shape", () => {
   it("has correct apiVersion and kind literals", () => {
-    const entry: CatalogEntry = { catalogRef: "a", displayName: "A", labPath: "lab" };
+    const entry: CatalogEntry = { catalogRef: "a", title: "A", labPath: "lab" };
     const list: CatalogList = { apiVersion: "v1alpha1", kind: "CatalogList", items: [entry] };
     expect(list.kind).toBe("CatalogList");
     expect(list.apiVersion).toBe("v1alpha1");
@@ -30,41 +30,36 @@ describe("LabManifest shape", () => {
     const m: LabManifest = {
       apiVersion: "v1alpha1",
       kind: "Lab",
-      metadata: { name: "lab1", displayName: "Lab 1" },
+      metadata: { title: "Lab 1" },
       spec: {},
     };
     expect(m.kind).toBe("Lab");
   });
 
-  it("supports optional checkpoints of type manual only", () => {
+  it("supports optional description and runtime attributes", () => {
     const m: LabManifest = {
-      apiVersion: "v1alpha1",
-      kind: "Lab",
-      metadata: { name: "lab1", displayName: "Lab 1" },
-      spec: {
-        checkpoints: [
-          { id: "cp1", type: "manual", pagePath: "010-intro.adoc", label: "Done?" },
-        ],
-      },
+      apiVersion: "v1alpha1", kind: "Lab",
+      metadata: { title: "Lab 1", description: "Intro" },
+      spec: { attributes: { audience: "developer" } },
     };
-    expect(m.spec.checkpoints?.[0].type).toBe("manual");
+    expect(m.spec?.attributes?.audience).toBe("developer");
   });
 });
 
 describe("LabBundle shape", () => {
-  it("has manifest, page descriptors, and runtimeContext", () => {
+  it("has manifest, grouped page descriptors, and runtimeContext", () => {
     const ctx: RuntimeContext = { catalogRef: "l1", branch: "main", helmChartAvailable: false };
     const manifest: LabManifest = {
       apiVersion: "v1alpha1",
       kind: "Lab",
-      metadata: { name: "l1", displayName: "L" },
+      metadata: { title: "L" },
       spec: {},
     };
     const bundle: LabBundle = {
       apiVersion: "v1alpha1",
       kind: "LabBundle",
       manifest,
-      pages: [{ path: "010-intro.adoc", url: "/api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/labs/l1/resources/lab/content/010-intro.adoc" }],
+      modules: [{ id: "010-intro", pages: [{ path: "modules/010-intro/content/010-intro.adoc", url: "/api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/labs/l1/resources/lab/modules/010-intro/content/010-intro.adoc" }] }],
       runtimeContext: ctx,
     };
     expect(bundle.kind).toBe("LabBundle");

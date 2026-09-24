@@ -3,6 +3,7 @@
  * Tests use React 17 react-dom/test-utils; no Testing Library.
  */
 
+import { readFileSync } from 'node:fs';
 import * as React from 'react';
 import * as ReactDOM from 'react-dom';
 import { act } from 'react-dom/test-utils';
@@ -11,10 +12,10 @@ import type { CatalogList } from './types/catalog';
 import type { LabError } from './types/errors';
 import type { LabBundle } from './types/manifest';
 import * as client from './api/client';
-import { renderAsciiDoc } from './renderer';
+import { extractAsciiDocTitle, renderAsciiDoc } from './renderer';
 
 jest.mock('./api/client');
-jest.mock('./renderer', () => ({ renderAsciiDoc: jest.fn() }));
+jest.mock('./renderer', () => ({ renderAsciiDoc: jest.fn(), extractAsciiDocTitle: jest.fn() }));
 const mockNavigate = jest.fn();
 let mockLocation = { pathname: '/interactive-labs', search: '' };
 jest.mock('react-router-dom-v5-compat', () => ({
@@ -26,11 +27,9 @@ const mockListCatalog = client.listCatalog as jest.MockedFunction<typeof client.
 const mockLoadLabBundle = client.loadLabBundle as jest.MockedFunction<typeof client.loadLabBundle>;
 const mockSetupLab = client.setupLab as jest.MockedFunction<typeof client.setupLab>;
 const mockGetSetupStatus = client.getSetupStatus as jest.MockedFunction<typeof client.getSetupStatus>;
-const mockGetNavigablePagePaths = client.getNavigablePagePaths as jest.MockedFunction<
-  typeof client.getNavigablePagePaths
->;
 const mockFetchResourceText = client.fetchResourceText as jest.MockedFunction<typeof client.fetchResourceText>;
 const mockRenderAsciiDoc = renderAsciiDoc as jest.MockedFunction<typeof renderAsciiDoc>;
+const mockExtractAsciiDocTitle = extractAsciiDocTitle as jest.MockedFunction<typeof extractAsciiDocTitle>;
 
 const SESSION_PREFIX = 'interactive-labs-console-plugin:session:';
 
@@ -43,17 +42,12 @@ beforeEach(() => {
   mockLoadLabBundle.mockReset();
   mockSetupLab.mockReset();
   mockGetSetupStatus.mockReset();
-  mockGetNavigablePagePaths.mockReset();
-  mockGetNavigablePagePaths.mockImplementation((pages) =>
-    pages
-      .map((page) => page.path)
-      .filter((pagePath) => pagePath.split('/').every((segment) => !segment.startsWith('_')))
-      .sort(),
-  );
   mockFetchResourceText.mockReset();
   mockFetchResourceText.mockResolvedValue('= Page');
   mockRenderAsciiDoc.mockReset();
   mockRenderAsciiDoc.mockImplementation(() => new Promise<never>(() => {}));
+  mockExtractAsciiDocTitle.mockReset();
+  mockExtractAsciiDocTitle.mockResolvedValue(undefined);
   mockNavigate.mockReset();
   mockLocation = { pathname: '/interactive-labs', search: '' };
   localStorage.clear();
@@ -71,8 +65,8 @@ const sampleCatalog: CatalogList = {
   apiVersion: 'v1alpha1',
   kind: 'CatalogList',
   items: [
-    { catalogRef: 'lab-1', displayName: 'Lab One', description: 'First lab description', labPath: 'labs/one' },
-    { catalogRef: 'lab-2', displayName: 'Lab Two', labPath: 'labs/two' },
+    { catalogRef: 'lab-1', title: 'Lab One', description: 'First lab description', labPath: 'labs/one' },
+    { catalogRef: 'lab-2', title: 'Lab Two', labPath: 'labs/two' },
   ],
 };
 
@@ -89,14 +83,13 @@ const noChartBundle: LabBundle = {
   manifest: {
     apiVersion: 'v1alpha1',
     kind: 'Lab',
-    metadata: { name: 'lab-one', displayName: 'Lab One' },
+    metadata: { title: 'Lab One' },
     spec: {},
   },
-  pages: [
-    { path: 'pages/z-last.adoc', url: 'api/v1alpha1/labs/lab-1/resources/labs/one/content/pages/z-last.adoc' },
-    { path: '_partials/shared.adoc', url: 'api/v1alpha1/labs/lab-1/resources/labs/one/content/_partials/shared.adoc' },
-    { path: 'pages/a-first.adoc', url: 'api/v1alpha1/labs/lab-1/resources/labs/one/content/pages/a-first.adoc' },
-  ],
+  modules: [{ id: '010-intro', pages: [
+    { path: 'modules/010-intro/content/pages/a-first.adoc', url: '/api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/labs/lab-1/resources/labs/one/modules/010-intro/content/pages/a-first.adoc' },
+    { path: 'modules/010-intro/content/pages/z-last.adoc', url: '/api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/labs/lab-1/resources/labs/one/modules/010-intro/content/pages/z-last.adoc' },
+  ] }],
   runtimeContext: { catalogRef: 'lab-1', branch: 'main', helmChartAvailable: false },
 };
 
@@ -105,12 +98,18 @@ const chartBundle: LabBundle = {
   runtimeContext: { ...noChartBundle.runtimeContext, helmChartAvailable: true },
 };
 
-const proxyNoChartBundle: LabBundle = {
+const proxyNoChartBundle: LabBundle = noChartBundle;
+const firstPage = noChartBundle.modules[0].pages[0];
+const lastPage = noChartBundle.modules[0].pages[1];
+const multiModuleBundle: LabBundle = {
   ...noChartBundle,
-  pages: noChartBundle.pages.map((page) => ({
-    ...page,
-    url: `/api/proxy/plugin/interactive-labs-console-plugin/backend/${page.url}`,
-  })),
+  modules: [
+    noChartBundle.modules[0],
+    { id: '020-apply', pages: [
+      { path: 'modules/020-apply/content/010-do.adoc', url: '/api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/labs/lab-1/resources/labs/one/modules/020-apply/content/010-do.adoc' },
+      { path: 'modules/020-apply/content/020-done.adoc', url: '/api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/labs/lab-1/resources/labs/one/modules/020-apply/content/020-done.adoc' },
+    ] },
+  ],
 };
 
 const sessionKey = (catalogRef: string) => `${SESSION_PREFIX}${catalogRef}`;
@@ -123,6 +122,15 @@ const getButton = (name: RegExp): HTMLButtonElement => {
   return button;
 };
 
+const moduleToggle = (): HTMLButtonElement => {
+  const toggle = container.querySelector<HTMLButtonElement>('button[aria-label^="Module: "]');
+  if (!toggle) throw new Error('Missing Module toggle');
+  return toggle;
+};
+
+const moduleOptions = (): HTMLButtonElement[] =>
+  Array.from(document.querySelectorAll<HTMLButtonElement>('[role="listbox"] [role="option"]'));
+
 const deferred = <T,>() => {
   let resolve!: (value: T) => void;
   let reject!: (error: unknown) => void;
@@ -133,8 +141,8 @@ const deferred = <T,>() => {
   return { promise, resolve, reject };
 };
 
-const renderCatalog = async () => {
-  mockListCatalog.mockResolvedValue(sampleCatalog);
+const renderCatalog = async (catalog: CatalogList = sampleCatalog) => {
+  mockListCatalog.mockResolvedValue(catalog);
   await act(async () => {
     ReactDOM.render(
       <InteractiveLabsProvider>
@@ -193,7 +201,7 @@ describe('InteractiveLabsPage', () => {
     await act(async () => { resolveList(emptyCatalog); });
   });
 
-  test('shows every displayName and description after successful response', async () => {
+  test('shows every title and description after successful response', async () => {
     mockListCatalog.mockResolvedValue(sampleCatalog);
     mockRenderAsciiDoc.mockResolvedValue({ html: '<p>First lab description</p>', warnings: [] });
 
@@ -203,8 +211,130 @@ describe('InteractiveLabsPage', () => {
 
     expect(container.textContent).toContain('Lab One');
     expect(container.textContent).toContain('First lab description');
+    expect(container.querySelector('button[aria-label="Toggle description for Lab One"]')).toBeNull();
     expect(container.textContent).toContain('Lab Two');
     expect(container.querySelector('[role="progressbar"]')).toBeNull();
+  });
+
+  test('shows first rendered paragraph, then reveals remaining description without duplication', async () => {
+    mockRenderAsciiDoc.mockResolvedValue({
+      html: '<div class="paragraph"><p>First <strong>intro</strong> paragraph.</p></div>' +
+        '<div class="paragraph"><p>Additional details.</p></div>',
+      warnings: ['Unsafe include was omitted.'],
+    });
+    await renderCatalog();
+
+    const toggle = getButton(/Toggle description for Lab One/);
+    const titleRow = toggle.closest('.pf-v6-c-data-list__item-row')!;
+    const preview = container.querySelector('.catalog-description')!;
+    const remaining = container.querySelectorAll('.catalog-description')[1]!;
+    expect(titleRow.querySelector('strong')?.textContent).toBe('Lab One');
+    expect(titleRow.querySelector('button')?.getAttribute('aria-label')).toBe('Toggle description for Lab One');
+    expect(titleRow.querySelectorAll('button')).toHaveLength(2);
+    expect(titleRow.contains(preview)).toBe(true);
+    expect(remaining.closest('.pf-v6-c-data-list__expandable-content')?.id).toBe(toggle.getAttribute('aria-controls'));
+    expect(container.textContent).not.toContain('Show more');
+    expect(preview.textContent).toContain('First intro paragraph.');
+    expect(preview.querySelector('p strong')?.textContent).toBe('intro');
+    expect(remaining.closest('[hidden]')).not.toBeNull();
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(container.textContent).toContain('Unsafe include was omitted.');
+    await act(async () => { toggle.click(); });
+    expect(remaining.closest('[hidden]')).toBeNull();
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(remaining.textContent).toContain('Additional details.');
+    expect(container.querySelectorAll('.catalog-description p')).toHaveLength(2);
+    await act(async () => { toggle.click(); });
+    expect(remaining.closest('[hidden]')).not.toBeNull();
+    expect(mockRenderAsciiDoc).toHaveBeenCalledTimes(1);
+  });
+
+  test('shows a single rendered paragraph in the row without an empty description toggle', async () => {
+    mockRenderAsciiDoc.mockResolvedValue({
+      html: '<div class="paragraph"><p>Only description.</p></div>',
+      warnings: [],
+    });
+    await renderCatalog({ ...sampleCatalog, items: [sampleCatalog.items[0]] });
+
+    const preview = container.querySelector('.catalog-description')!;
+    expect(preview.textContent).toContain('Only description.');
+    expect(preview.closest('.pf-v6-c-data-list__item-row')).not.toBeNull();
+    expect(container.querySelector('button[aria-label="Toggle description for Lab One"]')).toBeNull();
+  });
+
+  test('does not leave an empty toggle after extracting a nested sole paragraph', async () => {
+    mockRenderAsciiDoc.mockResolvedValue({
+      html: '<div id="preamble"><div class="sectionbody"><div class="paragraph"><p>Nested intro.</p></div></div></div>',
+      warnings: [],
+    });
+    await renderCatalog();
+    expect(container.querySelector('.catalog-description')?.textContent).toContain('Nested intro.');
+    expect(container.querySelector('button[aria-label="Toggle description for Lab One"]')).toBeNull();
+  });
+
+  test('keeps descriptions without paragraphs behind an expansion toggle', async () => {
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<div class="imageblock">Image only</div>', warnings: [] });
+    await renderCatalog();
+    const toggle = getButton(/Toggle description for Lab One/);
+    const description = container.querySelector('.catalog-description')!;
+    expect(description.closest('[hidden]')).not.toBeNull();
+    await act(async () => { toggle.click(); });
+    expect(description.closest('[hidden]')).toBeNull();
+    expect(description.textContent).toContain('Image only');
+  });
+
+  test('expands only the selected lab in a list of labs', async () => {
+    const labs = { ...sampleCatalog, items: [sampleCatalog.items[0], { ...sampleCatalog.items[1], description: 'Second lab description' }] };
+    mockRenderAsciiDoc.mockImplementation(({ source }) => Promise.resolve({ html: `<p>${source} intro</p><p>${source} details</p>`, warnings: [] }));
+    await renderCatalog(labs);
+    const first = getButton(/Toggle description for Lab One/);
+    const second = getButton(/Toggle description for Lab Two/);
+    expect(first.closest('.pf-v6-c-data-list__item-row')?.textContent).toContain('Lab One');
+    expect(second.closest('.pf-v6-c-data-list__item-row')?.textContent).toContain('Lab Two');
+    await act(async () => { second.click(); });
+    expect(first.getAttribute('aria-expanded')).toBe('false');
+    expect(second.getAttribute('aria-expanded')).toBe('true');
+    expect(container.querySelector(`#${first.getAttribute('aria-controls')}`)?.hasAttribute('hidden')).toBe(true);
+    expect(container.querySelector(`#${second.getAttribute('aria-controls')}`)?.hasAttribute('hidden')).toBe(false);
+  });
+
+  test('handles links from collapsed preview and expanded description', async () => {
+    mockRenderAsciiDoc.mockResolvedValue({
+      html: '<div class="paragraph"><p><a href="https://docs.example.test/intro">Intro</a></p></div>' +
+        '<div class="paragraph"><p><a href="https://docs.example.test/details">Details</a></p></div>',
+      warnings: [],
+    });
+    const open = jest.spyOn(window, 'open').mockImplementation(() => null);
+    try {
+      await renderCatalog();
+      const click = async (text: string) => {
+        const link = Array.from(container.querySelectorAll('a')).find((anchor) => anchor.textContent === text)!;
+        const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+        await act(async () => { link.dispatchEvent(event); });
+        expect(event.defaultPrevented).toBe(true);
+      };
+      await click('Intro');
+      await act(async () => { getButton(/Toggle description for Lab One/).click(); });
+      await click('Details');
+      expect(open).toHaveBeenNthCalledWith(1, 'https://docs.example.test/intro', '_blank', 'noopener,noreferrer');
+      expect(open).toHaveBeenNthCalledWith(2, 'https://docs.example.test/details', '_blank', 'noopener,noreferrer');
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  test('shows renderer warnings even when only one paragraph needs no toggle', async () => {
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Visible intro.</p>', warnings: ['Unsafe include was omitted.'] });
+    await renderCatalog();
+    expect(container.textContent).toContain('Visible intro.');
+    expect(container.textContent).toContain('Unsafe include was omitted.');
+    expect(container.querySelector('button[aria-label="Toggle description for Lab One"]')).toBeNull();
+  });
+
+  test('shows description render errors without expansion', async () => {
+    mockRenderAsciiDoc.mockRejectedValue(new Error('Description unavailable'));
+    await renderCatalog();
+    expect(container.textContent).toContain('Description unavailable');
   });
 
   test('always shows catalog descriptions', async () => {
@@ -271,10 +401,10 @@ describe('InteractiveLabsPage', () => {
     await act(async () => { launch.click(); });
 
     expect(mockLoadLabBundle).toHaveBeenCalledTimes(1);
-    expect(mockLoadLabBundle).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
+    expect(mockLoadLabBundle).toHaveBeenCalledWith('lab-1', 'labs/one', expect.any(AbortSignal));
   });
 
-  test('opens no-chart lab at lexical first navigable page without setup', async () => {
+  test('opens no-chart lab at first validated page without setup', async () => {
     mockLoadLabBundle.mockResolvedValue(noChartBundle);
     await renderCatalog();
 
@@ -297,12 +427,12 @@ describe('InteractiveLabsPage', () => {
     expect(container.querySelector('button[aria-label="Close lab"]')).toBeNull();
   });
 
-  test('shows validated manifest displayName in drawer', async () => {
+  test('shows validated manifest title in drawer', async () => {
     mockLoadLabBundle.mockResolvedValue({
       ...noChartBundle,
       manifest: {
         ...noChartBundle.manifest,
-        metadata: { ...noChartBundle.manifest.metadata, displayName: 'Validated bundle title' },
+        metadata: { ...noChartBundle.manifest.metadata, title: 'Validated bundle title' },
       },
     });
     await renderCatalog();
@@ -316,7 +446,7 @@ describe('InteractiveLabsPage', () => {
 
   test('opens chart-backed drawer and defers page rendering while setup is pending', async () => {
     const setup = deferred<Awaited<ReturnType<typeof client.setupLab>>>();
-    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockLoadLabBundle.mockResolvedValue({ ...chartBundle, modules: multiModuleBundle.modules });
     mockSetupLab.mockReturnValue(setup.promise);
     await renderCatalog();
 
@@ -324,16 +454,27 @@ describe('InteractiveLabsPage', () => {
     await act(async () => {});
 
     const drawer = container.querySelector('[class*="drawer__panel"]')!;
+    expect(drawer.querySelector('.pfext-lab-panel-content h2')?.textContent).toBe('Lab One');
     expect(drawer.textContent).toContain('Setting up your lab environment...');
     expect(drawer.querySelector('[aria-label="Setting up lab"]')).not.toBeNull();
-    expect(container.querySelector('.pfext-lab-footer')).toBeNull();
+    expect(drawer.querySelector('.pfext-lab-module-title')).toBeNull();
+    expect(drawer.querySelector('.pfext-lab-panel-content [aria-live="polite"]')).toBeNull();
+    expect(drawer.textContent).not.toMatch(/010-intro|020-apply|Page 1 of 2/);
+    expect(drawer.querySelector('.pfext-lab-footer')).not.toBeNull();
+    expect(getButton(/^Back$/).disabled).toBe(true);
+    expect(getButton(/^Next$/).disabled).toBe(true);
+    const toggle = drawer.querySelector<HTMLButtonElement>('.pfext-lab-module-toggle');
+    expect(toggle?.getAttribute('aria-label')).toBe('Module');
+    expect(toggle?.textContent?.trim()).toBe('Module');
+    expect(toggle?.disabled).toBe(true);
+    expect(moduleOptions()).toHaveLength(0);
     expect(mockFetchResourceText).not.toHaveBeenCalled();
     expect(mockSetupLab).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
   });
 
   test('renders chart-backed first page after setup becomes ready', async () => {
     const status = deferred<Awaited<ReturnType<typeof client.getSetupStatus>>>();
-    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockLoadLabBundle.mockResolvedValue({ ...chartBundle, modules: multiModuleBundle.modules });
     mockSetupLab.mockResolvedValue({
       apiVersion: 'v1alpha1',
       kind: 'SetupStatus',
@@ -347,6 +488,8 @@ describe('InteractiveLabsPage', () => {
     act(() => { getButton(/^Launch$/).click(); });
     await act(async () => {});
     expect(mockFetchResourceText).not.toHaveBeenCalled();
+    expect(getButton(/^Next$/).disabled).toBe(true);
+    expect(container.querySelector('.pfext-lab-module-title')).toBeNull();
 
     await act(async () => {
       status.resolve({
@@ -357,10 +500,15 @@ describe('InteractiveLabsPage', () => {
     });
 
     expect(mockGetSetupStatus).toHaveBeenCalledWith('lab-1');
-    expect(mockFetchResourceText).toHaveBeenCalledWith(chartBundle.pages[2].url, expect.any(AbortSignal));
+    expect(mockFetchResourceText).toHaveBeenCalledWith(firstPage.url, expect.any(AbortSignal));
     expect(container.textContent).toContain('Ready page');
+    expect(container.querySelector('.pfext-lab-module-title')?.textContent).toBe('010-intro');
+    expect(container.querySelector('.pfext-lab-panel-content [aria-live="polite"]')?.textContent).toBe('Page 1 of 2');
     expect(getButton(/^Back$/).disabled).toBe(true);
     expect(getButton(/^Next$/).disabled).toBe(false);
+    expect(moduleToggle().disabled).toBe(false);
+    await act(async () => { moduleToggle().click(); });
+    expect(moduleOptions().map((option) => option.textContent?.trim())).toEqual(['010-intro', '020-apply']);
   });
 
   test('removes setup poll abort listener after normal delay', async () => {
@@ -405,14 +553,26 @@ describe('InteractiveLabsPage', () => {
   });
 
   test('shows chart setup failure inside its open drawer', async () => {
-    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockLoadLabBundle.mockResolvedValue({ ...chartBundle, modules: multiModuleBundle.modules });
     mockSetupLab.mockRejectedValue(new Error('Cluster setup failed'));
     await renderCatalog();
 
     await act(async () => { getButton(/^Launch$/).click(); });
 
     const drawer = container.querySelector('[class*="drawer__panel"]')!;
+    expect(drawer.querySelector('.pfext-lab-panel-content h2')?.textContent).toBe('Lab One');
     expect(drawer.textContent).toContain('Cluster setup failed');
+    expect(drawer.querySelector('.pfext-lab-module-title')).toBeNull();
+    expect(drawer.querySelector('.pfext-lab-panel-content [aria-live="polite"]')).toBeNull();
+    expect(drawer.textContent).not.toMatch(/010-intro|020-apply|Page 1 of 2/);
+    expect(drawer.querySelector('.pfext-lab-footer')).not.toBeNull();
+    expect(getButton(/^Back$/).disabled).toBe(true);
+    expect(getButton(/^Next$/).disabled).toBe(true);
+    const toggle = drawer.querySelector<HTMLButtonElement>('.pfext-lab-module-toggle');
+    expect(toggle?.getAttribute('aria-label')).toBe('Module');
+    expect(toggle?.textContent?.trim()).toBe('Module');
+    expect(toggle?.disabled).toBe(true);
+    expect(moduleOptions()).toHaveLength(0);
     expect(mockFetchResourceText).not.toHaveBeenCalled();
   });
 
@@ -420,7 +580,7 @@ describe('InteractiveLabsPage', () => {
     const bundle = deferred<LabBundle>();
     let firstSignal!: AbortSignal;
     mockLoadLabBundle
-      .mockImplementationOnce((_catalogRef, signal) => {
+      .mockImplementationOnce((_catalogRef, _labPath, signal) => {
         firstSignal = signal!;
         return bundle.promise;
       })
@@ -428,7 +588,7 @@ describe('InteractiveLabsPage', () => {
         ...noChartBundle,
         manifest: {
           ...noChartBundle.manifest,
-          metadata: { ...noChartBundle.manifest.metadata, displayName: 'Lab Two' },
+          metadata: { ...noChartBundle.manifest.metadata, title: 'Lab Two' },
         },
       });
     await renderCatalog();
@@ -509,7 +669,7 @@ describe('InteractiveLabsPage', () => {
 
     await act(async () => { getButton(/^Launch$/).click(); });
 
-    const sourceURL = noChartBundle.pages[2].url;
+    const sourceURL = firstPage.url;
     expect(mockFetchResourceText).toHaveBeenCalledWith(sourceURL, expect.any(AbortSignal));
     const pageCall = mockRenderAsciiDoc.mock.calls.find(([input]) => input.sourceURL === sourceURL);
     expect(pageCall?.[0]).toEqual(expect.objectContaining({
@@ -526,6 +686,8 @@ describe('InteractiveLabsPage', () => {
     mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Sanitized description</p>', warnings: [] });
     await renderCatalog();
 
+    expect(container.querySelector('button[aria-label="Toggle description for Lab One"]')).toBeNull();
+    expect(container.querySelector('.catalog-description')?.textContent).toContain('Sanitized description');
     expect(mockRenderAsciiDoc).toHaveBeenCalledWith(expect.objectContaining({
       source: 'First lab description',
       sourceURL: '/api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/labs/lab-1/resources/labs/one/lab.yaml',
@@ -533,6 +695,46 @@ describe('InteractiveLabsPage', () => {
       loadResource: mockFetchResourceText,
     }));
     expect(container.innerHTML).toContain('Sanitized description');
+  });
+
+  test.each([
+    ['labs/lab#1', 'labs/lab%231'],
+    ['labs/lab?1', 'labs/lab%3F1'],
+    ['.', ''],
+  ])('keeps description resources and links inside labPath %s', async (labPath, encodedPath) => {
+    const prefix = `/api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/labs/lab-1/resources/${encodedPath ? `${encodedPath}/` : ''}`;
+    const bundle = {
+      ...noChartBundle,
+      modules: noChartBundle.modules.map((module) => ({
+        ...module,
+        pages: module.pages.map((page) => ({ ...page, url: page.url.replace('/resources/labs/one/', `/resources/${encodedPath ? `${encodedPath}/` : ''}`) })),
+      })),
+    };
+    mockLoadLabBundle.mockResolvedValue(bundle);
+    mockRenderAsciiDoc.mockResolvedValue({
+      html: '<a href="modules/010-intro/content/pages/z-last.adoc">Known</a>' +
+        '<a href="modules/010-intro/content/pages/missing.adoc">Unknown</a>' +
+        '<a href="../other/modules/010-intro/content/pages/z-last.adoc">Other lab</a>',
+      warnings: [],
+    });
+    await renderCatalog({ ...sampleCatalog, items: [{ ...sampleCatalog.items[0], labPath }] });
+    expect(mockRenderAsciiDoc).toHaveBeenCalledWith(expect.objectContaining({ sourceURL: `${prefix}lab.yaml`, loadResource: mockFetchResourceText }));
+    const click = async (text: string) => {
+      const link = Array.from(container.querySelectorAll('a')).find((anchor) => anchor.textContent === text)!;
+      const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+      await act(async () => { link.dispatchEvent(event); });
+      expect(event.defaultPrevented).toBe(true);
+    };
+    await click('Other lab');
+    expect(mockLoadLabBundle).not.toHaveBeenCalled();
+    await click('Unknown');
+    expect(mockLoadLabBundle).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain('Link is unavailable or unsafe.');
+    expect(container.querySelector('button[aria-label="Close lab"]')).toBeNull();
+    expect(mockFetchResourceText).not.toHaveBeenCalled();
+    await click('Known');
+    expect(mockLoadLabBundle).toHaveBeenLastCalledWith('lab-1', labPath, expect.any(AbortSignal));
+    expect(mockFetchResourceText).toHaveBeenCalledWith(`${prefix}modules/010-intro/content/pages/z-last.adoc`, expect.any(AbortSignal));
   });
 
   test('marks rendered page and description roots as scoped AsciiDoc documents', async () => {
@@ -589,7 +791,7 @@ describe('InteractiveLabsPage', () => {
     mockLoadLabBundle.mockResolvedValue(proxyNoChartBundle);
     mockRenderAsciiDoc.mockImplementation(({ sourceURL }) => Promise.resolve({
       html: sourceURL.endsWith('/lab.yaml')
-        ? '<a href="content/pages/z-last.adoc">Open linked page</a>'
+        ? '<a href="modules/010-intro/content/pages/z-last.adoc">Open linked page</a>'
         : '<p>Sanitized page</p>',
       warnings: [],
     }));
@@ -601,12 +803,12 @@ describe('InteractiveLabsPage', () => {
     await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
     document.removeEventListener('click', preventNavigation);
 
-    expect(mockLoadLabBundle).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
+    expect(mockLoadLabBundle).toHaveBeenCalledWith('lab-1', 'labs/one', expect.any(AbortSignal));
     expect(container.textContent).toContain('pages/z-last.adoc');
-    expect(mockFetchResourceText).toHaveBeenCalledWith(proxyNoChartBundle.pages[0].url, expect.any(AbortSignal));
+    expect(mockFetchResourceText).toHaveBeenCalledWith(lastPage.url, expect.any(AbortSignal));
   });
 
-  test('loads lexical first page and keeps previous and next within page boundaries', async () => {
+  test('loads first validated page and keeps previous and next within page boundaries', async () => {
     mockLoadLabBundle.mockResolvedValue(noChartBundle);
     mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Rendered page</p>', warnings: [] });
     await renderCatalog();
@@ -627,8 +829,49 @@ describe('InteractiveLabsPage', () => {
     expect(getButton(/^Back$/).disabled).toBe(false);
     expect(getButton(/^Next$/).disabled).toBe(true);
     expect(localStorage.getItem(sessionKey('lab-1'))).toBe(
-      JSON.stringify({ currentPagePath: 'pages/z-last.adoc', panelMode: 'open' }),
+      JSON.stringify({ currentPagePath: lastPage.path, panelMode: 'open' }),
     );
+  });
+
+  test('provides branded drawer header colors without PatternFly 6 theme tokens', () => {
+    const css = readFileSync(`${__dirname}/interactive-labs.css`, 'utf8');
+    const header = css.match(/\.pfext-lab-panel-content\s*\{([^}]*)\}/)?.[1];
+    expect(header).toContain('background-color: var(--pf-t--global--color--brand--default, #06c)');
+    expect(header).toContain('color: var(--pf-t--global--text--color--inverse, #fff)');
+  });
+
+  test('constrains drawer layout even without host PatternFly styles', () => {
+    const css = readFileSync(`${__dirname}/interactive-labs.css`, 'utf8');
+    expect(css).toMatch(/\.pfext-lab-drawer\s*\{[^}]*display:\s*flex;[^}]*height:\s*100%;[^}]*overflow:\s*hidden;/);
+    expect(css).toMatch(/#interactive-labs-drawer-panel\s*\{[^}]*display:\s*flex;[^}]*height:\s*100%;/);
+    expect(css).toMatch(/#interactive-labs-drawer-panel \.pf-v6-c-drawer__panel-main\s*\{[^}]*display:\s*flex;[^}]*flex:\s*1;[^}]*flex-direction:\s*column;/);
+  });
+
+  test('does not stack the resizable drawer splitter above the content', () => {
+    const css = readFileSync(`${__dirname}/interactive-labs.css`, 'utf8');
+    const panel = css.match(/#interactive-labs-drawer-panel\s*\{([^}]*)\}/)?.[1];
+    expect(panel).not.toContain('flex-direction: column');
+  });
+
+  test('keeps blue header flush with drawer top and plain controls legible', () => {
+    const css = readFileSync(`${__dirname}/interactive-labs.css`, 'utf8');
+    const panelMain = css.match(/#interactive-labs-drawer-panel \.pf-v6-c-drawer__panel-main\s*\{([^}]*)\}/)?.[1];
+    expect(panelMain).toContain('padding-block-start: 0;');
+    expect(css).toMatch(/\.pfext-lab-panel-content \.pf-v6-c-button\.pf-m-plain[^{}]*\{[^}]*color:\s*inherit;/);
+  });
+
+  test('keeps footer top spacing over PatternFly drawer sibling reset', () => {
+    const css = readFileSync(`${__dirname}/interactive-labs.css`, 'utf8');
+    expect(css).toMatch(/#interactive-labs-drawer-panel \.pfext-lab-footer\s*\{[^}]*padding-block-start:\s*var\(--pf-t--global--spacer--md, 0\.25rem\);/);
+  });
+
+  test('stretches module selector without long titles changing layout', () => {
+    const css = readFileSync(`${__dirname}/interactive-labs.css`, 'utf8');
+    const moduleItem = css.match(/\.pfext-lab-footer__module\s*\{([^}]*)\}/)?.[1];
+    const toggle = css.match(/\.pfext-lab-module-toggle\s*\{([^}]*)\}/)?.[1];
+    expect(moduleItem).toContain('flex: 1 1 0;');
+    expect(toggle).toContain('width: 100%;');
+    expect(css).toMatch(/\.pfext-lab-module-toggle \.pf-v6-c-menu-toggle__text\s*\{[^}]*text-overflow:\s*ellipsis;/);
   });
 
   test('uses an accessible resizable drawer header with an empty title while page rendering loads', async () => {
@@ -640,6 +883,7 @@ describe('InteractiveLabsPage', () => {
     await act(async () => { getButton(/^Launch$/).click(); });
 
     const drawer = container.querySelector('[class*="drawer__panel"]')!;
+    expect(container.querySelector('.pfext-lab-drawer')).not.toBeNull();
     const labName = drawer.querySelector('.pfext-lab-panel-content h2')!;
     const allH2s = drawer.querySelectorAll('h2');
     const pageTitle = allH2s[1]!;
@@ -649,12 +893,22 @@ describe('InteractiveLabsPage', () => {
     const close = getButton(/^close lab$/i);
 
     expect(labName.textContent).toBe('Lab One');
+    expect(drawer.querySelector('.pfext-lab-module-title')?.textContent).toBe('010-intro');
+    expect(drawer.querySelector('.pfext-lab-panel-content [aria-live="polite"]')?.textContent).toBe('Page 1 of 2');
+    expect(labName.nextElementSibling?.textContent).toBe('010-intro');
     expect(pageTitle.textContent).toBe('');
     expect(drawer.querySelector('[aria-label="Loading lab page"]')).not.toBeNull();
     expect(drawer.textContent).not.toContain('pages/a-first.adoc');
     expect(labName.compareDocumentPosition(pageTitle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(pageTitle.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(next.compareDocumentPosition(back) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const body = drawer.querySelector('.pfext-lab-panel-content__body')!;
+    const footer = drawer.querySelector('.pfext-lab-footer')!;
+    expect(body.contains(pageTitle)).toBe(true);
+    expect(body.contains(footer)).toBe(false);
+    expect(body.parentElement).toBe(footer.parentElement);
+    expect(footer.contains(next)).toBe(true);
+    expect(footer.contains(back)).toBe(true);
     expect(drawer.querySelector('[role="separator"][aria-label="Resize lab drawer"]')).not.toBeNull();
     [minimize, close].forEach((button) => {
       expect(button.textContent).toBe('');
@@ -697,7 +951,7 @@ describe('InteractiveLabsPage', () => {
       );
     });
     expect(container.textContent).toContain('pages/z-last.adoc');
-    expect(mockFetchResourceText).toHaveBeenCalledWith(noChartBundle.pages[0].url, expect.any(AbortSignal));
+    expect(mockFetchResourceText).toHaveBeenCalledWith(lastPage.url, expect.any(AbortSignal));
   });
 
   test('opens external links safely, retains drawer for Console links, and warns for plugin or unknown links', async () => {
@@ -706,7 +960,7 @@ describe('InteractiveLabsPage', () => {
       html: [
         '<a href="https://docs.example.test/guide">External</a>',
         `<a href="${window.location.origin}/">Console</a>`,
-        `<a href="${noChartBundle.pages[2].url}">Plugin resource</a>`,
+        `<a href="${firstPage.url}">Plugin resource</a>`,
         '<a href="missing.adoc">Missing</a>',
       ].join(''),
       warnings: [],
@@ -750,7 +1004,10 @@ describe('InteractiveLabsPage', () => {
 
   test('retries a failed page fetch without closing drawer', async () => {
     mockLoadLabBundle.mockResolvedValue(noChartBundle);
-    mockFetchResourceText.mockRejectedValueOnce(new Error('Page unavailable'));
+    let firstPageReads = 0;
+    mockFetchResourceText.mockImplementation((url) => url === firstPage.url && ++firstPageReads === 2
+      ? Promise.reject(new Error('Page unavailable'))
+      : Promise.resolve('= Page'));
     mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Retried page</p>', warnings: [] });
     await renderCatalog();
 
@@ -758,7 +1015,7 @@ describe('InteractiveLabsPage', () => {
     expect(container.textContent).toContain('Page unavailable');
 
     await act(async () => { getButton(/^Retry$/).click(); });
-    expect(mockFetchResourceText).toHaveBeenCalledTimes(2);
+    expect(mockFetchResourceText.mock.calls.filter(([url]) => url === firstPage.url)).toHaveLength(3);
     expect(container.textContent).toContain('Retried page');
     expect(container.querySelector('button[aria-label="Close lab"]')).not.toBeNull();
   });
@@ -781,7 +1038,7 @@ describe('InteractiveLabsPage', () => {
 
     act(() => { minimize.click(); });
     expect(localStorage.getItem(sessionKey('lab-1'))).toBe(
-      JSON.stringify({ currentPagePath: 'pages/a-first.adoc', panelMode: 'minimized' }),
+      JSON.stringify({ currentPagePath: firstPage.path, panelMode: 'minimized' }),
     );
     const restore = getButton(/restore/i);
     expect(restore.tagName).toBe('BUTTON');
@@ -792,7 +1049,7 @@ describe('InteractiveLabsPage', () => {
 
     act(() => { restore.click(); });
     expect(localStorage.getItem(sessionKey('lab-1'))).toBe(
-      JSON.stringify({ currentPagePath: 'pages/a-first.adoc', panelMode: 'open' }),
+      JSON.stringify({ currentPagePath: firstPage.path, panelMode: 'open' }),
     );
     act(() => { getButton(/close/i).click(); });
     expect(document.activeElement).toBe(launch);
@@ -874,7 +1131,7 @@ describe('InteractiveLabsPage', () => {
     mockLoadLabBundle.mockResolvedValue(noChartBundle);
     localStorage.setItem(
       sessionKey('lab-1'),
-      JSON.stringify({ currentPagePath: 'pages/z-last.adoc', panelMode: 'minimized' }),
+      JSON.stringify({ currentPagePath: lastPage.path, panelMode: 'minimized' }),
     );
     await renderCatalog();
 
@@ -898,7 +1155,7 @@ describe('InteractiveLabsPage', () => {
 
     expect(container.textContent).toContain('Page 1 of 2');
     expect(localStorage.getItem(sessionKey('lab-1'))).toBe(
-      JSON.stringify({ currentPagePath: 'pages/a-first.adoc', panelMode: 'open' }),
+      JSON.stringify({ currentPagePath: firstPage.path, panelMode: 'open' }),
     );
   });
 
@@ -915,8 +1172,227 @@ describe('InteractiveLabsPage', () => {
 
     expect(container.textContent).toContain('Page 1 of 2');
     expect(localStorage.getItem(sessionKey('lab-1'))).toBe(
-      JSON.stringify({ currentPagePath: 'pages/a-first.adoc', panelMode: 'open' }),
+      JSON.stringify({ currentPagePath: firstPage.path, panelMode: 'open' }),
     );
+  });
+
+  test('follows backend module/page order, selects first module page, and crosses both boundaries', async () => {
+    mockLoadLabBundle.mockResolvedValue(multiModuleBundle);
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Page content</p>', warnings: [] });
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+
+    expect(moduleToggle().textContent).toContain('010-intro');
+    const drawer = container.querySelector('[class*="drawer__panel"]')!;
+    expect(drawer.querySelector('.pfext-lab-module-title')?.textContent).toBe('010-intro');
+    expect(drawer.querySelector('.pfext-lab-panel-content [aria-live="polite"]')?.textContent).toBe('Page 1 of 2');
+    expect(drawer.querySelector('.pfext-lab-footer')?.contains(moduleToggle())).toBe(true);
+    expect(drawer.querySelector('.pfext-lab-footer')?.contains(getButton(/^Next$/))).toBe(true);
+    expect(drawer.querySelector('.pfext-lab-footer')?.contains(getButton(/^Back$/))).toBe(true);
+    expect(drawer.querySelector('.pfext-lab-panel-content__body')?.contains(moduleToggle())).toBe(false);
+    const footerItems = drawer.querySelectorAll('.pfext-lab-footer [class*="action-list__item"]');
+    expect(footerItems).toHaveLength(3);
+    expect(footerItems[0].contains(getButton(/^Next$/))).toBe(true);
+    expect(footerItems[1].contains(getButton(/^Back$/))).toBe(true);
+    expect(footerItems[2].contains(moduleToggle())).toBe(true);
+    expect(moduleToggle().getAttribute('aria-label')).toBe('Module: 010-intro');
+    expect(moduleToggle().title).toBe('010-intro');
+    await act(async () => { moduleToggle().click(); });
+    expect(moduleToggle().getAttribute('aria-expanded')).toBe('true');
+    expect(moduleOptions()[0].closest('#interactive-labs-drawer-panel')).toBeNull();
+    expect(moduleOptions().map((option) => option.textContent?.trim())).toEqual(['010-intro', '020-apply']);
+    expect(moduleOptions().map((option) => option.getAttribute('aria-selected'))).toEqual(['true', 'false']);
+    await act(async () => { moduleToggle().click(); });
+    expect(container.textContent).toContain('Page 1 of 2');
+    await act(async () => { getButton(/^Next$/).click(); });
+    expect(container.textContent).toContain('Page 2 of 2');
+    await act(async () => { getButton(/^Next$/).click(); });
+    expect(moduleToggle().textContent).toContain('020-apply');
+    expect(drawer.querySelector('.pfext-lab-module-title')?.textContent).toBe('020-apply');
+    expect(drawer.querySelector('.pfext-lab-panel-content [aria-live="polite"]')?.textContent).toBe('Page 1 of 2');
+    expect(localStorage.getItem(sessionKey('lab-1'))).toBe(JSON.stringify({ currentPagePath: multiModuleBundle.modules[1].pages[0].path, panelMode: 'open' }));
+    await act(async () => { getButton(/^Back$/).click(); });
+    expect(moduleToggle().textContent).toContain('010-intro');
+    expect(drawer.querySelector('.pfext-lab-module-title')?.textContent).toBe('010-intro');
+    expect(container.textContent).toContain('Page 2 of 2');
+    await act(async () => { moduleToggle().click(); });
+    await act(async () => { moduleOptions()[1].click(); });
+    expect(moduleToggle().getAttribute('aria-expanded')).toBe('false');
+    expect(moduleToggle().textContent).toContain('020-apply');
+    expect(container.textContent).toContain('Page 1 of 2');
+    await act(async () => { getButton(/^Next$/).click(); });
+    expect(container.textContent).toContain('Page 2 of 2');
+    expect(getButton(/^Next$/).disabled).toBe(true);
+  });
+
+  test('keeps module keyboard focus and closes menu on Escape, outside click, selection, and minimize', async () => {
+    mockLoadLabBundle.mockResolvedValue(multiModuleBundle);
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+
+    const toggle = moduleToggle();
+    act(() => { toggle.focus(); toggle.click(); });
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    act(() => { toggle.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })); });
+    expect(document.activeElement).toBe(moduleOptions()[0]);
+    act(() => { moduleOptions()[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(toggle);
+
+    act(() => { toggle.click(); });
+    act(() => { container.querySelector('#interactive-labs-drawer-panel h2')!.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
+    act(() => { toggle.click(); });
+    act(() => { moduleOptions()[1].click(); });
+    expect(document.activeElement).toBe(toggle);
+    expect(toggle.textContent).toContain('020-apply');
+
+    act(() => { toggle.click(); });
+    act(() => { getButton(/minimize lab/i).click(); });
+    act(() => { getButton(/restore lab/i).click(); });
+    expect(moduleToggle().getAttribute('aria-expanded')).toBe('false');
+  });
+
+  test('preserves validated descriptor order even when names are not lexically ordered', async () => {
+    const reordered: LabBundle = {
+      ...multiModuleBundle,
+      modules: [multiModuleBundle.modules[1], { ...multiModuleBundle.modules[0], pages: [...multiModuleBundle.modules[0].pages].reverse() }],
+    };
+    mockLoadLabBundle.mockResolvedValue(reordered);
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+    expect(moduleToggle().textContent).toContain('020-apply');
+    await act(async () => { moduleToggle().click(); });
+    expect(moduleOptions().map((option) => option.textContent?.trim())).toEqual(['020-apply', '010-intro']);
+    expect(moduleOptions()[0].getAttribute('aria-selected')).toBe('true');
+    await act(async () => { moduleToggle().click(); });
+    expect(mockFetchResourceText).toHaveBeenCalledWith(reordered.modules[0].pages[0].url, expect.any(AbortSignal));
+    await act(async () => { getButton(/^Next$/).click(); });
+    await act(async () => { getButton(/^Next$/).click(); });
+    expect(moduleToggle().textContent).toContain('010-intro');
+    expect(localStorage.getItem(sessionKey('lab-1'))).toContain(lastPage.path);
+  });
+
+  test('loads plain module labels in background after setup without blocking pages', async () => {
+    const status = deferred<Awaited<ReturnType<typeof client.getSetupStatus>>>();
+    const title = deferred<string | undefined>();
+    mockLoadLabBundle.mockResolvedValue({ ...multiModuleBundle, runtimeContext: { ...multiModuleBundle.runtimeContext, helmChartAvailable: true }, manifest: { ...multiModuleBundle.manifest, spec: { attributes: { product: 'Resolved' } } } });
+    mockSetupLab.mockResolvedValue({ apiVersion: 'v1alpha1', kind: 'SetupStatus', spaceRequests: { status: 'provisioning', namespaces: null }, helm: { status: 'pending', releaseName: 'il-test' } });
+    mockGetSetupStatus.mockReturnValue(status.promise);
+    mockExtractAsciiDocTitle.mockReturnValueOnce(title.promise).mockRejectedValueOnce(new Error('Title missing'));
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Already visible</p>', warnings: [] });
+    await renderCatalog();
+    act(() => { getButton(/^Launch$/).click(); });
+    await act(async () => {});
+    expect(mockExtractAsciiDocTitle).not.toHaveBeenCalled();
+    expect(mockFetchResourceText).not.toHaveBeenCalled();
+    await act(async () => { status.resolve({ apiVersion: 'v1alpha1', kind: 'SetupStatus', spaceRequests: { status: 'ready', namespaces: {} }, helm: { status: 'deployed', releaseName: 'il-test' } }); });
+    expect(moduleToggle().textContent).toContain('010-intro');
+    expect(container.querySelector('.pfext-lab-module-title')?.textContent).toBe('010-intro');
+    await act(async () => { moduleToggle().click(); });
+    expect(moduleOptions()[0].textContent?.trim()).toBe('010-intro');
+    expect(container.textContent).toContain('Already visible');
+    expect(mockFetchResourceText).toHaveBeenCalledWith(firstPage.url, expect.any(AbortSignal));
+    expect(mockFetchResourceText).toHaveBeenCalledWith(multiModuleBundle.modules[1].pages[0].url, expect.any(AbortSignal));
+    expect(mockExtractAsciiDocTitle).toHaveBeenCalledWith(expect.objectContaining({ sourceURL: firstPage.url, attributes: { product: 'Resolved' }, loadResource: mockFetchResourceText, signal: expect.any(AbortSignal) }));
+    await act(async () => { title.resolve('Safe <em>module</em> &amp; <script>unsafe</script>'); });
+    expect(moduleToggle().textContent).toContain('Safe module &');
+    expect(container.querySelector('.pfext-lab-module-title')?.textContent).toBe('Safe module &');
+    expect(container.querySelector('.pfext-lab-module-title em')).toBeNull();
+    expect(moduleOptions()[0].textContent?.trim()).toBe('Safe module &');
+    expect(moduleOptions()[0].querySelector('em')).toBeNull();
+    expect(moduleOptions()[1].textContent?.trim()).toBe('020-apply');
+  });
+
+  test('ignores obsolete title results after close, relaunch, and unmount', async () => {
+    const stale = deferred<string | undefined>();
+    let signal!: AbortSignal;
+    mockLoadLabBundle.mockResolvedValue(multiModuleBundle);
+    mockExtractAsciiDocTitle.mockImplementationOnce(({ signal: requestSignal }) => { signal = requestSignal!; return stale.promise; }).mockResolvedValue(undefined);
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+    act(() => { getButton(/close lab/i).click(); });
+    expect(signal.aborted).toBe(true);
+    await act(async () => { getButton(/^Launch$/).click(); });
+    await act(async () => { stale.resolve('Stale name'); });
+    expect(container.textContent).not.toContain('Stale name');
+    act(() => { ReactDOM.unmountComponentAtNode(container); });
+  });
+
+  test('aborts pending module titles on unmount', async () => {
+    const pending = deferred<string | undefined>();
+    let signal!: AbortSignal;
+    mockLoadLabBundle.mockResolvedValue(multiModuleBundle);
+    mockExtractAsciiDocTitle.mockImplementationOnce(({ signal: requestSignal }) => { signal = requestSignal!; return pending.promise; });
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+    act(() => { ReactDOM.unmountComponentAtNode(container); });
+    expect(signal.aborted).toBe(true);
+    await act(async () => { pending.resolve('Never shown'); });
+    expect(container.textContent).not.toContain('Never shown');
+  });
+
+  test('restores a valid page in a later module, but rejects a stale page path', async () => {
+    mockLoadLabBundle.mockResolvedValue(multiModuleBundle);
+    localStorage.setItem(sessionKey('lab-1'), JSON.stringify({ currentPagePath: multiModuleBundle.modules[1].pages[1].path, panelMode: 'open' }));
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+    expect(moduleToggle().textContent).toContain('020-apply');
+    expect(container.textContent).toContain('Page 2 of 2');
+    act(() => { getButton(/close lab/i).click(); });
+    localStorage.setItem(sessionKey('lab-1'), JSON.stringify({ currentPagePath: 'modules/020-apply/content/missing.adoc', panelMode: 'minimized' }));
+    await act(async () => { getButton(/^Launch$/).click(); });
+    expect(moduleToggle().textContent).toContain('010-intro');
+    expect(container.textContent).toContain('Page 1 of 2');
+  });
+
+  test('has no selector for a single module and resumes only a known module page', async () => {
+    mockLoadLabBundle.mockResolvedValue(noChartBundle);
+    localStorage.setItem(sessionKey('lab-1'), JSON.stringify({ currentPagePath: lastPage.path, panelMode: 'open' }));
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+    expect(container.querySelector('button[aria-label="Module"]')).toBeNull();
+    expect(container.querySelector('.pfext-lab-module-title')?.textContent).toBe('010-intro');
+    expect(container.textContent).toContain('Page 2 of 2');
+    expect(mockExtractAsciiDocTitle).toHaveBeenCalledWith(expect.objectContaining({ sourceURL: firstPage.url }));
+  });
+
+  test('updates single-module header with plain first-page title when background loading finishes', async () => {
+    const title = deferred<string | undefined>();
+    mockLoadLabBundle.mockResolvedValue(noChartBundle);
+    mockExtractAsciiDocTitle.mockReturnValue(title.promise);
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+    expect(container.querySelector('.pfext-lab-module-title')?.textContent).toBe('010-intro');
+    await act(async () => { title.resolve('Intro <em>overview</em> &amp; more'); });
+    expect(container.querySelector('.pfext-lab-module-title')?.textContent).toBe('Intro overview & more');
+    expect(container.querySelector('.pfext-lab-module-title em')).toBeNull();
+    expect(moduleOptions()).toHaveLength(0);
+  });
+
+  test('opens known cross-module relative links and catalog-description links only on descriptor match', async () => {
+    mockLoadLabBundle.mockResolvedValue(multiModuleBundle);
+    mockRenderAsciiDoc.mockImplementation(({ sourceURL }) => Promise.resolve({
+      html: sourceURL.endsWith('/lab.yaml')
+        ? '<a href="modules/020-apply/content/020-done.adoc">Catalog link</a><a href="modules/020-apply/content/missing.adoc">Unknown</a>'
+        : '<a href="../../../020-apply/content/010-do.adoc">Cross module</a>', warnings: [],
+    }));
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+    await act(async () => {
+      Array.from(container.querySelectorAll('a')).find((link) => link.textContent === 'Cross module')!.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    });
+    expect(moduleToggle().textContent).toContain('020-apply');
+    await act(async () => {
+      Array.from(container.querySelectorAll('a')).find((link) => link.textContent === 'Catalog link')!.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    });
+    expect(localStorage.getItem(sessionKey('lab-1'))).toContain('modules/020-apply/content/020-done.adoc');
+    await act(async () => {
+      Array.from(container.querySelectorAll('a')).find((link) => link.textContent === 'Unknown')!.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    });
+    expect(container.textContent).toContain('Link is unavailable or unsafe.');
+    expect(mockLoadLabBundle).toHaveBeenCalledTimes(3);
   });
 
   test('highlights only renderer-created valid guidance markers already visible in Console', async () => {

@@ -263,7 +263,7 @@ func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 	type item struct {
 		CatalogRef  string `json:"catalogRef"`
-		DisplayName string `json:"displayName"`
+		Title       string `json:"title"`
 		Description string `json:"description,omitempty"`
 		LabPath     string `json:"labPath"`
 	}
@@ -281,7 +281,7 @@ func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 		}
 		items = append(items, item{
 			CatalogRef:  e.CatalogRef,
-			DisplayName: result.Manifest.Metadata.DisplayName,
+			Title:       result.Manifest.Metadata.Title,
 			Description: result.Manifest.Metadata.Description,
 			LabPath:     path.Clean(e.LabPath),
 		})
@@ -327,20 +327,33 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
-	if labErr := manifest.ValidateBundlePaths(result.Pages); labErr != nil {
-		writeError(w, http.StatusUnprocessableEntity, labErr)
-		return
-	}
 	type page struct {
 		Path string `json:"path"`
 		URL  string `json:"url"`
 	}
-	pages := make([]page, 0, len(result.Pages))
-	for _, pagePath := range result.Pages {
-		pages = append(pages, page{
-			Path: pagePath,
-			URL:  resourcePath(entry.CatalogRef, entry.LabPath, pagePath),
-		})
+	type module struct {
+		ID    string `json:"id"`
+		Pages []page `json:"pages"`
+	}
+	if len(result.Modules) == 0 {
+		writeError(w, http.StatusUnprocessableEntity, laberr.New(laberr.TypeContentError, "no modules in bundle", nil))
+		return
+	}
+	modules := make([]module, 0, len(result.Modules))
+	for _, source := range result.Modules {
+		if labErr := manifest.ValidateBundlePaths(source.Pages); labErr != nil {
+			writeError(w, http.StatusUnprocessableEntity, labErr)
+			return
+		}
+		pages := make([]page, 0, len(source.Pages))
+		for _, relative := range source.Pages {
+			pagePath := path.Join("modules", source.ID, "content", relative)
+			pages = append(pages, page{
+				Path: pagePath,
+				URL:  resourcePath(entry.CatalogRef, entry.LabPath, pagePath),
+			})
+		}
+		modules = append(modules, module{ID: source.ID, Pages: pages})
 	}
 
 	// Merge attributes: manifest → catalog overrides → runtime attrs.
@@ -362,7 +375,7 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 		"apiVersion": "v1alpha1",
 		"kind":       "LabBundle",
 		"manifest":   result.Manifest,
-		"pages":      pages,
+		"modules":    modules,
 		"runtimeContext": map[string]any{
 			"catalogRef":         entry.CatalogRef,
 			"branch":             entry.Branch,
@@ -793,6 +806,6 @@ func recordCatalogOmission(ctx context.Context, cfg Config, entry catalog.Entry,
 }
 
 func resourcePath(catalogRef, labPath, pagePath string) string {
-	resourceURL := url.URL{Path: path.Join("api/v1alpha1/labs", catalogRef, "resources", path.Clean(labPath), "content", pagePath)}
+	resourceURL := url.URL{Path: path.Join("api/v1alpha1/labs", catalogRef, "resources", path.Clean(labPath), pagePath)}
 	return resourceURL.EscapedPath()
 }

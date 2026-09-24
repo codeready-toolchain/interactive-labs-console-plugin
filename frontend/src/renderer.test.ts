@@ -1,6 +1,6 @@
 import * as asciidoctor from "@asciidoctor/core";
 import mermaid from "mermaid";
-import { renderAsciiDoc } from "./renderer";
+import { extractAsciiDocTitle, renderAsciiDoc } from "./renderer";
 
 const sourceURL =
   "/api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/labs/lab-1/resources/labs/one/content/pages/intro.adoc";
@@ -26,6 +26,28 @@ describe("renderAsciiDoc", () => {
     expect(result).toMatchObject({ title: "Interactive Labs introduction" });
   });
 
+  it("parses only header with final attributes and does not fetch body includes", async () => {
+    const source = "= {product} *Intro*\n:product: ignored\n\ninclude::../partials/inner.adoc[]";
+    const load = jest.spyOn(asciidoctor, "load");
+    const title = await extractAsciiDocTitle({ source, sourceURL, attributes: { product: "Resolved" }, loadResource: loader });
+
+    expect(title).toContain("Resolved");
+    expect(title).toContain("Intro");
+    expect(loader).not.toHaveBeenCalled();
+    expect(load).toHaveBeenCalledWith(source, expect.objectContaining({
+      parse_header_only: true,
+      safe: "secure", attributes: expect.objectContaining({ "product@": "Resolved", relfilesuffix: ".adoc" }),
+      extension_registry: expect.anything(),
+    }));
+  });
+
+  it("extracts only the title without converting the document body", async () => {
+    const convert = jest.fn();
+    jest.spyOn(asciidoctor, "load").mockResolvedValue({ getDocumentTitle: () => "First page", convert } as never);
+    expect(await extractAsciiDocTitle({ source: "= First page\n\nimage::missing[]", sourceURL, attributes: {}, loadResource: loader })).toBe("First page");
+    expect(convert).not.toHaveBeenCalled();
+  });
+
   describe("native page xrefs", () => {
     const targetPageURL = sourceURL.replace("intro.adoc", "next.adoc");
     const xrefInput = (source: string, loadResource: (url: string, signal: AbortSignal) => Promise<string>) => ({
@@ -34,6 +56,18 @@ describe("renderAsciiDoc", () => {
       attributes: {},
       pageURLs: [targetPageURL],
       loadResource,
+    });
+
+    it("never fetches an approved-looking page title from another catalog source", async () => {
+      const otherPageURL = sourceURL.replace("/labs/lab-1/", "/labs/lab-2/").replace("intro.adoc", "next.adoc");
+      const loadResource = jest.fn(async () => "= Other repository title");
+      const result = await renderAsciiDoc({
+        ...xrefInput("xref:../../../../../../lab-2/resources/labs/one/content/pages/next.adoc[]", loadResource),
+        pageURLs: [otherPageURL],
+      });
+
+      expect(loadResource).not.toHaveBeenCalled();
+      expect(result.html).not.toContain("Other repository title");
     });
 
     it("uses an approved target document title for an unlabeled xref", async () => {
@@ -156,6 +190,29 @@ describe("renderAsciiDoc", () => {
     expect(result.html).toContain("/resources/labs/one/content/images/diagram.png");
     expect(result.html).not.toMatch(/evil\.example|data:image/i);
     expect(result.warnings).toContain("Included resource is unavailable or unsafe.");
+  });
+
+  it("blocks nested includes and images crossing into another catalog source without blocking shared files in same repository", async () => {
+    const loadResource = jest.fn(async (url: string) => {
+      if (url.endsWith("partials/outer.adoc")) {
+        return "include::../../../../../../lab-2/resources/secret.adoc[]\ninclude::../../../../../../lab-1/resources/shared.adoc[]";
+      }
+      if (url.endsWith("/lab-1/resources/shared.adoc")) return "Shared repository content";
+      return "Other repository content";
+    });
+    const result = await renderAsciiDoc({
+      source: "include::../partials/outer.adoc[]\n\nimage::../../../../../../lab-2/resources/secret.png[]",
+      sourceURL,
+      attributes: {},
+      loadResource,
+    });
+
+    expect(loadResource).toHaveBeenCalledTimes(2);
+    expect(loadResource).toHaveBeenCalledWith(expect.stringContaining("/lab-1/resources/shared.adoc"), expect.any(AbortSignal));
+    expect(loadResource).not.toHaveBeenCalledWith(expect.stringContaining("/lab-2/resources/"), expect.any(AbortSignal));
+    expect(result.warnings).toContain("Included resource is unavailable or unsafe.");
+    expect(result.html).toContain("Shared repository content");
+    expect(result.html).not.toMatch(/Other repository content|secret\.png|<img/);
   });
 
   it("uses native labels and preserves styles from separately sanitized Mermaid SVG", async () => {

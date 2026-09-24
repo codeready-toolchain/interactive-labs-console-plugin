@@ -296,7 +296,7 @@ func TestCombinedHandler(t *testing.T) {
   labPath: lab`}}, nil
 		},
 		BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
-			return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}}, Pages: []string{"intro.adoc"}}, nil
+			return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}}, Modules: []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}}}, nil
 		},
 		Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	}

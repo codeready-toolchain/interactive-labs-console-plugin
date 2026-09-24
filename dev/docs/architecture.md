@@ -21,7 +21,7 @@ Evidence: [Containerfile](../../Containerfile), [server](../../backend/cmd/serve
 | Owner | Responsibilities | Must not do |
 | --- | --- | --- |
 | Console | authentication context, routing, active namespace, service proxy | grant backend a privileged user identity |
-| Browser plugin | catalog UI; eventually drawer, page state, and any resolved progress model | clone repositories, execute Helm, decide authorization, persist tokens, or unilaterally choose namespace policy |
+| Browser plugin | catalog UI, drawer, module/page navigation, browser-local panel state; any future resolved progress model | clone repositories, execute Helm, decide authorization, persist tokens, or unilaterally choose namespace policy |
 | Backend | catalog resolution, authentication, bundle validation/loading, setup authorization and release identity | log, persist, echo, or return forwarded tokens |
 | Cluster administrator | install plugin and select trusted labs through catalog ConfigMap | place unapproved browser-controlled repository locations in catalog |
 | Lab author | author supported lab content and optional chart | use unsupported rendering or execution capabilities |
@@ -32,24 +32,19 @@ Evidence: [Containerfile](../../Containerfile), [server](../../backend/cmd/serve
 
 1. `InteractiveLabsPage` calls `listCatalog()`.
 2. `consoleFetch` sends `GET /api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/catalog`.
-3. Backend validates source locators, derives each opaque `catalogRef`, resolves each lab from its cached approved snapshot, and returns manifest `displayName` and optional `description` in declared order.
+3. Backend validates source locators, derives each opaque `catalogRef`, resolves each lab from its cached approved snapshot, and returns manifest `title`, optional `description`, and normalized `labPath` in declared order. Invalid flat or malformed module labs are omitted safely.
 4. An unavailable repository, missing manifest, or invalid lab omits only that item. Backend logs safe opaque context and emits one deduplicated namespaced Warning Event per `(catalogRef, reason)` for its lifetime.
 
 ### Bundle
 
 1. Browser requests `GET /api/v1alpha1/labs/{catalogRef}/bundle` through same proxy.
 2. Backend requires bearer token, resolves authenticated subject, then resolves `catalogRef` from live catalog.
-3. **Implemented and verified:** Backend serves catalog, bundle, setup, and resource reads from one immutable configured HTTPS repository/branch generation in `/var/lib/interactive-labs/cache/<sha256 canonical repository+branch>/content`. `Close` preserves snapshots; current deployment has no PVC, so pod/container replacement loses cache. Future PVCs mount this fixed path. It loads `lab.yaml`, `.adoc` files below `content/`, and optional `setup/helm/Chart.yaml`; bundle returns normalized navigable page descriptors with backend-relative resource paths.
-4. **Implemented and verified:** A service-account-owned startup sweep and bounded periodic loop (`CACHE_REFRESH_INTERVAL=1h`, `CACHE_CONCURRENT_REFRESH_LIMIT=4` by default) discover current validated catalog sources without browser requests. Invalid non-positive or malformed values are logged and use defaults. Each source has a ten-minute staged `go-git` deadline; remote-ref lookup avoids unchanged clones. After clone, `HEAD`, and all configured lab-path checks, publication swaps one immutable generation under a per-source read/write lock. Source-acquisition failure preserves last-known-good content; an initial miss omits only dependent labs. Catalog and API shapes do not change.
-5. **Implemented and verified:** Catalog returns normalized `labPath`; browser resolves backend-relative page paths through its fixed Console proxy base. `GET /api/v1alpha1/labs/{catalogRef}/resources/{repositoryRelativePath...}` serves approved page/include/image bytes on demand with repository-root validation. Bytes and quoted snapshot Git `HEAD` `ETag` come from one generation; responses use `Cache-Control: private, no-cache`. Resource-size caps are not yet enforced.
+3. **Implemented and verified:** On first use, backend shallow-clones one configured HTTPS repository/branch into `/var/lib/interactive-labs/cache/<sha256 canonical repository+branch>/content` and reuses that snapshot for catalog, bundle, setup, and resource loading while cache storage remains. Entry directory is reserved for future metadata. `Close` preserves snapshots; current deployment has no PVC, so pod/container replacement loses cache. Future PVCs mount this fixed path. It loads `lab.yaml`, each `modules/<id>/content/` tree, and optional repository-root `setup/helm/Chart.yaml`; bundle returns ordered `modules: [{id, pages: [{path, url}]}]` with module-qualified lab-relative paths and backend-relative resource URLs, never root `pages`.
+4. **Implemented and verified:** Catalog returns normalized `labPath`; browser checks each module ID, navigable path, and URL against that lab path and fixed Console proxy base before using it. `GET /api/v1alpha1/labs/{catalogRef}/resources/{repositoryRelativePath...}` serves approved page/include/image bytes on demand with repository-root validation. Responses use a quoted snapshot Git `HEAD` SHA as shared `ETag` and `Cache-Control: private, no-cache`; resource-size caps are not yet enforced.
 
 ### Setup
 
-`POST /api/v1alpha1/labs/{catalogRef}/setup` requires authentication and `releaseNamespace`. Backend loads bundle from the same cached source snapshot and derives a deterministic user-specific `il-...` release name. It returns `v1alpha1/SetupResult`.
-
-**Implemented and verified:** validation, authentication boundary, and release-name derivation.
-
-**Not implemented:** Helm installation. Current handler explicitly returns `outcome: success` with message stating Helm execution is deferred.
+Chart-backed launch calls `POST /api/v1alpha1/labs/{catalogRef}/setup` with no namespace body. Backend authenticates forwarded current user, creates/reuses SpaceRequests in user's home namespace, and starts a background worker to wait for readiness and install repository-root Helm chart with current-user RBAC. `POST` returns `202` with `v1alpha1/SetupStatus` (or `200` when release already deployed). Frontend polls `GET /api/v1alpha1/labs/{catalogRef}/setup/status` and opens content after SpaceRequests are ready and Helm is deployed. Worker is bounded but can be lost on process restart; no automatic cleanup/cancellation. See [lab setup design](lab-setup-design.md).
 
 Evidence: [frontend client](../../frontend/src/api/client.ts), [router](../../backend/internal/handler/handler.go), [bundle loader](../../backend/internal/bundle/loader.go).
 
@@ -60,7 +55,8 @@ Evidence: [frontend client](../../frontend/src/api/client.ts), [router](../../ba
 | List catalog | `GET /api/v1alpha1/catalog` | `v1alpha1/CatalogList` |
 | Load bundle | `GET /api/v1alpha1/labs/{catalogRef}/bundle` | `v1alpha1/LabBundle` |
 | Read resource | `GET /api/v1alpha1/labs/{catalogRef}/resources/{repositoryRelativePath...}` | Raw supported text or raster bytes; `v1alpha1/Error` on failure |
-| Setup lab | `POST /api/v1alpha1/labs/{catalogRef}/setup` | `v1alpha1/SetupResult` |
+| Start setup | `POST /api/v1alpha1/labs/{catalogRef}/setup` | `v1alpha1/SetupStatus` |
+| Check setup | `GET /api/v1alpha1/labs/{catalogRef}/setup/status` | `v1alpha1/SetupStatus` |
 
 All non-success API responses use `v1alpha1/Error`. Unknown client error types normalize to `unknown_error`.
 
@@ -77,10 +73,10 @@ See [administrator guide](administrator-guide.md).
 ## Current and planned flows
 
 - Enabled launch opens accessible, minimizable drawer and restores browser-local session state only after explicit user activation.
-- **Implemented and verified:** Restricted AsciiDoc uses exact pinned renderer dependencies. DOMPurify's final AsciiDoc pass uses its default allowlist and forbids `style`/`form` elements and `style` attributes; Mermaid SVG receives a separate SVG/SVG-filter-profile pass that retains allowed styling and is inserted afterward. Renderer passes backend-final attributes hard-set to Asciidoctor. Relative links resolve from source URL and navigate only known pages under `labPath/content`; external HTTP(S) links open safe new tab, same-origin Console links retain drawer, and plugin backend resource URLs warn. Includes/images may come from same approved repository through backend-validated resource URLs. Underscore-prefixed paths are include-only. Typed `console:` and `resource:` macros accept only fixed validated Console targets; guidance verifies renderer-generated provenance, waits only after required route navigation, and renders a non-modal dismissible spotlight.
+- **Implemented and verified:** Restricted AsciiDoc uses exact pinned renderer dependencies. DOMPurify's final AsciiDoc pass uses its default allowlist and forbids `style`/`form` elements and `style` attributes; Mermaid SVG receives a separate SVG/SVG-filter-profile pass that retains allowed styling and is inserted afterward. Renderer passes backend-final attributes hard-set to Asciidoctor. Relative links resolve from source URL and navigate only known module-qualified pages (including cross-module links); external HTTP(S) links open safe new tab, same-origin Console links retain drawer, and plugin backend resource URLs warn. Includes/images may come from same approved repository through backend-validated resource URLs. Underscore-prefixed paths are include-only. Typed `console:` and `resource:` macros accept only fixed validated Console targets; guidance verifies renderer-generated provenance, waits only after required route navigation, and renders a non-modal dismissible spotlight.
 - **Provisional:** explicit selection of existing release namespace and schema-annotated additional inputs; namespace selection/lifecycle policy remains open.
-- Backend runs synchronous, bounded Helm setup with current-user RBAC and returns terminal success, failure, or timeout.
+- **Implemented and verified:** first page of first module opens by default; dropdown for multiple modules shows safe plain-text first-page titles (or module ID fallback), fetched in background after setup. Previous/Next crosses modules, counter is module-local, and only valid page paths resume on explicit relaunch. Chart-backed launches use async SpaceRequests/Helm worker and frontend polling, not a synchronous setup result.
 - **Implemented and verified:** Typed guidance uses fixed 25-ID Console registry and `resource:` links that require two or three GVK components (`version/kind` or `group/version/kind`). Scope and attribute schema remain enforced; cluster scope rejects `namespace`. Each GVK component and every nonempty supplied `name`/`namespace` selector is URI-encoded into fixed derived Console resource list/details paths, while Console resolves resource existence. Authors cannot supply routes or filter syntax. Route-backed target absence navigates once then waits; visible-only absence does not navigate. Spotlight is non-modal and cancels on interaction, Escape, route change, timeout, panel close, or unmount.
-- **Provisional:** browser-local `type: manual` checkpoints record user attestation only; evidence/checkpoint rules and solver behavior remain open.
+- Module-local manual checkpoint definitions are validated but not sent in bundle or presented as progress; evidence/checkpoint rules and solver behavior remain open.
 
 Design detail: [architect notes](../efforts/interactive-labs/architect-notes.md). Decisions: [design decisions](design-decisions.md).

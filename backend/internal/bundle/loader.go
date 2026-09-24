@@ -17,6 +17,9 @@ import (
 )
 
 var (
+	validModuleID   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	encodedPathText = regexp.MustCompile(`(?i)%[0-9a-f]{2}`)
+
 	// ErrRepositoryUnavailable means an approved source could not be obtained.
 	ErrRepositoryUnavailable = errors.New("repository unavailable")
 	// ErrManifestMissing means the configured lab has no lab.yaml.
@@ -41,10 +44,16 @@ type Resource struct {
 // Allows: alphanumeric, dash, dot, underscore, forward-slash.
 var validBranchRE = regexp.MustCompile(`^[a-zA-Z0-9._/-]+$`)
 
+// Module is one lab module with navigable paths relative to its content/ directory.
+type Module struct {
+	ID    string
+	Pages []string
+}
+
 // Result is the in-memory lab bundle loaded from disk.
 type Result struct {
 	Manifest           *manifest.LabManifest
-	Pages              []string // sorted navigable relative page paths
+	Modules            []Module // sorted by literal module ID
 	HelmChartAvailable bool
 	HelmChartDir       string // absolute path to setup/helm/ if available, empty otherwise
 	ValuesSchema       []byte // raw contents of setup/helm/values.schema.json, nil if absent
@@ -75,7 +84,14 @@ func ValidateLabPath(labPath string) error {
 	if slices.Contains(strings.Split(labPath, "/"), "..") {
 		return errors.New("lab path must not traverse")
 	}
+	if hasUnsupportedPathText(labPath) {
+		return errors.New("lab path contains unsupported characters")
+	}
 	return nil
+}
+
+func hasUnsupportedPathText(value string) bool {
+	return strings.IndexFunc(value, func(r rune) bool { return r < 32 || r == '\\' }) >= 0 || encodedPathText.MatchString(value)
 }
 
 // ValidateResourcePath permits only a repository-relative non-URL path.
@@ -155,6 +171,12 @@ func LoadFromSnapshot(repositoryRoot, labPath string) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: repository snapshot unavailable", ErrRepositoryUnavailable)
 	}
+	if err := rejectSymlinkPath(root, labPath); err != nil {
+		if errors.Is(err, ErrResourceNotFound) {
+			return nil, fmt.Errorf("%w: lab path", ErrManifestMissing)
+		}
+		return nil, fmt.Errorf("%w: lab path", ErrLabInvalid)
+	}
 	labDir, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(labPath)))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -173,7 +195,15 @@ func LoadFromSnapshot(repositoryRoot, labPath string) (*Result, error) {
 // repoRoot is the repository root directory where setup/helm/ is expected.
 // Exported for filesystem-focused tests.
 func LoadFromDir(labDir string, repoRoot string) (*Result, error) {
-	manifestBytes, err := os.ReadFile(filepath.Join(labDir, "lab.yaml"))
+	manifestPath := filepath.Join(labDir, "lab.yaml")
+	manifestInfo, err := os.Lstat(manifestPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w: lab.yaml", ErrManifestMissing)
+	}
+	if err != nil || !manifestInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: invalid lab.yaml", ErrLabInvalid)
+	}
+	manifestBytes, err := os.ReadFile(manifestPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("%w: lab.yaml", ErrManifestMissing)
@@ -185,41 +215,84 @@ func LoadFromDir(labDir string, repoRoot string) (*Result, error) {
 		return nil, fmt.Errorf("%w: manifest", ErrLabInvalid)
 	}
 
-	var contentPaths []string
-	contentDir := filepath.Join(labDir, "content")
-	if err := filepath.WalkDir(contentDir, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	modulesDir := filepath.Join(labDir, "modules")
+	info, err := os.Lstat(modulesDir)
+	if err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("%w: modules directory", ErrLabInvalid)
+	}
+	entries, err := os.ReadDir(modulesDir)
+	if err != nil || len(entries) == 0 {
+		return nil, fmt.Errorf("%w: no modules", ErrLabInvalid)
+	}
+	modules := make([]Module, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() || !validModuleID.MatchString(entry.Name()) {
+			return nil, fmt.Errorf("%w: invalid module entry", ErrLabInvalid)
 		}
-		if d.IsDir() || !strings.HasSuffix(p, ".adoc") {
+		moduleDir := filepath.Join(modulesDir, entry.Name())
+		contentDir := filepath.Join(moduleDir, "content")
+		contentInfo, err := os.Lstat(contentDir)
+		if err != nil || !contentInfo.IsDir() {
+			return nil, fmt.Errorf("%w: module content directory", ErrLabInvalid)
+		}
+		var contentPaths []string
+		err = filepath.WalkDir(moduleDir, func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if d.Type()&os.ModeSymlink != 0 {
+				return errors.New("symlink in module")
+			}
+			if d.IsDir() {
+				return nil
+			}
+			file, err := d.Info()
+			if err != nil || !file.Mode().IsRegular() {
+				return errors.New("non-regular module file")
+			}
+			rel, err := filepath.Rel(contentDir, p)
+			if err != nil {
+				return err
+			}
+			if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && strings.HasSuffix(p, ".adoc") {
+				page := filepath.ToSlash(rel)
+				if hasUnsupportedPathText(page) {
+					return errors.New("unsupported page path")
+				}
+				contentPaths = append(contentPaths, page)
+			}
 			return nil
-		}
-		rel, err := filepath.Rel(contentDir, p)
+		})
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("%w: read module content", ErrLabInvalid)
 		}
-		contentPaths = append(contentPaths, filepath.ToSlash(rel))
-		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("%w: read content", ErrLabInvalid)
-	}
-	if labErr := manifest.ValidateBundlePaths(contentPaths); labErr != nil {
-		return nil, fmt.Errorf("%w: content", ErrLabInvalid)
-	}
-
-	pages := make([]string, 0, len(contentPaths))
-	for _, page := range contentPaths {
-		if !isIncludeOnly(page) {
-			pages = append(pages, page)
+		if labErr := manifest.ValidateBundlePaths(contentPaths); labErr != nil {
+			return nil, fmt.Errorf("%w: module has no navigable pages", ErrLabInvalid)
 		}
+		pages := make([]string, 0, len(contentPaths))
+		for _, page := range contentPaths {
+			if !isIncludeOnly(page) {
+				pages = append(pages, page)
+			}
+		}
+		slices.Sort(pages)
+		moduleYAML, err := os.ReadFile(filepath.Join(moduleDir, "module.yaml"))
+		if err == nil {
+			if _, labErr := manifest.ValidateModule(moduleYAML, pages); labErr != nil {
+				return nil, fmt.Errorf("%w: invalid module.yaml", ErrLabInvalid)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: read module.yaml", ErrLabInvalid)
+		}
+		modules = append(modules, Module{ID: entry.Name(), Pages: pages})
 	}
-	slices.Sort(pages)
+	slices.SortFunc(modules, func(a, b Module) int { return strings.Compare(a.ID, b.ID) })
 
 	helmDir := filepath.Join(repoRoot, "setup", "helm")
 	_, helmErr := os.Stat(filepath.Join(helmDir, "Chart.yaml"))
 	helmAvailable := helmErr == nil
 
-	result := &Result{Manifest: m, Pages: pages, HelmChartAvailable: helmAvailable}
+	result := &Result{Manifest: m, Modules: modules, HelmChartAvailable: helmAvailable}
 	if helmAvailable {
 		result.HelmChartDir = helmDir
 		if schema, err := os.ReadFile(filepath.Join(helmDir, "values.schema.json")); err == nil {

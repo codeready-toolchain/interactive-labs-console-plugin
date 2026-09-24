@@ -7,6 +7,14 @@ import {
   ActionListItem,
   Alert,
   Button,
+  DataList,
+  DataListAction,
+  DataListCell,
+  DataListContent,
+  DataListItem,
+  DataListItemCells,
+  DataListItemRow,
+  DataListToggle,
   Drawer,
   DrawerActions,
   DrawerContent,
@@ -15,27 +23,28 @@ import {
   DrawerPanelContent,
   EmptyState,
   EmptyStateBody,
-  Flex,
-  FlexItem,
   PageSection,
+  Select,
+  SelectList,
+  SelectOption,
+  MenuToggle,
   Spinner,
   TextInput,
   Title,
 } from "@patternfly/react-core";
 import {
   fetchResourceText,
-  getNavigablePagePaths,
   getSetupStatus,
   listCatalog,
   loadLabBundle,
   setupLab,
 } from "./api/client";
-import { renderAsciiDoc, type RenderResult } from "./renderer";
+import { extractAsciiDocTitle, renderAsciiDoc, type RenderResult } from "./renderer";
 import { TimesIcon, WindowMinimizeIcon } from "@patternfly/react-icons";
 import type { CatalogEntry } from "./types/catalog";
 import type { LabError } from "./types/errors";
 import type { PersistedSession } from "./types/session";
-import type { LabPage } from "./types/manifest";
+import type { LabModule, LabPage } from "./types/manifest";
 import type { SetupStatus } from "./types/setup";
 import { sanitizeTitle } from "./sanitizer";
 
@@ -46,9 +55,11 @@ type PageState =
 
 type ActivePanel = PersistedSession & {
   catalogRef: string;
-  displayName: string;
+  title: string;
+  modules: LabModule[];
   pages: LabPage[];
   attributes: Record<string, string>;
+  launchController: AbortController;
 };
 
 type RenderState =
@@ -73,7 +84,7 @@ type GuidanceRequest = {
 type GuidanceState = GuidanceRequest | { phase: "notice"; message: string };
 
 type InteractiveLabsContextValue = {
-  launch: (catalogRef: string, trigger: HTMLElement, requestedPageURL?: string) => Promise<void>;
+  launch: (catalogRef: string, labPath: string, trigger: HTMLElement, requestedPageURL?: string) => Promise<void>;
   loadingCatalogRef?: string;
   launchError?: string;
 };
@@ -226,6 +237,8 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const [setupState, setSetupState] = React.useState<SetupState>();
   const [renderState, setRenderState] = React.useState<RenderState>({ status: "loading" });
   const [renderRetry, setRenderRetry] = React.useState(0);
+  const [moduleTitles, setModuleTitles] = React.useState<Record<string, string>>({});
+  const [moduleSelectOpen, setModuleSelectOpen] = React.useState(false);
   const launchTriggerRef = React.useRef<HTMLElement | null>(null);
   const drawerFocusRef = React.useRef<HTMLDivElement | null>(null);
   const restoreFocusRef = React.useRef<HTMLButtonElement | null>(null);
@@ -240,22 +253,27 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const isOpen = activePanel?.panelMode === "open";
   const navigate = useNavigate();
   const location = useLocation();
-  const pagePaths = activePanel ? getNavigablePagePaths(activePanel.pages) : [];
+  const pagePaths = activePanel ? activePanel.pages.map((page) => page.path) : [];
   const currentPageIndex = activePanel ? pagePaths.indexOf(activePanel.currentPagePath) : -1;
+  const activeModule = activePanel?.modules.find((module) => module.pages.some((page) => page.path === activePanel.currentPagePath));
+  const modulePageIndex = activeModule?.pages.findIndex((page) => page.path === activePanel?.currentPagePath) ?? -1;
 
   React.useEffect(() => {
     if (isOpen) drawerFocusRef.current?.focus();
     else if (activePanel?.panelMode === "minimized") restoreFocusRef.current?.focus();
     else if (launchTriggerRef.current?.isConnected) launchTriggerRef.current.focus();
-  }, [activePanel, isOpen]);
+  }, [activePanel?.panelMode, isOpen]);
 
   const launch = React.useCallback(async (
     catalogRef: string,
+    labPath: string,
     trigger: HTMLElement,
     requestedPageURL?: string,
   ): Promise<void> => {
     launchTriggerRef.current = trigger;
     launchAbortRef.current?.abort();
+    setModuleTitles({});
+    setModuleSelectOpen(false);
     const controller = new AbortController();
     launchAbortRef.current = controller;
     const isCurrentLaunch = (): boolean => mountedRef.current && launchAbortRef.current === controller && !controller.signal.aborted;
@@ -265,33 +283,36 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
     setLaunchError(undefined);
     setSetupState(undefined);
     try {
-      const bundle = await loadLabBundle(catalogRef, controller.signal);
+      const bundle = await loadLabBundle(catalogRef, labPath, controller.signal);
       if (!isCurrentLaunch()) return;
 
-      const pagePaths = getNavigablePagePaths(bundle.pages);
+      const pages = bundle.modules.flatMap((module) => module.pages);
+      const pagePaths = pages.map((page) => page.path);
       const entryPage = pagePaths[0];
       if (!entryPage) throw new Error("Lab has no navigable pages.");
       const saved = readSession(catalogRef, pagePaths);
       const requestedPage = requestedPageURL ? (() => {
         const target = new URL(requestedPageURL, window.location.origin);
         if (target.search) return undefined;
-        return bundle.pages.find((page) => {
+        return pages.find((page) => {
           const pageURL = new URL(page.url, window.location.origin);
           return pageURL.origin === target.origin && pageURL.pathname === target.pathname;
         });
       })() : undefined;
-      if (requestedPageURL && !requestedPage) throw new Error("Lab page is unavailable.");
+      if (requestedPageURL && !requestedPage) throw new Error(LINK_WARNING);
       pendingFragmentRef.current = requestedPageURL
         ? new URL(requestedPageURL, window.location.origin).hash.slice(1) || undefined
         : undefined;
       const needsSetup = bundle.runtimeContext.helmChartAvailable;
       const panel: ActivePanel = {
         catalogRef,
-        displayName: bundle.manifest.metadata.displayName,
+        title: bundle.manifest.metadata.title,
+        modules: bundle.modules,
         currentPagePath: requestedPage?.path ?? saved?.currentPagePath ?? entryPage,
         panelMode: needsSetup ? "open" : saved?.panelMode ?? "open",
-        pages: bundle.pages,
-        attributes: bundle.manifest.spec.attributes ?? {},
+        pages,
+        attributes: bundle.manifest.spec?.attributes ?? {},
+        launchController: controller,
       };
       openedPanel = needsSetup;
       if (needsSetup) setSetupState({ status: "pending" });
@@ -321,6 +342,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   }, []);
 
   const setPanelMode = React.useCallback((panelMode: PersistedSession["panelMode"]): void => {
+    setModuleSelectOpen(false);
     setActivePanel((current) => {
       if (!current) return current;
       const panel = { ...current, panelMode };
@@ -346,6 +368,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   }, []);
 
   const closePanel = React.useCallback(() => {
+    setModuleSelectOpen(false);
     launchAbortRef.current?.abort();
     clearGuidance();
     setSetupState(undefined);
@@ -561,6 +584,31 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   }, [clearGuidance, guidance]);
 
   React.useEffect(() => {
+    if (!activePanel || setupState) return undefined;
+    const controller = new AbortController();
+    for (const module of activePanel.modules) {
+      const page = module.pages[0];
+      void fetchResourceText(page.url, controller.signal)
+        .then((source) => extractAsciiDocTitle({
+          source,
+          sourceURL: page.url,
+          attributes: activePanel.attributes,
+          loadResource: fetchResourceText,
+          signal: controller.signal,
+        }))
+        .then((title) => {
+          if (controller.signal.aborted || activePanel.launchController.signal.aborted || !title) return;
+          const template = document.createElement("template");
+          template.innerHTML = sanitizeTitle(title);
+          const text = template.content.textContent?.trim();
+          if (text) setModuleTitles((current) => ({ ...current, [module.id]: text }));
+        })
+        .catch(() => { /* Use literal module ID if its first page or title is unavailable. */ });
+    }
+    return () => controller.abort();
+  }, [activePanel?.launchController, setupState]);
+
+  React.useEffect(() => {
     if (!activePanel || activePanel.panelMode !== "open" || setupState) return undefined;
     const page = activePanel.pages.find((candidate) => candidate.path === activePanel.currentPagePath);
     if (!page) {
@@ -611,6 +659,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       {children}
       {activePanel && (
         <Drawer
+          className="pfext-lab-drawer"
           isExpanded={isOpen}
           position="end"
           style={{ position: "fixed", inset: 0, zIndex: 1000, pointerEvents: "none" }}
@@ -629,9 +678,14 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
                   <DrawerHead>
                     <div ref={drawerFocusRef} tabIndex={-1}>
                       <Title headingLevel="h2" style={{ marginRight: "var(--pf-t--global--spacer--md)" }}>
-                        {activePanel.displayName}
+                        {activePanel.title}
                       </Title>
-                      <span aria-live="polite">Page {currentPageIndex + 1} of {pagePaths.length}</span>
+                      {!setupState && (
+                        <>
+                          <div className="pfext-lab-module-title">{activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}</div>
+                          <span aria-live="polite">Page {modulePageIndex + 1} of {activeModule?.pages.length ?? 0}</span>
+                        </>
+                      )}
                     </div>
                     <DrawerActions>
                       <Button variant="plain" onClick={() => setPanelMode("minimized")} aria-label="Minimize lab">
@@ -687,33 +741,68 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
                       </>
                     )}
                   </div>
-                  {!setupState && (
-                    <div className="pfext-lab-footer">
-                      <ActionList>
-                        <ActionListGroup>
-                          <ActionListItem>
-                            <Button
-                              variant="primary"
-                              isDisabled={currentPageIndex < 0 || currentPageIndex >= pagePaths.length - 1}
-                              onClick={() => selectPage(pagePaths[currentPageIndex + 1])}
-                            >
-                              Next
-                            </Button>
-                          </ActionListItem>
-                          <ActionListItem>
-                            <Button
-                              variant="secondary"
-                              isDisabled={currentPageIndex <= 0}
-                              onClick={() => selectPage(pagePaths[currentPageIndex - 1])}
-                            >
-                              Back
-                            </Button>
-                          </ActionListItem>
-                        </ActionListGroup>
-                      </ActionList>
-                    </div>
-                  )}
                 </DrawerPanelBody>
+                <div className="pfext-lab-footer">
+                  <ActionList>
+                    <ActionListGroup className="pfext-lab-footer__actions">
+                      <ActionListItem>
+                        <Button
+                          variant="primary"
+                          isDisabled={!!setupState || currentPageIndex < 0 || currentPageIndex >= pagePaths.length - 1}
+                          onClick={() => selectPage(pagePaths[currentPageIndex + 1])}
+                        >
+                          Next
+                        </Button>
+                      </ActionListItem>
+                      <ActionListItem>
+                        <Button
+                          variant="secondary"
+                          isDisabled={!!setupState || currentPageIndex <= 0}
+                          onClick={() => selectPage(pagePaths[currentPageIndex - 1])}
+                        >
+                          Back
+                        </Button>
+                      </ActionListItem>
+                      {activePanel.modules.length > 1 && (
+                        <ActionListItem className="pfext-lab-footer__module">
+                          <Select
+                            isOpen={!setupState && moduleSelectOpen}
+                            selected={setupState ? undefined : activeModule?.id}
+                            onOpenChange={setModuleSelectOpen}
+                            shouldFocusToggleOnSelect
+                            onSelect={(_event, id) => {
+                              const firstPage = activePanel.modules.find((module) => module.id === id)?.pages[0];
+                              if (firstPage) selectPage(firstPage.path);
+                              setModuleSelectOpen(false);
+                            }}
+                            toggle={(toggleRef) => (
+                              <MenuToggle
+                                ref={toggleRef}
+                                className="pfext-lab-module-toggle"
+                                aria-label={setupState ? "Module" : `Module: ${activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}`}
+                                title={setupState ? undefined : activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}
+                                aria-haspopup="listbox"
+                                isExpanded={!setupState && moduleSelectOpen}
+                                isDisabled={!!setupState}
+                                onClick={() => setModuleSelectOpen((open) => !open)}
+                              >
+                                {setupState ? "Module" : activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}
+                              </MenuToggle>
+                            )}
+                          >
+                            <SelectList>
+                              {!setupState && activePanel.modules.map((module) => (
+                                <SelectOption key={module.id} value={module.id}>
+                                  {moduleTitles[module.id] ?? module.id}
+                                </SelectOption>
+                              ))}
+                            </SelectList>
+                          </Select>
+                        </ActionListItem>
+                      )}
+                    </ActionListGroup>
+                  </ActionList>
+                </div>
               </DrawerPanelContent>
             ) : null}
           >
@@ -772,11 +861,15 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
 const useInteractiveLabs = (): InteractiveLabsContextValue | undefined =>
   React.useContext(InteractiveLabsContext);
 
-const CatalogDescription: React.FC<{ item: CatalogEntry }> = ({ item }) => {
+const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
   const [state, setState] = React.useState<RenderState>({ status: "loading" });
+  const [isExpanded, setIsExpanded] = React.useState(false);
   const [linkWarning, setLinkWarning] = React.useState<string>();
   const interactiveLabs = useInteractiveLabs();
-  const sourceURL = `${PROXY_BASE}/api/v1alpha1/labs/${item.catalogRef}/resources/${item.labPath}/lab.yaml`;
+  const resourceRoot = `${PROXY_BASE}/api/v1alpha1/labs/${item.catalogRef}/resources/${item.labPath === "." ? "" : `${item.labPath.split("/").map(encodeURIComponent).join("/")}/`}`;
+  const sourceURL = `${resourceRoot}lab.yaml`;
+  const itemId = `lab-${item.catalogRef}`;
+  const descriptionId = `${itemId}-description`;
 
   const handleLink = React.useCallback((event: React.MouseEvent<HTMLDivElement>): void => {
     if (event.defaultPrevented || event.button !== 0) return;
@@ -791,10 +884,10 @@ const CatalogDescription: React.FC<{ item: CatalogEntry }> = ({ item }) => {
       setLinkWarning(LINK_WARNING);
       return;
     }
-    const pageRoot = `${PROXY_BASE}/api/v1alpha1/labs/${item.catalogRef}/resources/${item.labPath}/content/`;
+    const pageRoot = `${resourceRoot}modules/`;
     if (target.origin === window.location.origin && target.pathname.startsWith(pageRoot)) {
       event.preventDefault();
-      void interactiveLabs?.launch(item.catalogRef, link, target.href);
+      void interactiveLabs?.launch(item.catalogRef, item.labPath, link, target.href);
       return;
     }
     if ((target.protocol === "http:" || target.protocol === "https:") && target.origin !== window.location.origin) {
@@ -805,7 +898,7 @@ const CatalogDescription: React.FC<{ item: CatalogEntry }> = ({ item }) => {
     if (target.origin === window.location.origin && !target.pathname.startsWith(PROXY_BASE)) return;
     event.preventDefault();
     setLinkWarning(LINK_WARNING);
-  }, [interactiveLabs, item.catalogRef, item.labPath, sourceURL]);
+  }, [interactiveLabs, item.catalogRef, item.labPath, resourceRoot, sourceURL]);
 
   React.useEffect(() => {
     if (!item.description) return undefined;
@@ -829,18 +922,62 @@ const CatalogDescription: React.FC<{ item: CatalogEntry }> = ({ item }) => {
     return () => controller.abort();
   }, [item]);
 
-  if (state.status === "loading") return <Spinner aria-label={`Loading description for ${item.displayName}`} />;
-  if (state.status === "error") return <Alert variant="warning" title={state.message} isInline />;
+  const template = document.createElement("template");
+  if (state.status === "success") template.innerHTML = state.result.html;
+  const paragraph = template.content.querySelector("div.paragraph > p, p");
+  const preview = paragraph?.parentElement?.matches("div.paragraph") ? paragraph.parentElement : paragraph;
+  const previewHTML = preview?.outerHTML;
+  let parent = preview?.parentElement;
+  preview?.remove();
+  while (parent && !parent.innerHTML.trim()) {
+    const next = parent.parentElement;
+    parent.remove();
+    parent = next;
+  }
+  const remainingHTML = template.innerHTML.trim();
+
   return (
-    <>
-      {linkWarning && <Alert variant="warning" title={linkWarning} isInline />}
-      {state.result.warnings.map((warning, index) => <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />)}
-      <div
-        className="interactive-labs-content doc catalog-description"
-        onClick={handleLink}
-        dangerouslySetInnerHTML={{ __html: state.result.html }}
-      />
-    </>
+    <DataListItem aria-labelledby={itemId} isExpanded={isExpanded}>
+      <DataListItemRow>
+        {remainingHTML && (
+          <DataListToggle
+            id={`${itemId}-toggle`}
+            aria-controls={descriptionId}
+            aria-label={`Toggle description for ${item.title}`}
+            isExpanded={isExpanded}
+            buttonProps={{ onClick: () => setIsExpanded((expanded) => !expanded) }}
+          />
+        )}
+        <DataListItemCells dataListCells={[
+          <DataListCell key="name" width={5}>
+            <strong id={itemId}>{item.title}</strong>
+            {linkWarning && <Alert variant="warning" title={linkWarning} isInline />}
+            {item.description && state.status === "loading" && <Spinner aria-label={`Loading description for ${item.title}`} />}
+            {state.status === "error" && <Alert variant="warning" title={state.message} isInline />}
+            {state.status === "success" && state.result.warnings.map((warning, index) => (
+              <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
+            ))}
+            {previewHTML && (
+              <div className="interactive-labs-content doc catalog-description" onClick={handleLink} dangerouslySetInnerHTML={{ __html: previewHTML }} />
+            )}
+          </DataListCell>,
+        ]} />
+        <DataListAction id={`${itemId}-actions`} aria-labelledby={itemId} aria-label={`Actions for ${item.title}`}>
+          <Button
+            isLoading={interactiveLabs?.loadingCatalogRef === item.catalogRef}
+            isDisabled={!interactiveLabs}
+            onClick={(event) => void interactiveLabs?.launch(item.catalogRef, item.labPath, event.currentTarget)}
+          >
+            Launch
+          </Button>
+        </DataListAction>
+      </DataListItemRow>
+      {remainingHTML && (
+        <DataListContent id={descriptionId} aria-label={`Description for ${item.title}`} isHidden={!isExpanded}>
+          <div className="interactive-labs-content doc catalog-description" onClick={handleLink} dangerouslySetInnerHTML={{ __html: remainingHTML }} />
+        </DataListContent>
+      )}
+    </DataListItem>
   );
 };
 
@@ -852,7 +989,7 @@ const InteractiveLabsPage: React.FC = () => {
   const filteredItems =
     state.status === "success"
       ? state.items.filter((item) =>
-          `${item.displayName} ${item.description ?? ""}`
+          `${item.title} ${item.description ?? ""}`
             .toLowerCase()
             .includes(filter.toLowerCase()),
         )
@@ -918,28 +1055,9 @@ const InteractiveLabsPage: React.FC = () => {
               <EmptyStateBody>Try a different name or description.</EmptyStateBody>
             </EmptyState>
           ) : (
-            <>
-              {filteredItems.map((item) => {
-                const itemId = `lab-${item.catalogRef}`;
-                return (
-                  <Flex key={item.catalogRef} alignItems={{ default: "alignItemsFlexStart" }}>
-                    <FlexItem grow={{ default: "grow" }}>
-                      <strong id={itemId}>{item.displayName}</strong>
-                      {item.description && <CatalogDescription item={item} />}
-                    </FlexItem>
-                    <FlexItem>
-                      <Button
-                        isLoading={interactiveLabs?.loadingCatalogRef === item.catalogRef}
-                        isDisabled={!interactiveLabs}
-                        onClick={(event) => void interactiveLabs?.launch(item.catalogRef, event.currentTarget)}
-                      >
-                        Launch
-                      </Button>
-                    </FlexItem>
-                  </Flex>
-                );
-              })}
-            </>
+            <DataList aria-label="Available labs" isCompact isPlain>
+              {filteredItems.map((item) => <CatalogItem key={item.catalogRef} item={item} />)}
+            </DataList>
           )}
         </>
       )}

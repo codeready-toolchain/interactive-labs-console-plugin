@@ -38,13 +38,15 @@ Do not represent planned behavior as shipped.
 | --- | --- |
 | Secure Console proxy, source-only ConfigMap catalog, manifest-derived catalog metadata, atomic refreshed hashed HTTPS repository snapshots at fixed future-PVC mount path, bundle API, manifest/path validation, typed errors, safe catalog-omission and refresh-failure Warning Events | **Implemented and verified** |
 | Catalog-listing page, loading/empty/error/retry states | **Implemented and verified** |
-| Lab launch for labs without charts, drawer, AsciiDoc rendering, page navigation, browser page/include/image resource endpoint | **Implemented and verified** |
+| Modules-only lab bundle, single/multi-module drawer navigation and title fallback, AsciiDoc rendering, browser page/include/image resource endpoint | **Implemented and verified** |
 | Typed Console guidance/resource links | **Implemented and verified** |
-| Helm execution; explicit existing-namespace selection with schema annotations; browser-local `type: manual` checkpoints | **Provisional direction** |
-| Namespace selection/lifecycle; completion evidence and checkpoint rules; section solving; automated verification; durable/audited progress; async setup/recovery; revision lifecycle; offline delivery; author validation tool | **Open or deferred** |
+| Chart-backed async SpaceRequests/Helm setup with frontend status polling | **Implemented and verified** |
+| Explicit existing-namespace selection; browser-local manual-checkpoint attestation | **Provisional direction** |
+| Namespace selection/lifecycle; completion evidence and checkpoint rules; section solving; automated verification; durable/audited progress; durable setup recovery; revision lifecycle; offline delivery; author validation tool | **Open or deferred** |
 
-Notable current boundaries: snapshots live under `/var/lib/interactive-labs/cache` and persist across backend shutdown while storage remains. No PVC is mounted today, so pod/container replacement loses them; a future PVC mounts that fixed path. Service-account refresh runs at startup and then on configured cadence (`1h` default, four source workers), stages each source for a fixed ten-minute deadline, and atomically replaces only validated generations. Resource responses use a quoted snapshot Git `HEAD` SHA as `ETag` with `Cache-Control: private, no-cache`; resource-size caps are not yet enforced. No browser update notification, revision pinning, migration, reconciliation, rollback, or cache eviction exists. Labs without charts launch directly; chart-backed launches defer setup to STORY-5. Backend setup returns a success-shaped response with a derived release name but does **not** invoke Helm.
+Notable current boundaries: snapshots live under `/var/lib/interactive-labs/cache` and persist across backend shutdown while storage remains. No PVC is mounted today, so pod/container replacement loses them; a future PVC mounts that fixed path. Service-account refresh runs at startup and then on configured cadence (`1h` default, four source workers), stages each source for a fixed ten-minute deadline, and atomically replaces only validated generations. Resource responses use a quoted snapshot Git `HEAD` SHA as `ETag` with `Cache-Control: private, no-cache`; resource-size caps are not yet enforced. No browser update notification, revision pinning, migration, reconciliation, rollback, or cache eviction exists. Labs without charts launch directly; chart-backed launches start async SpaceRequests/Helm setup and open instructions after status polling succeeds. See [lab setup design](lab-setup-design.md).
 
 ## Provisional directions
 
 Namespace selection/lifecycle and completion/checkpoint rules remain open. Current explicit existing-namespace selection and browser-local `type: manual` checkpoint approaches are candidates for exploration, not settled policy. Section-solving behavior also remains open.
+

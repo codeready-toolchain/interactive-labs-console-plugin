@@ -2,18 +2,11 @@ export interface LabManifest {
   apiVersion: "v1alpha1";
   kind: "Lab";
   metadata: {
-    name: string;
-    displayName: string;
+    title: string;
     description?: string;
   };
-  spec: {
+  spec?: {
     attributes?: Record<string, string>;
-    checkpoints?: Array<{
-      id: string;
-      type: "manual";
-      pagePath: string;
-      label: string;
-    }>;
   };
 }
 
@@ -28,12 +21,17 @@ export interface LabPage {
   url: string;
 }
 
+export interface LabModule {
+  id: string;
+  pages: LabPage[];
+}
+
 export interface LabBundle {
   apiVersion: "v1alpha1";
   kind: "LabBundle";
   manifest: LabManifest;
-  /** Sorted content-relative paths with proxy-resolved source URLs. */
-  pages: LabPage[];
+  /** Backend-ordered modules and lab-relative pages with proxy-resolved URLs. */
+  modules: LabModule[];
   runtimeContext: RuntimeContext;
 }
 

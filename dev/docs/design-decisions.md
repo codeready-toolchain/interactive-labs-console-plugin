@@ -6,7 +6,7 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 **Decision:** Use Console `UserToken` proxy and one supported Console/Dynamic Plugin SDK compatibility range.
 
-**Why:** preserves current-user RBAC and avoids privileged identity/impersonation. Forwarded tokens are request-scoped and never logged, persisted, audited, echoed, or returned in errors.
+**Why:** preserves current-user RBAC and avoids privileged identity/impersonation. Forwarded tokens are never logged, persisted, audited, echoed, or returned in errors; current asynchronous setup worker holds token in memory beyond POST response for current-user cluster operations.
 
 **Implemented and verified:** proxy alias `backend` uses `UserToken`; backend authenticates token against OpenShift user API.
 
@@ -16,7 +16,7 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 **Why:** retrying or cleaning partially installed charts needs an explicit chart lifecycle policy. Terminal errors require manual user or administrator intervention.
 
-**Deferred:** cancellation, durable operation records, recovery protocol, and async status.
+**Implemented:** async SpaceRequests/Helm worker with setup status polling. **Deferred:** cancellation, durable operation records, and automatic cleanup/recovery.
 
 ## Q3 — Rendered content safety
 
@@ -52,13 +52,13 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 **Status: open.** Product needs policy for one and multiple namespaces.
 
-**Provisional direction:** explicit existing release-namespace selection plus `values.schema.json` fields annotated `x-interactive-labs: { kind: namespace-name }` for additional inputs. This avoids duplicate manifest lists and brittle template inference, but does not settle selection or lifecycle policy. Current candidate permits accessible current-namespace preselection and shared bindings.
+**Provisional direction:** explicit existing release-namespace selection plus `values.schema.json` fields annotated `x-interactive-labs: { kind: namespace-name }` for additional inputs. This is not current setup behavior: current chart setup creates SpaceRequests from schema annotations, then installs Helm asynchronously. Selection/lifecycle policy remains open.
 
 ## Q8 — Manifest/API evolution
 
-**Decision:** support only semantic `v1alpha1` manifest in MVP; backend and plugin reject unsupported versions. No general migration framework.
+**Decision:** keep `apiVersion: v1alpha1` while deliberately breaking its old flat lab shape. This is an explicit incompatible cutover, not additive evolution: `lab.yaml` now requires `metadata.title`, rejects old name/displayName and root checkpoints, and pages live in `modules/<id>/content/`; bundle has modules, not root pages. Backend and plugin reject unsupported versions **and** old/unknown fields. No general migration framework.
 
-**Implemented and verified:** backend accepts only `apiVersion: v1alpha1`, `kind: Lab`, and required metadata fields; client checks compatible manifest version and required metadata.
+**Implemented and verified:** backend and browser validate new manifest/bundle shapes. Authors must convert old flat labs before rollout. Invalid cached old snapshots are omitted safely from catalog; cache does not auto-refresh, and active sessions are not migrated. Change to a new `apiVersion` if future compatibility promises require coexistence rather than treating this breaking `v1alpha1` change as additive.
 
 ## Q9 — Lab-content delivery
 
@@ -78,7 +78,7 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 ## Open or deferred
 
-Namespace selection/lifecycle, completion evidence/checkpoint rules, and section-solving behavior are open. Current explicit existing-namespace selection and browser-local manual-checkpoint approaches are provisional. No commitment exists for automated verification, author-validation tool, durable/audited progress, asynchronous setup/recovery, upstream revision lifecycle, rollback, disconnected delivery, or broad chart topology support.
+Namespace selection/lifecycle, completion evidence/checkpoint rules, and section-solving behavior are open. Current explicit existing-namespace selection and browser-local manual-checkpoint approaches are provisional, not current UI. No commitment exists for automated verification, author-validation tool, durable/audited progress, durable async recovery, upstream revision lifecycle, rollback, disconnected delivery, or broad chart topology support.
 
 ## Decision records
 

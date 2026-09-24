@@ -53,8 +53,8 @@ func newRouter(t *testing.T) http.Handler {
 		},
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
-				Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Manifest Lab", Description: "Manifest description"}},
-				Pages:    []string{"intro.adoc"},
+				Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Manifest Lab", Description: "Manifest description"}},
+				Modules:  []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 			}, nil
 		},
 		RuntimeAttributes: func(_ *http.Request, subject string) (map[string]string, error) {
@@ -76,8 +76,8 @@ func newSetupRouter(t *testing.T) (http.Handler, <-chan struct{}) {
 		},
 		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 			return &bundle.Result{
-				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Manifest Lab"}},
-				Pages:              []string{"= Intro"},
+				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Manifest Lab"}},
+				Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 				HelmChartAvailable: true,
 				HelmChartDir:       t.TempDir(),
 				ValuesSchema:       testValuesSchema,
@@ -123,7 +123,7 @@ func TestCatalogHandler(t *testing.T) {
 				if strings.Contains(repository, "lab-z") {
 					name = "Lab Z"
 				}
-				return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: name, DisplayName: name}}, Pages: []string{"intro.adoc"}}, nil
+				return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: name}}, Modules: []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}}}, nil
 			},
 		})
 		rw := httptest.NewRecorder()
@@ -135,8 +135,9 @@ func TestCatalogHandler(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
 		items := body["items"].([]any)
 		require.Len(t, items, 2)
-		assert.Equal(t, "Lab Z", items[0].(map[string]any)["displayName"])
-		assert.Equal(t, "Lab A", items[1].(map[string]any)["displayName"])
+		assert.Equal(t, "Lab Z", items[0].(map[string]any)["title"])
+		assert.Equal(t, "Lab A", items[1].(map[string]any)["title"])
+		assert.NotContains(t, items[0].(map[string]any), "displayName")
 		// catalogRef must be present, id must not
 		assert.Contains(t, items[0].(map[string]any), "catalogRef")
 		assert.NotContains(t, items[0].(map[string]any), "id")
@@ -184,7 +185,7 @@ func TestCatalogHandler(t *testing.T) {
 				if strings.Contains(repository, "missing") {
 					return nil, fmt.Errorf("%w: private details", bundle.ErrManifestMissing)
 				}
-				return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: "good", DisplayName: "Manifest name", Description: "Manifest description"}}, Pages: []string{"intro.adoc"}}, nil
+				return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Manifest name", Description: "Manifest description"}}, Modules: []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}}}, nil
 			},
 			Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
 			CatalogLabOmitted: func(_ context.Context, entry catalog.Entry, reason string) {
@@ -198,14 +199,14 @@ func TestCatalogHandler(t *testing.T) {
 		var body struct {
 			Items []struct {
 				CatalogRef  string `json:"catalogRef"`
-				DisplayName string `json:"displayName"`
+				Title       string `json:"title"`
 				Description string `json:"description"`
 			} `json:"items"`
 		}
 		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
 		require.Equal(t, []struct {
 			CatalogRef  string `json:"catalogRef"`
-			DisplayName string `json:"displayName"`
+			Title       string `json:"title"`
 			Description string `json:"description"`
 		}{{validRef, "Manifest name", "Manifest description"}}, body.Items)
 		assert.Equal(t, []string{catalog.DeriveRef("https://github.com/redhat/missing", "main", "lab", nil) + ":ManifestMissing"}, warnings)
@@ -251,6 +252,140 @@ func TestCatalogHandler(t *testing.T) {
 	})
 }
 
+// STORY-14: module metadata belongs to the bundle, but setup remains lab-wide.
+func TestModuleWireContract(t *testing.T) {
+	root := t.TempDir()
+	for name, contents := range map[string]string{
+		"lab/lab.yaml": "apiVersion: v1alpha1\nkind: Lab\nmetadata:\n  title: Manifest title\n  description: Catalog only\nspec:\n  attributes:\n    shared: manifest\n    user: manifest\n    manifest-only: yes\n",
+		"lab/modules/010-intro/content/010-start.adoc":        "= Start\n",
+		"lab/modules/010-intro/content/_partials/shared.adoc": "Shared\n",
+		"lab/modules/010-intro/module.yaml":                   "checkpoints:\n  - id: checkpoint\n    type: manual\n    pagePath: 010-start.adoc\n    label: Done\n",
+		"lab/modules/020-apply/content/pages/020-apply.adoc":  "= Apply\n",
+		"invalid/lab.yaml": "apiVersion: v1alpha1\nkind: Lab\nmetadata:\n  title: Invalid lab\n",
+		"invalid/modules/010-broken/content/_only.adoc": "= Include only\n",
+		"setup/helm/Chart.yaml":                         "apiVersion: v2\nname: test\nversion: 1.0.0\n",
+		"setup/helm/values.schema.json":                 string(testValuesSchema),
+	} {
+		file := filepath.Join(root, filepath.FromSlash(name))
+		require.NoError(t, os.MkdirAll(filepath.Dir(file), 0o755))
+		require.NoError(t, os.WriteFile(file, []byte(contents), 0o600))
+	}
+	const repository = "https://github.com/redhat/modules"
+	overrides := map[string]string{"shared": "catalog", "user": "catalog", "catalog-only": "yes"}
+	ref := catalog.DeriveRef(repository, "main", "lab", overrides)
+	var omitted []string
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: stubCatalogCM(map[string]string{"catalog.yaml": `- repository: https://github.com/redhat/modules
+  branch: main
+  labPath: lab
+  attributeOverrides:
+    shared: catalog
+    user: catalog
+    catalog-only: yes
+- repository: https://github.com/redhat/invalid
+  branch: main
+  labPath: invalid`}),
+		BundleLoader: func(_ context.Context, _, _, labPath string) (*bundle.Result, error) {
+			return bundle.LoadFromSnapshot(root, labPath)
+		},
+		CatalogLabOmitted: func(_ context.Context, entry catalog.Entry, reason string) {
+			omitted = append(omitted, entry.CatalogRef+":"+reason)
+		},
+		Authenticate: func(_ context.Context, _, token string) (string, error) { return token, nil },
+		RuntimeAttributes: func(_ *http.Request, subject string) (map[string]string, error) {
+			return map[string]string{"user": subject, "openshift_api_url": "https://api.example.test", "openshift_console_url": "https://console.example.test", "openshift_cluster_ingress_domain": "apps.example.test"}, nil
+		},
+		ResourceLoader: func(_ context.Context, _, _, resourcePath string) (*bundle.Resource, error) {
+			res, err := bundle.ReadResource(root, resourcePath)
+			if err != nil {
+				return nil, err
+			}
+			res.Revision = "abc123"
+			return res, nil
+		},
+		SetupClient: prepareSetupClient(t),
+		HelmManager: &stubHelmManager{status: "deployed"},
+	})
+
+	t.Run("catalog exposes manifest title and safely omits invalid lab", func(t *testing.T) {
+		rw := httptest.NewRecorder()
+		router.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/api/v1alpha1/catalog", nil))
+		require.Equal(t, http.StatusOK, rw.Code)
+		var body struct {
+			Items []map[string]any `json:"items"`
+		}
+		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+		require.Len(t, body.Items, 1)
+		assert.Equal(t, ref, body.Items[0]["catalogRef"])
+		assert.Equal(t, "Manifest title", body.Items[0]["title"])
+		assert.Equal(t, "Catalog only", body.Items[0]["description"])
+		assert.Equal(t, "lab", body.Items[0]["labPath"])
+		assert.NotContains(t, body.Items[0], "displayName")
+		assert.Equal(t, []string{catalog.DeriveRef("https://github.com/redhat/invalid", "main", "invalid", nil) + ":LabInvalid"}, omitted)
+	})
+
+	t.Run("bundle returns only module-qualified paths and effective attributes", func(t *testing.T) {
+		rw := resourceRequest(t, router, ref, "lab/modules/010-intro/content/010-start.adoc")
+		require.Equal(t, http.StatusOK, rw.Code)
+		assert.Equal(t, "= Start\n", rw.Body.String())
+		req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
+		req.Header.Set("Authorization", "Bearer user1")
+		rw = httptest.NewRecorder()
+		router.ServeHTTP(rw, req)
+		require.Equal(t, http.StatusOK, rw.Code)
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+		assert.Equal(t, "LabBundle", body["kind"])
+		assert.NotContains(t, body, "pages")
+		modules, ok := body["modules"].([]any)
+		require.True(t, ok, "bundle must have modules: %s", rw.Body.String())
+		require.Len(t, modules, 2)
+		for i, expected := range []struct{ id, page string }{{"010-intro", "010-start.adoc"}, {"020-apply", "pages/020-apply.adoc"}} {
+			module := modules[i].(map[string]any)
+			assert.Equal(t, expected.id, module["id"])
+			assert.Len(t, module, 2, "module contains only id and pages")
+			pagePath := "modules/" + expected.id + "/content/" + expected.page
+			assert.Equal(t, []any{map[string]any{"path": pagePath, "url": "api/v1alpha1/labs/" + ref + "/resources/lab/" + pagePath}}, module["pages"])
+		}
+		m := body["manifest"].(map[string]any)
+		assert.Equal(t, map[string]any{"title": "Manifest title", "description": "Catalog only"}, m["metadata"])
+		assert.NotContains(t, m["spec"].(map[string]any), "checkpoints")
+		attrs := m["spec"].(map[string]any)["attributes"].(map[string]any)
+		assert.Equal(t, "catalog", attrs["shared"])
+		assert.Equal(t, "yes", attrs["manifest-only"])
+		assert.Equal(t, "yes", attrs["catalog-only"])
+		assert.Equal(t, "user1", attrs["user"])
+		assert.Equal(t, ref, body["runtimeContext"].(map[string]any)["catalogRef"])
+		assert.Equal(t, true, body["runtimeContext"].(map[string]any)["helmChartAvailable"])
+	})
+
+	t.Run("cross-module partial and page remain approved resources with ETag", func(t *testing.T) {
+		for _, target := range []struct{ path, body string }{
+			{"lab/modules/010-intro/content/_partials/shared.adoc", "Shared\n"},
+			{"lab/modules/020-apply/content/pages/020-apply.adoc", "= Apply\n"},
+		} {
+			rw := resourceRequest(t, router, ref, target.path)
+			require.Equal(t, http.StatusOK, rw.Code)
+			assert.Equal(t, target.body, rw.Body.String())
+			assert.Equal(t, `"abc123"`, rw.Header().Get("ETag"))
+			assert.Equal(t, "private, no-cache", rw.Header().Get("Cache-Control"))
+		}
+	})
+
+	t.Run("setup still uses one lab-wide chart and catalog identity", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
+		req.Header.Set("Authorization", "Bearer user1")
+		rw := httptest.NewRecorder()
+		router.ServeHTTP(rw, req)
+		require.Equal(t, http.StatusOK, rw.Code)
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+		assert.Equal(t, "deployed", body["helm"].(map[string]any)["status"])
+		assert.NotEmpty(t, body["helm"].(map[string]any)["releaseName"])
+		assert.NotContains(t, rw.Body.String(), "modules/")
+	})
+}
+
 // --- GET /api/v1alpha1/labs/{id}/bundle (stub — no real loader) ---
 
 func TestBundleHandler(t *testing.T) {
@@ -268,7 +403,7 @@ func TestBundleHandler(t *testing.T) {
 		assert.Equal(t, "lab_not_found", body["type"])
 	})
 
-	t.Run("returns sorted navigable page descriptors", func(t *testing.T) {
+	t.Run("returns grouped navigable page descriptors", func(t *testing.T) {
 		ref := goodCatalogRef()
 		rw := httptest.NewRecorder()
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
@@ -277,18 +412,20 @@ func TestBundleHandler(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, rw.Code)
 		var body struct {
-			Pages []struct {
-				Path string `json:"path"`
-				URL  string `json:"url"`
-			} `json:"pages"`
+			Modules []struct {
+				ID    string `json:"id"`
+				Pages []struct {
+					Path string `json:"path"`
+					URL  string `json:"url"`
+				} `json:"pages"`
+			} `json:"modules"`
 		}
 		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
-		assert.Equal(t, []struct {
-			Path string `json:"path"`
-			URL  string `json:"url"`
-		}{
-			{Path: "intro.adoc", URL: "api/v1alpha1/labs/" + ref + "/resources/lab/content/intro.adoc"},
-		}, body.Pages)
+		require.Len(t, body.Modules, 1)
+		assert.Equal(t, "010-intro", body.Modules[0].ID)
+		assert.Len(t, body.Modules[0].Pages, 1)
+		assert.Equal(t, "modules/010-intro/content/intro.adoc", body.Modules[0].Pages[0].Path)
+		assert.Equal(t, "api/v1alpha1/labs/"+ref+"/resources/lab/modules/010-intro/content/intro.adoc", body.Modules[0].Pages[0].URL)
 		assert.NotContains(t, rw.Body.String(), "= Intro")
 	})
 
@@ -337,10 +474,10 @@ func TestBundleHandler(t *testing.T) {
 					Manifest: &manifest.LabManifest{
 						APIVersion: "v1alpha1",
 						Kind:       "Lab",
-						Metadata:   manifest.Metadata{Name: "lab", DisplayName: "Lab"},
+						Metadata:   manifest.Metadata{Title: "Lab"},
 						Spec:       manifest.Spec{Attributes: map[string]string{"user": "manifest-val", "manifest-only": "yes"}},
 					},
-					Pages: []string{"intro.adoc"},
+					Modules: []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 				}, nil
 			},
 			RuntimeAttributes: func(_ *http.Request, _ string) (map[string]string, error) {
@@ -382,7 +519,7 @@ func TestBundleHandler(t *testing.T) {
 					CatalogSource: goodCatalogCM,
 					Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 					BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-						return &bundle.Result{Manifest: &manifest.LabManifest{}, Pages: []string{"intro.adoc"}}, nil
+						return &bundle.Result{Manifest: &manifest.LabManifest{}, Modules: []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}}}, nil
 					},
 					RuntimeAttributes: func(_ *http.Request, _ string) (map[string]string, error) {
 						return tc.attrs, tc.err
@@ -523,8 +660,8 @@ func TestSetupHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"= Intro"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchema,
 				}, nil
@@ -581,8 +718,8 @@ func TestSetupHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"intro.adoc"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					HelmChartDir:       t.TempDir(),
 					ValuesSchema:       testValuesSchema,
@@ -634,8 +771,8 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"intro.adoc"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchema,
 				}, nil
@@ -673,8 +810,8 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"intro.adoc"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchema,
 				}, nil
@@ -710,8 +847,8 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"intro.adoc"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchema,
 				}, nil
@@ -749,8 +886,8 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"intro.adoc"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchema,
 				}, nil
@@ -799,8 +936,8 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"= Intro"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchema,
 				}, nil
@@ -837,8 +974,8 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"= Intro"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchema,
 				}, nil
@@ -876,8 +1013,8 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"= Intro"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchemaWithPasswords,
 				}, nil
@@ -914,8 +1051,8 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"= Intro"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchema, // no password bindings
 				}, nil
@@ -951,8 +1088,8 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"= Intro"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{Pages: []string{"= Intro"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchema,
 				}, nil
@@ -988,8 +1125,10 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"intro.adoc"},
+					Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules: []bundle.Module{{
+						Pages: []string{"intro.adoc"},
+					}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchema,
 				}, nil
@@ -1025,8 +1164,10 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"= Intro"},
+					Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules: []bundle.Module{{
+						Pages: []string{"= Intro"},
+					}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchemaWithPasswords,
 				}, nil
@@ -1059,8 +1200,10 @@ func TestSetupStatusHandler(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"= Intro"},
+					Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules: []bundle.Module{{
+						Pages: []string{"= Intro"},
+					}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchemaWithRootURL,
 				}, nil
@@ -1100,7 +1243,7 @@ func TestResourceHandler(t *testing.T) {
 			wantBody    []byte
 			contentType string
 		}{
-			{name: "page", resource: "lab/content/intro.adoc", wantBody: []byte("= Intro\n"), contentType: "text/plain; charset=utf-8"},
+			{name: "page", resource: "lab/modules/010-intro/content/intro.adoc", wantBody: []byte("= Intro\n"), contentType: "text/plain; charset=utf-8"},
 			{name: "partial", resource: "lab/partials/_shared.adoc", wantBody: []byte("Shared\n"), contentType: "text/plain; charset=utf-8"},
 			{name: "raster", resource: "lab/images/pixel.png", wantBody: pngBytes(), contentType: "image/png"},
 		} {
@@ -1126,7 +1269,7 @@ func TestResourceHandler(t *testing.T) {
 			},
 		})
 
-		rw := resourceRequest(t, router, ref, "lab/content/intro.adoc")
+		rw := resourceRequest(t, router, ref, "lab/modules/010-intro/content/intro.adoc")
 
 		require.Equal(t, http.StatusOK, rw.Code)
 		assert.Equal(t, "text/plain; charset=utf-8", rw.Header().Get("Content-Type"))
@@ -1143,7 +1286,7 @@ func TestResourceHandler(t *testing.T) {
 				return &bundle.Resource{Bytes: []byte("= Intro\n"), Revision: "abc123"}, nil
 			},
 		})
-		request := httptest.NewRequestWithContext(context.TODO(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/resources/lab/content/intro.adoc", nil)
+		request := httptest.NewRequestWithContext(context.TODO(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/resources/lab/modules/010-intro/content/intro.adoc", nil)
 		request.Header.Set("Authorization", "Bearer user1")
 		request.Header.Set("If-None-Match", `"abc123"`)
 		recorder := httptest.NewRecorder()
@@ -1173,7 +1316,7 @@ func TestResourceHandler(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				rw := httptest.NewRecorder()
 				req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
-					"/api/v1alpha1/labs/"+ref+"/resources/lab/content/intro.adoc", nil)
+					"/api/v1alpha1/labs/"+ref+"/resources/lab/modules/010-intro/content/intro.adoc", nil)
 				req.Header.Set("Authorization", "Bearer user1")
 				req.Header.Set("If-None-Match", tc.ifNoneMatch)
 				router.ServeHTTP(rw, req)
@@ -1189,8 +1332,8 @@ func TestResourceHandler(t *testing.T) {
 		root := resourceFixture(t)
 		outside := filepath.Join(t.TempDir(), "outside.adoc")
 		require.NoError(t, os.WriteFile(outside, []byte("outside"), 0o600))
-		require.NoError(t, os.Symlink(outside, filepath.Join(root, "lab", "content", "escape.adoc")))
-		require.NoError(t, os.Symlink("intro.adoc", filepath.Join(root, "lab", "content", "link.adoc")))
+		require.NoError(t, os.Symlink(outside, filepath.Join(root, "lab", "modules", "010-intro", "content", "escape.adoc")))
+		require.NoError(t, os.Symlink("intro.adoc", filepath.Join(root, "lab", "modules", "010-intro", "content", "link.adoc")))
 
 		ref := goodCatalogRef()
 		router := resourceRouter(t, goodCatalogCM, root, "abc123")
@@ -1201,23 +1344,23 @@ func TestResourceHandler(t *testing.T) {
 			wantType     string
 			wantRedirect string
 		}{
-			{name: "missing", resource: "lab/content/missing.adoc", wantStatus: http.StatusNotFound, wantType: "content_error"},
+			{name: "missing", resource: "lab/modules/010-intro/content/missing.adoc", wantStatus: http.StatusNotFound, wantType: "content_error"},
 			// these cases makes sure that even if the caller wants to be clever and pass in the path as one url segment, we handle the path on the backend properly and don't allow an escape from the repo root
-			{name: "missing encoded", resource: "lab%2Fcontent%2Fmissing.adoc", wantStatus: http.StatusNotFound, wantType: "content_error"},
+			{name: "missing encoded", resource: "lab%2Fmodules%2F010-intro%2Fcontent%2Fmissing.adoc", wantStatus: http.StatusNotFound, wantType: "content_error"},
 			{name: "remote", resource: "https://example.test/outside.adoc", wantStatus: http.StatusTemporaryRedirect, wantRedirect: "https:/example.test/outside.adoc"},
 			{name: "remote redirected", resource: "https:/example.test/outside.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
 			{name: "remote encoded", resource: "https:%2F%2Fexample.test%2Foutside.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
 			{name: "absolute", resource: "/etc/passwd", wantStatus: http.StatusTemporaryRedirect, wantRedirect: "etc/passwd"},
 			{name: "absolute encoded", resource: "%2Fetc%2Fpasswd", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
 			// here we just test we cannot obtain a path that would point outside of our repository - we actually obtain a URL that points to a different enpoint completely, giving a 404 after the redirect, so that's correct behavior
-			{name: "repository escape", resource: "lab/content/../../../../outside.adoc", wantStatus: http.StatusTemporaryRedirect, wantRedirect: "labs/outside.adoc"},
-			{name: "repository escape encoded", resource: "lab%2Fcontent%2F..%2F..%2F..%2Foutside.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
-			{name: "directory", resource: "lab/content", wantStatus: http.StatusUnprocessableEntity, wantType: "content_error"},
-			{name: "directory encoded", resource: "lab%2Fcontent", wantStatus: http.StatusUnprocessableEntity, wantType: "content_error"},
-			{name: "symlink escape", resource: "lab/content/escape.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
-			{name: "symlink escape encoded", resource: "lab%2Fcontent%2Fescape.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
-			{name: "symlink", resource: "lab/content/link.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
-			{name: "symlink encoded", resource: "lab%2Fcontent%2Flink.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+			{name: "repository escape", resource: "lab/modules/010-intro/content/../../../../../../outside.adoc", wantStatus: http.StatusTemporaryRedirect, wantRedirect: "labs/outside.adoc"},
+			{name: "repository escape encoded", resource: "lab%2Fmodules%2F010-intro%2Fcontent%2F..%2F..%2F..%2F..%2F..%2F..%2Foutside.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+			{name: "directory", resource: "lab/modules/010-intro/content", wantStatus: http.StatusUnprocessableEntity, wantType: "content_error"},
+			{name: "directory encoded", resource: "lab%2Fmodules%2F010-intro%2Fcontent", wantStatus: http.StatusUnprocessableEntity, wantType: "content_error"},
+			{name: "symlink escape", resource: "lab/modules/010-intro/content/escape.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+			{name: "symlink escape encoded", resource: "lab%2Fmodules%2F010-intro%2Fcontent%2Fescape.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+			{name: "symlink", resource: "lab/modules/010-intro/content/link.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
+			{name: "symlink encoded", resource: "lab%2Fmodules%2F010-intro%2Fcontent%2Flink.adoc", wantStatus: http.StatusUnprocessableEntity, wantType: "path_traversal"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				rw := resourceRequest(t, router, ref, tc.resource)
@@ -1253,12 +1396,12 @@ func TestResourceHandler(t *testing.T) {
 			Authenticate: func(_ context.Context, _, token string) (string, error) { return token, nil },
 			ResourceLoader: func(_ context.Context, repository, branch, resourcePath string) (*bundle.Resource, error) {
 				gotRepository, gotBranch = repository, branch
-				assert.Equal(t, "selected-lab/content/intro.adoc", resourcePath)
+				assert.Equal(t, "selected-lab/modules/010-intro/content/intro.adoc", resourcePath)
 				return &bundle.Resource{Bytes: []byte("= Intro\n"), Revision: "abc123"}, nil
 			},
 		})
 
-		rw := resourceRequest(t, router, ref, "selected-lab/content/intro.adoc")
+		rw := resourceRequest(t, router, ref, "selected-lab/modules/010-intro/content/intro.adoc")
 		require.Equal(t, http.StatusOK, rw.Code)
 		assert.Equal(t, repository, gotRepository)
 		assert.Equal(t, branch, gotBranch)
@@ -1353,8 +1496,8 @@ func TestSetupWorker(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, tok string) (string, error) { return tok, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"= Intro"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchemaWithRootURL,
 				}, nil
@@ -1392,8 +1535,8 @@ func TestSetupWorker(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, tok string) (string, error) { return tok, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"= Intro"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchemaWithRootURL,
 				}, nil
@@ -1442,8 +1585,8 @@ func TestSetupWorker(t *testing.T) {
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
 			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
 				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Name: "lab", DisplayName: "Lab"}},
-					Pages:              []string{"= Intro"},
+					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
+					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
 					HelmChartAvailable: true,
 					ValuesSchema:       testValuesSchemaWithRootURLBadRef,
 				}, nil
@@ -1595,10 +1738,10 @@ func resourceRequest(t *testing.T, router http.Handler, catalogRef, resourcePath
 func resourceFixture(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
-	for _, dir := range []string{"lab/content", "lab/partials", "lab/images"} {
+	for _, dir := range []string{"lab/modules/010-intro/content", "lab/partials", "lab/images"} {
 		require.NoError(t, os.MkdirAll(filepath.Join(root, dir), 0o755))
 	}
-	require.NoError(t, os.WriteFile(filepath.Join(root, "lab", "content", "intro.adoc"), []byte("= Intro\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "lab", "modules", "010-intro", "content", "intro.adoc"), []byte("= Intro\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "lab", "partials", "_shared.adoc"), []byte("Shared\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "lab", "images", "pixel.png"), pngBytes(), 0o600))
 	return root
