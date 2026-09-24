@@ -207,24 +207,15 @@ describe('InteractiveLabsPage', () => {
     expect(container.querySelector('[role="progressbar"]')).toBeNull();
   });
 
-  test('keeps descriptions collapsed until expanded', async () => {
+  test('always shows catalog descriptions', async () => {
     mockListCatalog.mockResolvedValue(sampleCatalog);
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>First lab description</p>', warnings: [] });
 
     await act(async () => {
       ReactDOM.render(<InteractiveLabsPage />, container);
     });
 
-    const description = container.querySelector(
-      'section[aria-label="Description for Lab One"]',
-    ) as HTMLElement;
-    const toggle = container.querySelector(
-      'button[aria-label="Toggle description for Lab One"]',
-    ) as HTMLButtonElement;
-    expect(description.hidden).toBe(true);
-
-    act(() => { toggle.click(); });
-
-    expect(description.hidden).toBe(false);
+    expect(container.textContent).toContain('First lab description');
   });
 
   test('filters labs by display name and description', async () => {
@@ -335,8 +326,7 @@ describe('InteractiveLabsPage', () => {
     const drawer = container.querySelector('[class*="drawer__panel"]')!;
     expect(drawer.textContent).toContain('Setting up your lab environment...');
     expect(drawer.querySelector('[aria-label="Setting up lab"]')).not.toBeNull();
-    expect(getButton(/previous page/i).disabled).toBe(true);
-    expect(getButton(/next page/i).disabled).toBe(true);
+    expect(container.querySelector('.pfext-lab-footer')).toBeNull();
     expect(mockFetchResourceText).not.toHaveBeenCalled();
     expect(mockSetupLab).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
   });
@@ -369,8 +359,8 @@ describe('InteractiveLabsPage', () => {
     expect(mockGetSetupStatus).toHaveBeenCalledWith('lab-1');
     expect(mockFetchResourceText).toHaveBeenCalledWith(chartBundle.pages[2].url, expect.any(AbortSignal));
     expect(container.textContent).toContain('Ready page');
-    expect(getButton(/previous page/i).disabled).toBe(true);
-    expect(getButton(/next page/i).disabled).toBe(false);
+    expect(getButton(/^Back$/).disabled).toBe(true);
+    expect(getButton(/^Next$/).disabled).toBe(false);
   });
 
   test('removes setup poll abort listener after normal delay', async () => {
@@ -536,8 +526,6 @@ describe('InteractiveLabsPage', () => {
     mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Sanitized description</p>', warnings: [] });
     await renderCatalog();
 
-    await act(async () => { getButton(/Toggle description for Lab One/).click(); });
-
     expect(mockRenderAsciiDoc).toHaveBeenCalledWith(expect.objectContaining({
       source: 'First lab description',
       sourceURL: '/api/proxy/plugin/interactive-labs-console-plugin/backend/api/v1alpha1/labs/lab-1/resources/labs/one/lab.yaml',
@@ -553,12 +541,9 @@ describe('InteractiveLabsPage', () => {
     await renderCatalog();
 
     await act(async () => { getButton(/^Launch$/).click(); });
-    await act(async () => { getButton(/Toggle description for Lab One/).click(); });
 
     const page = container.querySelector('[class*="drawer__panel"] .interactive-labs-content.doc');
-    const description = container.querySelector(
-      '[aria-label="Description for Lab One"] .interactive-labs-content.doc',
-    );
+    const description = container.querySelector('.interactive-labs-content.doc.catalog-description');
     expect(page).not.toBeNull();
     expect(description).not.toBeNull();
   });
@@ -610,7 +595,6 @@ describe('InteractiveLabsPage', () => {
     }));
     await renderCatalog();
 
-    await act(async () => { getButton(/Toggle description for Lab One/).click(); });
     const link = Array.from(container.querySelectorAll('a')).find((anchor) => anchor.textContent === 'Open linked page')!;
     const preventNavigation = (event: Event) => event.preventDefault();
     document.addEventListener('click', preventNavigation);
@@ -629,19 +613,19 @@ describe('InteractiveLabsPage', () => {
 
     await act(async () => { getButton(/^Launch$/).click(); });
 
-    const previous = getButton(/previous page/i);
-    const next = getButton(/next page/i);
+    const back = getButton(/^Back$/);
+    const next = getButton(/^Next$/);
     expect(container.textContent).toContain('pages/a-first.adoc');
     expect(container.textContent).toContain('Page 1 of 2');
-    expect(previous.disabled).toBe(true);
+    expect(back.disabled).toBe(true);
     expect(next.disabled).toBe(false);
 
     await act(async () => { next.click(); });
 
     expect(container.textContent).toContain('pages/z-last.adoc');
     expect(container.textContent).toContain('Page 2 of 2');
-    expect(getButton(/previous page/i).disabled).toBe(false);
-    expect(getButton(/next page/i).disabled).toBe(true);
+    expect(getButton(/^Back$/).disabled).toBe(false);
+    expect(getButton(/^Next$/).disabled).toBe(true);
     expect(localStorage.getItem(sessionKey('lab-1'))).toBe(
       JSON.stringify({ currentPagePath: 'pages/z-last.adoc', panelMode: 'open' }),
     );
@@ -656,10 +640,11 @@ describe('InteractiveLabsPage', () => {
     await act(async () => { getButton(/^Launch$/).click(); });
 
     const drawer = container.querySelector('[class*="drawer__panel"]')!;
-    const labName = drawer.querySelector('strong')!;
-    const pageTitle = drawer.querySelector('h2')!;
-    const previous = getButton(/previous page/i);
-    const next = getButton(/next page/i);
+    const labName = drawer.querySelector('.pfext-lab-panel-content h2')!;
+    const allH2s = drawer.querySelectorAll('h2');
+    const pageTitle = allH2s[1]!;
+    const next = getButton(/^Next$/);
+    const back = getButton(/^Back$/);
     const minimize = getButton(/^minimize lab$/i);
     const close = getButton(/^close lab$/i);
 
@@ -667,9 +652,9 @@ describe('InteractiveLabsPage', () => {
     expect(pageTitle.textContent).toBe('');
     expect(drawer.querySelector('[aria-label="Loading lab page"]')).not.toBeNull();
     expect(drawer.textContent).not.toContain('pages/a-first.adoc');
-    expect(labName.compareDocumentPosition(previous) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(previous.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(next.compareDocumentPosition(pageTitle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(labName.compareDocumentPosition(pageTitle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pageTitle.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(next.compareDocumentPosition(back) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(drawer.querySelector('[role="separator"][aria-label="Resize lab drawer"]')).not.toBeNull();
     [minimize, close].forEach((button) => {
       expect(button.textContent).toBe('');
