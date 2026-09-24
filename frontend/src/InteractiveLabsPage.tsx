@@ -2,16 +2,11 @@ import * as React from "react";
 import { useLocation, useNavigate } from "react-router-dom-v5-compat";
 import "./interactive-labs.css";
 import {
+  ActionList,
+  ActionListGroup,
+  ActionListItem,
   Alert,
   Button,
-  DataList,
-  DataListAction,
-  DataListCell,
-  DataListContent,
-  DataListItem,
-  DataListItemCells,
-  DataListItemRow,
-  DataListToggle,
   Drawer,
   DrawerActions,
   DrawerContent,
@@ -20,6 +15,8 @@ import {
   DrawerPanelContent,
   EmptyState,
   EmptyStateBody,
+  Flex,
+  FlexItem,
   PageSection,
   Spinner,
   TextInput,
@@ -230,7 +227,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const [renderState, setRenderState] = React.useState<RenderState>({ status: "loading" });
   const [renderRetry, setRenderRetry] = React.useState(0);
   const launchTriggerRef = React.useRef<HTMLElement | null>(null);
-  const drawerFocusRef = React.useRef<HTMLSpanElement | null>(null);
+  const drawerFocusRef = React.useRef<HTMLDivElement | null>(null);
   const restoreFocusRef = React.useRef<HTMLButtonElement | null>(null);
   const renderedContentRef = React.useRef<HTMLDivElement | null>(null);
   const pendingFragmentRef = React.useRef<string>();
@@ -628,81 +625,93 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
                 resizeAriaLabel="Resize lab drawer"
                 style={{ pointerEvents: "auto" }}
               >
-                <DrawerHead>
-                  <div>
-                    <span ref={drawerFocusRef} tabIndex={-1}>
-                      <strong>{activePanel.displayName}</strong>
-                    </span>
-                    <div style={{ display: "flex", alignItems: "center", gap: "var(--pf-t--global--spacer--sm)" }}>
-                      <Button
-                        variant="secondary"
-                        aria-label="Previous page"
-                        isDisabled={Boolean(setupState) || currentPageIndex <= 0}
-                        onClick={() => selectPage(pagePaths[currentPageIndex - 1])}
-                      >
-                        Previous
-                      </Button>
-                      <span aria-live="polite">Page {currentPageIndex + 1} of {pagePaths.length}</span>
-                      <Button
-                        variant="secondary"
-                        aria-label="Next page"
-                        isDisabled={Boolean(setupState) || currentPageIndex < 0 || currentPageIndex >= pagePaths.length - 1}
-                        onClick={() => selectPage(pagePaths[currentPageIndex + 1])}
-                      >
-                        Next
-                      </Button>
-                    </div>
-                  </div>
-                  <DrawerActions>
-                    <Button variant="plain" onClick={() => setPanelMode("minimized")} aria-label="Minimize lab">
-                      <WindowMinimizeIcon />
-                    </Button>
-                    <Button variant="plain" onClick={closePanel} aria-label="Close lab">
-                      <TimesIcon />
-                    </Button>
-                  </DrawerActions>
-                </DrawerHead>
-                <DrawerPanelBody>
-                  {setupState?.status === "pending" && (
-                    <Alert variant="info" title="Setting up your lab environment..." isInline isLiveRegion>
-                      <Spinner size="md" aria-label="Setting up lab" />
-                      Lab pages will appear when setup finishes.
-                    </Alert>
-                  )}
-                  {setupState?.status === "error" && (
-                    <Alert variant="danger" title={setupState.message} isInline isLiveRegion />
-                  )}
-                  {!setupState && (
-                    <>
-                      <Title headingLevel="h2">
-                        <span dangerouslySetInnerHTML={{
-                          __html: renderState.status === "success"
-                            ? sanitizeTitle(renderState.result.title ?? activePanel.currentPagePath)
-                            : ""
-                        }} />
+                <div className="pfext-lab-panel-content">
+                  <DrawerHead>
+                    <div ref={drawerFocusRef} tabIndex={-1}>
+                      <Title headingLevel="h2" style={{ marginRight: "var(--pf-t--global--spacer--md)" }}>
+                        {activePanel.displayName}
                       </Title>
-                      {navigationWarning && <Alert variant="warning" title={navigationWarning} isInline />}
-                      {renderState.status === "loading" && <Spinner aria-label="Loading lab page" />}
-                      {renderState.status === "error" && (
-                        <>
-                          <Alert variant="danger" title={renderState.message} isInline isLiveRegion />
-                          <Button variant="link" onClick={() => setRenderRetry((count) => count + 1)}>Retry</Button>
-                        </>
-                      )}
-                      {renderState.status === "success" && (
-                        <>
-                          {renderState.result.warnings.map((warning, index) => (
-                            <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
-                          ))}
-                          <div
-                            ref={renderedContentRef}
-                            className="interactive-labs-content doc"
-                            onClick={handleRenderedLink}
-                            dangerouslySetInnerHTML={{ __html: renderState.result.html }}
-                          />
-                        </>
-                      )}
-                    </>
+                      <span aria-live="polite">Page {currentPageIndex + 1} of {pagePaths.length}</span>
+                    </div>
+                    <DrawerActions>
+                      <Button variant="plain" onClick={() => setPanelMode("minimized")} aria-label="Minimize lab">
+                        <WindowMinimizeIcon />
+                      </Button>
+                      <Button variant="plain" onClick={closePanel} aria-label="Close lab">
+                        <TimesIcon />
+                      </Button>
+                    </DrawerActions>
+                  </DrawerHead>
+                </div>
+                <DrawerPanelBody className="pfext-lab-panel-content__body">
+                  <div>
+                    {setupState?.status === "pending" && (
+                      <Alert variant="info" title="Setting up your lab environment..." isInline isLiveRegion>
+                        <Spinner size="md" aria-label="Setting up lab" className="pf-v5-u-mr-xs" />
+                        Lab pages will appear when setup finishes.
+                      </Alert>
+                    )}
+                    {setupState?.status === "error" && (
+                      <Alert variant="danger" title={setupState.message} isInline isLiveRegion />
+                    )}
+                    {!setupState && (
+                      <>
+                        <Title headingLevel="h2">
+                          <span dangerouslySetInnerHTML={{
+                            __html: renderState.status === "success"
+                              ? sanitizeTitle(renderState.result.title ?? activePanel.currentPagePath)
+                              : ""
+                          }} />
+                        </Title>
+                        {navigationWarning && <Alert variant="warning" title={navigationWarning} isInline />}
+                        {renderState.status === "loading" && <Spinner aria-label="Loading lab page" />}
+                        {renderState.status === "error" && (
+                          <>
+                            <Alert variant="danger" title={renderState.message} isInline isLiveRegion />
+                            <Button variant="link" onClick={() => setRenderRetry((count) => count + 1)}>Retry</Button>
+                          </>
+                        )}
+                        {renderState.status === "success" && (
+                          <>
+                            {renderState.result.warnings.map((warning, index) => (
+                              <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
+                            ))}
+                            <div
+                              ref={renderedContentRef}
+                              className="interactive-labs-content doc"
+                              onClick={handleRenderedLink}
+                              dangerouslySetInnerHTML={{ __html: renderState.result.html }}
+                            />
+                          </>
+                        )}
+                      </>
+                    )}
+                  </div>
+                  {!setupState && (
+                    <div className="pfext-lab-footer">
+                      <ActionList>
+                        <ActionListGroup>
+                          <ActionListItem>
+                            <Button
+                              variant="primary"
+                              isDisabled={currentPageIndex < 0 || currentPageIndex >= pagePaths.length - 1}
+                              onClick={() => selectPage(pagePaths[currentPageIndex + 1])}
+                            >
+                              Next
+                            </Button>
+                          </ActionListItem>
+                          <ActionListItem>
+                            <Button
+                              variant="secondary"
+                              isDisabled={currentPageIndex <= 0}
+                              onClick={() => selectPage(pagePaths[currentPageIndex - 1])}
+                            >
+                              Back
+                            </Button>
+                          </ActionListItem>
+                        </ActionListGroup>
+                      </ActionList>
+                    </div>
                   )}
                 </DrawerPanelBody>
               </DrawerPanelContent>
@@ -827,7 +836,7 @@ const CatalogDescription: React.FC<{ item: CatalogEntry }> = ({ item }) => {
       {linkWarning && <Alert variant="warning" title={linkWarning} isInline />}
       {state.result.warnings.map((warning, index) => <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />)}
       <div
-        className="interactive-labs-content doc"
+        className="interactive-labs-content doc catalog-description"
         onClick={handleLink}
         dangerouslySetInnerHTML={{ __html: state.result.html }}
       />
@@ -839,7 +848,6 @@ const InteractiveLabsPage: React.FC = () => {
   const [state, setState] = React.useState<PageState>({ status: "loading" });
   const [retry, setRetry] = React.useState(0);
   const [filter, setFilter] = React.useState("");
-  const [expandedItems, setExpandedItems] = React.useState<Set<string>>(() => new Set());
   const interactiveLabs = useInteractiveLabs();
   const filteredItems =
     state.status === "success"
@@ -910,65 +918,28 @@ const InteractiveLabsPage: React.FC = () => {
               <EmptyStateBody>Try a different name or description.</EmptyStateBody>
             </EmptyState>
           ) : (
-            <DataList aria-label="Available labs" isCompact isPlain>
+            <>
               {filteredItems.map((item) => {
                 const itemId = `lab-${item.catalogRef}`;
-                const descriptionId = `${itemId}-description`;
-                const isExpanded = expandedItems.has(item.catalogRef);
                 return (
-                  <DataListItem key={item.catalogRef} aria-labelledby={itemId} isExpanded={isExpanded}>
-                    <DataListItemRow>
-                      {item.description && (
-                        <DataListToggle
-                          id={`${itemId}-toggle`}
-                          aria-controls={descriptionId}
-                          aria-label={`Toggle description for ${item.displayName}`}
-                          isExpanded={isExpanded}
-                          buttonProps={{
-                            onClick: () =>
-                              setExpandedItems((current) => {
-                                const next = new Set(current);
-                                if (next.has(item.catalogRef)) next.delete(item.catalogRef);
-                                else next.add(item.catalogRef);
-                                return next;
-                              }),
-                          }}
-                        />
-                      )}
-                      <DataListItemCells
-                        dataListCells={[
-                          <DataListCell key="name" width={5}>
-                            <strong id={itemId}>{item.displayName}</strong>
-                          </DataListCell>,
-                        ]}
-                      />
-                      <DataListAction
-                        id={`${itemId}-actions`}
-                        aria-labelledby={itemId}
-                        aria-label={`Actions for ${item.displayName}`}
+                  <Flex key={item.catalogRef} alignItems={{ default: "alignItemsFlexStart" }}>
+                    <FlexItem grow={{ default: "grow" }}>
+                      <strong id={itemId}>{item.displayName}</strong>
+                      {item.description && <CatalogDescription item={item} />}
+                    </FlexItem>
+                    <FlexItem>
+                      <Button
+                        isLoading={interactiveLabs?.loadingCatalogRef === item.catalogRef}
+                        isDisabled={!interactiveLabs}
+                        onClick={(event) => void interactiveLabs?.launch(item.catalogRef, event.currentTarget)}
                       >
-                        <Button
-                          isLoading={interactiveLabs?.loadingCatalogRef === item.catalogRef}
-                          isDisabled={!interactiveLabs}
-                          onClick={(event) => void interactiveLabs?.launch(item.catalogRef, event.currentTarget)}
-                        >
-                          Launch
-                        </Button>
-                      </DataListAction>
-                    </DataListItemRow>
-                    {item.description && (
-                      <DataListContent
-                        id={descriptionId}
-                        aria-label={`Description for ${item.displayName}`}
-                        isHidden={!isExpanded}
-                      >
-                        <CatalogDescription item={item} />
-                      </DataListContent>
-                    )}
-                  </DataListItem>
+                        Launch
+                      </Button>
+                    </FlexItem>
+                  </Flex>
                 );
               })}
-            </DataList>
+            </>
           )}
         </>
       )}

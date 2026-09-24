@@ -78,6 +78,10 @@
   padding: 0 1rem 4rem;
 }
 
+.interactive-labs-content.catalog-description {
+  padding-bottom: 1rem;
+}
+
 .pf-v5-theme-dark .interactive-labs-content,
 .pf-v6-theme-dark .interactive-labs-content {
   --color-smoke-70: #383838;
@@ -300,6 +304,24 @@
 .interactive-labs-content .icon i::after { hyphens: none; }
 .interactive-labs-content th.tableblock,
 .interactive-labs-content td.tableblock { word-break: break-word; }
+
+.pfext-lab-panel-content {
+  background-color: var(--pf-t--global--color--brand--default);
+  color: var(--pf-t--global--text--color--inverse);
+  padding: var(--pf-t--global--spacer--md) var(--pf-t--global--spacer--lg);
+}
+
+.pfext-lab-panel-content__body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.pfext-lab-footer {
+  margin-top: auto;
+  padding-top: var(--pf-t--global--spacer--md);
+}
 
 @keyframes interactive-labs-guidance-expand {
   from { outline-offset: -4px; outline-width: 4px; opacity: 1; }
