@@ -23,6 +23,8 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/bundle"
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/catalog"
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/config"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/handler"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/setup"
 )
@@ -42,18 +44,20 @@ var (
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	serverConfig := config.LoadFromEnv(log)
 	cache, err := bundle.NewCache(snapshotCacheRoot)
 	if err != nil {
 		log.Error("create snapshot cache failed")
 		return
 	}
+	catalogSource := inClusterCatalogSource(serverConfig.Namespace)
+	catalogEvents := inClusterCatalogEventPoster(log, serverConfig.Namespace)
 
 	cfg := handler.Config{
-		CatalogSource:        inClusterCatalogSource(),
-		BundleLoader:         cache.Load,
-		SnapshotCommitHash:   cache.CommitHash,
-		ResourceLoader:       cache.Read,
-		CatalogLabOmitted:    inClusterCatalogEventPoster(log),
+		CatalogSource:        catalogSource,
+		BundleLoader:         cache.LoadBundle,
+		ResourceLoader:       cache.ReadResource,
+		CatalogLabOmitted:    catalogEvents,
 		Logger:               log,
 		Authenticate:         inClusterIdentityResolver(),
 		RuntimeAttributes:    inClusterRuntimeAttributes(log),
@@ -74,6 +78,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	refreshCoordinator := bundle.NewRefreshCoordinator(
+		loadCatalogEntries(catalogSource),
+		cache.Refresh,
+		func(ctx context.Context, entry bundle.RefreshEntry, reason string) {
+			catalogEvents(ctx, catalog.Entry{CatalogRef: entry.CatalogRef, Repository: entry.Repository, Branch: entry.Branch, LabPath: entry.LabPath}, reason)
+		},
+		serverConfig.CacheRefreshInterval,
+		int(serverConfig.CacheConcurrentRefreshLimit),
+	)
+	// make sure the refresh is completed before we exit
+	refreshDone := make(chan struct{})
+	go func() {
+		defer close(refreshDone)
+		refreshCoordinator.Run(ctx, func(error) { log.Warn("catalog refresh failed") })
+	}()
 	go serveTLS(log, "backend", backend, backendTLSCert, backendTLSKey)
 
 	<-ctx.Done()
@@ -81,7 +100,8 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	backend.Shutdown(shutCtx) //nolint:errcheck
-	cache.Close()             // preserves successful snapshots for next process
+	<-refreshDone
+	cache.Close() // preserves successful snapshots for next process
 }
 
 func serveTLS(log *slog.Logger, name string, server *http.Server, cert, key string) {
@@ -201,8 +221,7 @@ func newClusterRuntimeAttributes(client configclient.Interface, log *slog.Logger
 }
 
 // inClusterCatalogSource reads the catalog ConfigMap through the service-account-authenticated typed client.
-func inClusterCatalogSource() func(ctx context.Context) (*corev1.ConfigMap, error) {
-	namespace := os.Getenv("NAMESPACE")
+func inClusterCatalogSource(namespace string) func(ctx context.Context) (*corev1.ConfigMap, error) {
 	if namespace == "" {
 		namespace = "interactive-labs-console-plugin"
 	}
@@ -242,6 +261,24 @@ func inClusterSetupClient(log *slog.Logger) *setup.SpaceRequestClient {
 		return nil
 	}
 	return &setup.SpaceRequestClient{HTTPClient: client, APIHost: apiHost}
+}
+
+func loadCatalogEntries(source func(context.Context) (*corev1.ConfigMap, error)) func(context.Context) ([]bundle.RefreshEntry, error) {
+	return func(ctx context.Context) ([]bundle.RefreshEntry, error) {
+		cm, err := source(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("catalog unavailable")
+		}
+		entries, err := catalog.Read(cm)
+		if err != nil {
+			return nil, fmt.Errorf("catalog configuration error")
+		}
+		refreshEntries := make([]bundle.RefreshEntry, len(entries))
+		for i, entry := range entries {
+			refreshEntries[i] = bundle.RefreshEntry{CatalogRef: entry.CatalogRef, Repository: entry.Repository, Branch: entry.Branch, LabPath: entry.LabPath}
+		}
+		return refreshEntries, nil
+	}
 }
 
 func inClusterHelmClient(log *slog.Logger) setup.HelmManager {

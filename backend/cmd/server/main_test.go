@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	configv1 "github.com/openshift/api/config/v1"
@@ -313,6 +314,28 @@ func TestCombinedHandler(t *testing.T) {
 		require.Equal(t, http.StatusOK, rw.Code)
 		require.Contains(t, rw.Header().Get("Content-Type"), "application/json")
 	})
+}
+
+func TestRefreshCatalogEntriesParsesConfigMap(t *testing.T) {
+	source := loadCatalogEntries(func(context.Context) (*corev1.ConfigMap, error) {
+		return &corev1.ConfigMap{Data: map[string]string{"catalog.yaml": `- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: one
+- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: two`}}, nil
+	})
+
+	entries, err := source(context.Background())
+
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	for i, labPath := range []string{"one", "two"} {
+		assert.NotEmpty(t, entries[i].CatalogRef)
+		assert.Equal(t, "https://github.com/redhat/lab", entries[i].Repository)
+		assert.Equal(t, "main", entries[i].Branch)
+		assert.Equal(t, labPath, entries[i].LabPath)
+	}
 }
 
 func mustWrite(t *testing.T, path, content string) {

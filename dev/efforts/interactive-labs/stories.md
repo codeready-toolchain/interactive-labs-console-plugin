@@ -150,16 +150,17 @@ administrators retain control of approved source locations and static overrides.
 
 **Dependencies:** STORY-1, STORY-2.
 
-## ☐ STORY-10: Refresh cached approved lab sources
+## ☑ STORY-10: Refresh cached approved lab sources
 
 Cached approved sources must receive branch updates without repeated user-request clones.
 
 **Goal:** Periodically replace cached repository snapshots through bounded backend refresh.
 
 **Acceptance criteria:**
-- Backend refreshes configured repository/branch snapshots on defined cadence without browser requests.
-- It validates configured lab paths before atomically replacing a snapshot; readers never see partial updates.
-- Failed refresh retains last known-good snapshot and emits safe structured logs and bounded Warning Events.
+- Backend refreshes configured repository/branch snapshots without browser requests on a validated administrator-configured cadence (default: one hour), with validated distinct-source concurrency (default: four). A scheduled tick skips when prior sweep remains active.
+- Each source refresh has a ten-minute deadline. Its `go-git` library checkout runs only in private staging, so deadline cancellation or failure cannot corrupt a published snapshot. Backend never invokes or packages a Git executable for any Git-related operation.
+- After a new Git revision clones and resolves its `HEAD`, backend validates configured lab paths before atomically replacing its snapshot; readers never see partial updates. A path invalid in that new revision makes only that lab unavailable and does not block valid siblings from advancing.
+- Failed source acquisition (clone or Git `HEAD` resolution) retains last known-good snapshot and emits safe structured logs plus one bounded Warning Event per affected `catalogRef` and safe failure class. All catalog-omission and refresh-failure logs and Event annotations identify the validated configured repository, branch, and lab path, but never include tokens, headers, raw Git output, or lab content.
 - Initial misses and sources with no valid snapshot remain unavailable only to their affected labs.
 - Refresh introduces no user-facing update notification, revision pinning, migration, or session reconciliation.
 

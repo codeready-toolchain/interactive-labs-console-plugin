@@ -28,7 +28,7 @@
 - Use standard `net/http` `ServeMux` method/path patterns.
 - Return typed error envelopes for non-2xx API responses.
 - Validate untrusted boundary input before use: HTTPS repository URL, branch characters, manifest version/type, bundle paths, catalog shape, and namespace request shape.
-- Invoke Git via fixed `exec.Command` argument slices; never compose shell command strings. Disable Git terminal prompts; use temporary clone directory and cleanup.
+- Use `github.com/go-git/go-git/v5` for every repository clone, open, and revision operation. Never invoke a Git executable; use private temporary clone directories and cleanup.
 - Preserve catalog declaration order. Derive canonical catalog identity server-side.
 - Tokens are request-scoped. Never place token material in logs, errors, caches, databases, or audit records.
 

@@ -38,12 +38,10 @@ type Config struct {
 	CatalogSource func(context.Context) (*corev1.ConfigMap, error)
 	// BundleLoader loads a bundle from the configured repo; nil means bundles are unavailable.
 	BundleLoader func(context.Context, string, string, string) (*bundle.Result, error)
-	// SnapshotCommitHash returns the immutable commit hash of an approved source snapshot.
-	SnapshotCommitHash func(context.Context, string, string, string) (string, error)
 	// ResourceLoader reads an approved resource from the configured source snapshot.
-	ResourceLoader func(context.Context, string, string, string, string) (*bundle.Resource, error)
-	// CatalogLabOmitted receives catalog entry omission notifications.
-	CatalogLabOmitted func(ctx context.Context, catalogRef, reason string)
+	ResourceLoader func(context.Context, string, string, string) (*bundle.Resource, error)
+	// CatalogLabOmitted receives validated catalog entry omission notifications.
+	CatalogLabOmitted func(ctx context.Context, entry catalog.Entry, reason string)
 	// Logger receives safe operational fields only; tokens must never be passed to it.
 	Logger *slog.Logger
 	// Authenticate resolves a forwarded user token to its server-verified subject.
@@ -273,7 +271,7 @@ func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 	for _, e := range entries {
 		result, err := loader(r.Context(), e.Repository, e.Branch, e.LabPath)
 		if reason := omittedLabReason(err); reason != "" {
-			recordCatalogOmission(r.Context(), cfg, e.CatalogRef, reason)
+			recordCatalogOmission(r.Context(), cfg, e, reason)
 			continue
 		}
 		if err != nil || result == nil || result.Manifest == nil {
@@ -394,30 +392,25 @@ func handleResource(w http.ResponseWriter, r *http.Request, cfg Config) {
 		writeError(w, http.StatusUnprocessableEntity, laberr.New(laberr.TypePathTraversal, "resource path is invalid", nil))
 		return
 	}
-	if cfg.SnapshotCommitHash == nil || cfg.ResourceLoader == nil {
+	if cfg.ResourceLoader == nil {
 		writeError(w, http.StatusServiceUnavailable,
 			laberr.New(laberr.TypeRepositoryError, "resource loader not configured", nil))
 		return
 	}
-	commitHash, err := cfg.SnapshotCommitHash(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
+	resource, err := cfg.ResourceLoader(r.Context(), entry.Repository, entry.Branch, resourcePath)
 	if err != nil {
 		handleResourceError(w, err)
 		return
 	}
-	etag := fmt.Sprintf("%q", commitHash)
+	if resource == nil || resource.Revision == "" {
+		writeError(w, http.StatusUnprocessableEntity, laberr.New(laberr.TypeContentError, "resource is unsupported", nil))
+		return
+	}
+	etag := fmt.Sprintf("%q", resource.Revision)
 	w.Header().Set("Cache-Control", "private, no-cache")
 	w.Header().Set("ETag", etag)
 	if r.Header.Get("If-None-Match") == etag {
 		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-	resource, err := cfg.ResourceLoader(r.Context(), entry.Repository, entry.Branch, entry.LabPath, resourcePath)
-	if err != nil {
-		handleResourceError(w, err)
-		return
-	}
-	if resource == nil {
-		writeError(w, http.StatusUnprocessableEntity, laberr.New(laberr.TypeContentError, "resource is unsupported", nil))
 		return
 	}
 	contentType := http.DetectContentType(resource.Bytes)
@@ -790,10 +783,12 @@ func omittedLabReason(err error) string {
 	}
 }
 
-func recordCatalogOmission(ctx context.Context, cfg Config, catalogRef, reason string) {
-	cfg.Logger.Warn("catalog lab omitted", "catalogRef", catalogRef, "reason", reason)
+func recordCatalogOmission(ctx context.Context, cfg Config, entry catalog.Entry, reason string) {
+	if cfg.Logger != nil {
+		cfg.Logger.Warn("catalog lab omitted", "catalogRef", entry.CatalogRef, "repository", entry.Repository, "branch", entry.Branch, "labPath", entry.LabPath, "reason", reason)
+	}
 	if cfg.CatalogLabOmitted != nil {
-		cfg.CatalogLabOmitted(ctx, catalogRef, reason)
+		cfg.CatalogLabOmitted(ctx, entry, reason)
 	}
 }
 

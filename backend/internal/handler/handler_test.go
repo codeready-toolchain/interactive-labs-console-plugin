@@ -186,8 +186,10 @@ func TestCatalogHandler(t *testing.T) {
 				}
 				return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Name: "good", DisplayName: "Manifest name", Description: "Manifest description"}}, Pages: []string{"intro.adoc"}}, nil
 			},
-			Logger:            slog.New(slog.NewJSONHandler(&logs, nil)),
-			CatalogLabOmitted: func(_ context.Context, ref, reason string) { warnings = append(warnings, ref+":"+reason) },
+			Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
+			CatalogLabOmitted: func(_ context.Context, entry catalog.Entry, reason string) {
+				warnings = append(warnings, entry.CatalogRef+":"+reason)
+			},
 		})
 
 		rw := httptest.NewRecorder()
@@ -209,7 +211,31 @@ func TestCatalogHandler(t *testing.T) {
 		assert.Equal(t, []string{catalog.DeriveRef("https://github.com/redhat/missing", "main", "lab", nil) + ":ManifestMissing"}, warnings)
 		assert.Contains(t, logs.String(), "catalog lab omitted")
 		assert.NotContains(t, logs.String(), "private details")
-		assert.NotContains(t, logs.String(), "https://github.com/redhat/missing")
+		assert.Contains(t, logs.String(), "https://github.com/redhat/missing")
+		assert.Contains(t, logs.String(), "branch")
+		assert.Contains(t, logs.String(), "labPath")
+	})
+
+	t.Run("passes validated entry to omission observer", func(t *testing.T) {
+		var observed catalog.Entry
+		router := handler.NewRouter(handler.Config{
+			CatalogSource: stubCatalogCM(map[string]string{"catalog.yaml": `- repository: https://github.com/redhat/missing
+  branch: main
+  labPath: lab`}),
+			BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
+				return nil, bundle.ErrManifestMissing
+			},
+			CatalogLabOmitted: func(_ context.Context, entry catalog.Entry, reason string) {
+				observed = entry
+				assert.Equal(t, "ManifestMissing", reason)
+			},
+		})
+
+		router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil))
+		assert.Equal(t, "https://github.com/redhat/missing", observed.Repository)
+		assert.Equal(t, "main", observed.Branch)
+		assert.Equal(t, "lab", observed.LabPath)
+		assert.NotEmpty(t, observed.CatalogRef)
 	})
 
 	t.Run("unexpected loader failure is not omitted", func(t *testing.T) {
@@ -1095,11 +1121,8 @@ func TestResourceHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _ string, token string) (string, error) { return token, nil },
-			SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
-				return "abc123", nil
-			},
-			ResourceLoader: func(context.Context, string, string, string, string) (*bundle.Resource, error) {
-				return &bundle.Resource{Bytes: []byte("= Intro\n")}, nil
+			ResourceLoader: func(context.Context, string, string, string) (*bundle.Resource, error) {
+				return &bundle.Resource{Bytes: []byte("= Intro\n"), Revision: "abc123"}, nil
 			},
 		})
 
@@ -1109,18 +1132,15 @@ func TestResourceHandler(t *testing.T) {
 		assert.Equal(t, "text/plain; charset=utf-8", rw.Header().Get("Content-Type"))
 	})
 
-	t.Run("returns not modified before loading resource", func(t *testing.T) {
+	t.Run("returns not modified from paired resource revision", func(t *testing.T) {
 		loads := 0
 		ref := goodCatalogRef()
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _ string, token string) (string, error) { return token, nil },
-			SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
-				return "abc123", nil
-			},
-			ResourceLoader: func(context.Context, string, string, string, string) (*bundle.Resource, error) {
+			ResourceLoader: func(context.Context, string, string, string) (*bundle.Resource, error) {
 				loads++
-				return nil, errors.New("resource loader must not run")
+				return &bundle.Resource{Bytes: []byte("= Intro\n"), Revision: "abc123"}, nil
 			},
 		})
 		request := httptest.NewRequestWithContext(context.TODO(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/resources/lab/content/intro.adoc", nil)
@@ -1131,7 +1151,7 @@ func TestResourceHandler(t *testing.T) {
 		router.ServeHTTP(recorder, request)
 
 		assert.Equal(t, http.StatusNotModified, recorder.Code)
-		assert.Zero(t, loads)
+		assert.Equal(t, 1, loads)
 		assert.Equal(t, `"abc123"`, recorder.Header().Get("ETag"))
 		assert.Equal(t, "private, no-cache", recorder.Header().Get("Cache-Control"))
 	})
@@ -1222,7 +1242,7 @@ func TestResourceHandler(t *testing.T) {
 			labPath    = "selected-lab"
 		)
 		ref := catalog.DeriveRef(repository, branch, labPath, nil)
-		var gotRepository, gotBranch, gotLabPath string
+		var gotRepository, gotBranch string
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: stubCatalogCM(map[string]string{"catalog.yaml": `- repository: https://github.com/redhat/other
   branch: main
@@ -1231,13 +1251,10 @@ func TestResourceHandler(t *testing.T) {
   branch: stable
   labPath: selected-lab`}),
 			Authenticate: func(_ context.Context, _, token string) (string, error) { return token, nil },
-			SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
-				return "abc123", nil
-			},
-			ResourceLoader: func(_ context.Context, repository, branch, labPath, resourcePath string) (*bundle.Resource, error) {
-				gotRepository, gotBranch, gotLabPath = repository, branch, labPath
+			ResourceLoader: func(_ context.Context, repository, branch, resourcePath string) (*bundle.Resource, error) {
+				gotRepository, gotBranch = repository, branch
 				assert.Equal(t, "selected-lab/content/intro.adoc", resourcePath)
-				return &bundle.Resource{Bytes: []byte("= Intro\n")}, nil
+				return &bundle.Resource{Bytes: []byte("= Intro\n"), Revision: "abc123"}, nil
 			},
 		})
 
@@ -1245,7 +1262,22 @@ func TestResourceHandler(t *testing.T) {
 		require.Equal(t, http.StatusOK, rw.Code)
 		assert.Equal(t, repository, gotRepository)
 		assert.Equal(t, branch, gotBranch)
-		assert.Equal(t, labPath, gotLabPath)
+	})
+
+	t.Run("uses revision paired with resource bytes", func(t *testing.T) {
+		ref := goodCatalogRef()
+		router := handler.NewRouter(handler.Config{
+			CatalogSource: goodCatalogCM,
+			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
+			ResourceLoader: func(context.Context, string, string, string) (*bundle.Resource, error) {
+				return &bundle.Resource{Bytes: []byte("= New\n"), Revision: "new"}, nil
+			},
+		})
+
+		rw := resourceRequest(t, router, ref, "lab/content/intro.adoc")
+		require.Equal(t, http.StatusOK, rw.Code)
+		assert.Equal(t, []byte("= New\n"), rw.Body.Bytes())
+		assert.Equal(t, `"new"`, rw.Header().Get("ETag"))
 	})
 }
 
@@ -1540,11 +1572,12 @@ func resourceRouter(t *testing.T, catalogSource func(context.Context) (*corev1.C
 	return handler.NewRouter(handler.Config{
 		CatalogSource: catalogSource,
 		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-		SnapshotCommitHash: func(context.Context, string, string, string) (string, error) {
-			return etag, nil
-		},
-		ResourceLoader: func(_ context.Context, _, _, _, resourcePath string) (*bundle.Resource, error) {
-			return bundle.ReadResource(root, resourcePath)
+		ResourceLoader: func(_ context.Context, _, _, resourcePath string) (*bundle.Resource, error) {
+			resource, err := bundle.ReadResource(root, resourcePath)
+			if resource != nil {
+				resource.Revision = etag
+			}
+			return resource, err
 		},
 	})
 }

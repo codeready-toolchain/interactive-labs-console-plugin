@@ -19,7 +19,7 @@ RUN echo "Building the binary for $TARGETOS/$TARGETARCH with commit $COMMIT and 
 RUN cd backend && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags "-X main.commit=${COMMIT} -X main.buildtime=${BUILDTIME}" -o /out/interactive-labs ./cmd/server
 
 FROM --platform=${TARGETPLATFORM} alpine:3.21
-RUN apk add --no-cache ca-certificates git && adduser -D -u 10001 interactive-labs && \
+RUN apk add --no-cache ca-certificates && adduser -D -u 10001 interactive-labs && \
   mkdir -p /var/lib/interactive-labs/cache && \
   chown 0:0 /var/lib/interactive-labs/cache && \
   chmod 0770 /var/lib/interactive-labs/cache
