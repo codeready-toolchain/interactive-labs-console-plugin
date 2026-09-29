@@ -5,6 +5,7 @@ package setup
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 const (
@@ -59,7 +60,7 @@ func ParseSchemaBindings(raw []byte) (*SchemaBindings, error) {
 	for _, b := range all {
 		switch b.Kind {
 		case KindNamespaceName:
-			result.Namespaces = append(result.Namespaces, NamespaceBinding{Key: b.Key, Path: b.Path})
+			result.Namespaces = append(result.Namespaces, NamespaceBinding{Key: strings.TrimSuffix(b.Key, ".namespace"), Path: b.Path})
 		case KindGeneratedPassword:
 			result.Passwords = append(result.Passwords, b)
 		case KindRootURL:

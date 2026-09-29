@@ -1109,8 +1109,8 @@ func TestSetupStatusHandler(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
 		require.IsType(t, map[string]any{}, body["attributes"])
 		attrs := body["attributes"].(map[string]any)
-		assert.Equal(t, "ns-abc", attrs["gitea-namespace"])
-		assert.Equal(t, "ns-abc", attrs["datasphere-namespace"])
+		assert.Equal(t, "ns-abc", attrs["gitea"])
+		assert.Equal(t, "ns-abc", attrs["datasphere"])
 	})
 
 	t.Run("attributes absent during provisioning", func(t *testing.T) {
