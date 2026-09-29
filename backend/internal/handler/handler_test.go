@@ -543,20 +543,30 @@ func TestBundleHandler(t *testing.T) {
 
 var testValuesSchema = []byte(`{
 	"properties": {
-		"gitea.namespace": {
-			"type": "string",
-			"title": "gitea namespace",
-			"description": "Namespace name for Gitea deployment",
-			"x-interactive-labs": {
-				"kind": "namespace-name"
+		"gitea": {
+			"type": "object",
+			"properties": {
+				"namespace": {
+					"type": "string",
+					"title": "gitea namespace",
+					"description": "Namespace name for Gitea deployment",
+					"x-interactive-labs": {
+						"kind": "namespace-name"
+					}
+				}
 			}
 		},
-		"datasphere.namespace": {
-			"type": "string",
-			"title": "datasphere namespace",
-			"description": "Namespace name for Datasphere deployment",
-			"x-interactive-labs": {
-				"kind": "namespace-name"
+		"datasphere": {
+			"type": "object",
+			"properties": {
+				"namespace": {
+					"type": "string",
+					"title": "datasphere namespace",
+					"description": "Namespace name for Datasphere deployment",
+					"x-interactive-labs": {
+						"kind": "namespace-name"
+					}
+				}
 			}
 		}
 	}
@@ -1109,8 +1119,8 @@ func TestSetupStatusHandler(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
 		require.IsType(t, map[string]any{}, body["attributes"])
 		attrs := body["attributes"].(map[string]any)
-		assert.Equal(t, "ns-abc", attrs["gitea-namespace"])
-		assert.Equal(t, "ns-abc", attrs["datasphere-namespace"])
+		assert.Equal(t, "ns-abc", attrs["gitea"])
+		assert.Equal(t, "ns-abc", attrs["datasphere"])
 	})
 
 	t.Run("attributes absent during provisioning", func(t *testing.T) {

@@ -86,6 +86,69 @@ func TestParseSchemaBindings(t *testing.T) {
 		assert.Equal(t, "gitea", bindings.RootURLs[0].NamespaceRef)
 	})
 
+	t.Run("strips .namespace suffix from namespaceRef", func(t *testing.T) {
+		schema := []byte(`{
+			"properties": {
+				"datasphere": {
+					"type": "object",
+					"properties": {
+						"namespace": {
+							"type": "string",
+							"x-interactive-labs": { "kind": "namespace-name" }
+						},
+						"rootUrl": {
+							"type": "string",
+							"x-interactive-labs": { "kind": "root-url", "routeName": "datasphere", "namespaceRef": "datasphere.namespace" }
+						}
+					}
+				}
+			}
+		}`)
+
+		bindings, err := ParseSchemaBindings(schema)
+		require.NoError(t, err)
+		require.Len(t, bindings.Namespaces, 1)
+		assert.Equal(t, "datasphere", bindings.Namespaces[0].Key)
+		assert.Equal(t, "datasphere.namespace", bindings.Namespaces[0].Path)
+		require.Len(t, bindings.RootURLs, 1)
+		assert.Equal(t, "datasphere.rootUrl", bindings.RootURLs[0].Path)
+		assert.Equal(t, "datasphere", bindings.RootURLs[0].NamespaceRef)
+	})
+
+	t.Run("strips .namespace suffix from key", func(t *testing.T) {
+		schema := []byte(`{
+			"properties": {
+				"gitea": {
+					"type": "object",
+					"properties": {
+						"namespace": {
+							"type": "string",
+							"x-interactive-labs": { "kind": "namespace-name" }
+						}
+					}
+				},
+				"datasphere": {
+					"type": "object",
+					"properties": {
+						"namespace": {
+							"type": "string",
+							"x-interactive-labs": { "kind": "namespace-name" }
+						}
+					}
+				}
+			}
+		}`)
+
+		bindings, err := ParseSchemaBindings(schema)
+		require.NoError(t, err)
+		require.Len(t, bindings.Namespaces, 2)
+		sort.Slice(bindings.Namespaces, func(i, j int) bool { return bindings.Namespaces[i].Key < bindings.Namespaces[j].Key })
+		assert.Equal(t, "datasphere", bindings.Namespaces[0].Key)
+		assert.Equal(t, "datasphere.namespace", bindings.Namespaces[0].Path)
+		assert.Equal(t, "gitea", bindings.Namespaces[1].Key)
+		assert.Equal(t, "gitea.namespace", bindings.Namespaces[1].Path)
+	})
+
 	t.Run("no passwords", func(t *testing.T) {
 		schema := []byte(`{
 			"properties": {
