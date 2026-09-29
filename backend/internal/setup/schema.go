@@ -60,7 +60,11 @@ func ParseSchemaBindings(raw []byte) (*SchemaBindings, error) {
 	for _, b := range all {
 		switch b.Kind {
 		case KindNamespaceName:
-			result.Namespaces = append(result.Namespaces, NamespaceBinding{Key: strings.TrimSuffix(b.Key, ".namespace"), Path: b.Path})
+			key := strings.TrimSuffix(b.Path, ".namespace")
+			if key == b.Path {
+				key = b.Key
+			}
+			result.Namespaces = append(result.Namespaces, NamespaceBinding{Key: key, Path: b.Path})
 		case KindGeneratedPassword:
 			result.Passwords = append(result.Passwords, b)
 		case KindRootURL:
@@ -68,7 +72,7 @@ func ParseSchemaBindings(raw []byte) (*SchemaBindings, error) {
 				Key:          b.Key,
 				Path:         b.Path,
 				RouteName:    b.RouteName,
-				NamespaceRef: b.NamespaceRef,
+				NamespaceRef: strings.TrimSuffix(b.NamespaceRef, ".namespace"),
 			})
 		}
 	}

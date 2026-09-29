@@ -543,20 +543,30 @@ func TestBundleHandler(t *testing.T) {
 
 var testValuesSchema = []byte(`{
 	"properties": {
-		"gitea.namespace": {
-			"type": "string",
-			"title": "gitea namespace",
-			"description": "Namespace name for Gitea deployment",
-			"x-interactive-labs": {
-				"kind": "namespace-name"
+		"gitea": {
+			"type": "object",
+			"properties": {
+				"namespace": {
+					"type": "string",
+					"title": "gitea namespace",
+					"description": "Namespace name for Gitea deployment",
+					"x-interactive-labs": {
+						"kind": "namespace-name"
+					}
+				}
 			}
 		},
-		"datasphere.namespace": {
-			"type": "string",
-			"title": "datasphere namespace",
-			"description": "Namespace name for Datasphere deployment",
-			"x-interactive-labs": {
-				"kind": "namespace-name"
+		"datasphere": {
+			"type": "object",
+			"properties": {
+				"namespace": {
+					"type": "string",
+					"title": "datasphere namespace",
+					"description": "Namespace name for Datasphere deployment",
+					"x-interactive-labs": {
+						"kind": "namespace-name"
+					}
+				}
 			}
 		}
 	}
