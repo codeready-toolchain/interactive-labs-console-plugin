@@ -144,7 +144,7 @@ func TestLoadFromDir(t *testing.T) {
 }
 
 func TestValidateLabPathRejectsUnsupportedSegments(t *testing.T) {
-	for _, labPath := range []string{`lab\other`, "lab/%2e/other", "lab/%2E%2E/other", "lab/with\nnewline", "lab/with\x00nul"} {
+	for _, labPath := range []string{`lab\other`, "lab/%2e/other", "lab/%2E%2E/other", "lab/with\nnewline", "lab/with\x00nul"} { //nolint: misspell
 		t.Run(labPath, func(t *testing.T) {
 			require.Error(t, bundle.ValidateLabPath(labPath))
 		})

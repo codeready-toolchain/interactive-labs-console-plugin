@@ -309,7 +309,7 @@ func TestModuleWireContract(t *testing.T) {
 
 	t.Run("catalog exposes manifest title and safely omits invalid lab", func(t *testing.T) {
 		rw := httptest.NewRecorder()
-		router.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/api/v1alpha1/catalog", nil))
+		router.ServeHTTP(rw, httptest.NewRequestWithContext(context.TODO(), http.MethodGet, "/api/v1alpha1/catalog", nil))
 		require.Equal(t, http.StatusOK, rw.Code)
 		var body struct {
 			Items []map[string]any `json:"items"`
@@ -328,7 +328,7 @@ func TestModuleWireContract(t *testing.T) {
 		rw := resourceRequest(t, router, ref, "lab/modules/010-intro/content/010-start.adoc")
 		require.Equal(t, http.StatusOK, rw.Code)
 		assert.Equal(t, "= Start\n", rw.Body.String())
-		req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
+		req := httptest.NewRequestWithContext(context.TODO(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/bundle", nil)
 		req.Header.Set("Authorization", "Bearer user1")
 		rw = httptest.NewRecorder()
 		router.ServeHTTP(rw, req)
@@ -373,7 +373,7 @@ func TestModuleWireContract(t *testing.T) {
 	})
 
 	t.Run("setup still uses one lab-wide chart and catalog identity", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
+		req := httptest.NewRequestWithContext(context.TODO(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
 		req.Header.Set("Authorization", "Bearer user1")
 		rw := httptest.NewRecorder()
 		router.ServeHTTP(rw, req)

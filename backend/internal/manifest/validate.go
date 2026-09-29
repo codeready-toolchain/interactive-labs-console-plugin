@@ -3,6 +3,7 @@ package manifest
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"path"
 	"slices"
@@ -103,7 +104,7 @@ func decodeStrict(raw []byte, dst any) (*yaml.Node, error) {
 		return nil, err
 	}
 	var extra yaml.Node
-	if err := decoder.Decode(&extra); err != io.EOF {
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return nil, io.ErrUnexpectedEOF
 	}
 	return doc.Content[0], nil

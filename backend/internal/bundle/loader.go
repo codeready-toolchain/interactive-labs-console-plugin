@@ -171,7 +171,7 @@ func LoadFromSnapshot(repositoryRoot, labPath string) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: repository snapshot unavailable", ErrRepositoryUnavailable)
 	}
-	if err := rejectSymlinkPath(root, labPath); err != nil {
+	if err = rejectSymlinkPath(root, labPath); err != nil {
 		if errors.Is(err, ErrResourceNotFound) {
 			return nil, fmt.Errorf("%w: lab path", ErrManifestMissing)
 		}
@@ -194,7 +194,7 @@ func LoadFromSnapshot(repositoryRoot, labPath string) (*Result, error) {
 // LoadFromDir loads a lab bundle from an already-populated labPath on disk.
 // repoRoot is the repository root directory where setup/helm/ is expected.
 // Exported for filesystem-focused tests.
-func LoadFromDir(labDir string, repoRoot string) (*Result, error) {
+func LoadFromDir(labDir string, repoRoot string) (*Result, error) { //nolint: gocyclo
 	manifestPath := filepath.Join(labDir, "lab.yaml")
 	manifestInfo, err := os.Lstat(manifestPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -246,11 +246,13 @@ func LoadFromDir(labDir string, repoRoot string) (*Result, error) {
 			if d.IsDir() {
 				return nil
 			}
-			file, err := d.Info()
+			var file fs.FileInfo
+			file, err = d.Info()
 			if err != nil || !file.Mode().IsRegular() {
 				return errors.New("non-regular module file")
 			}
-			rel, err := filepath.Rel(contentDir, p)
+			var rel string
+			rel, err = filepath.Rel(contentDir, p)
 			if err != nil {
 				return err
 			}
