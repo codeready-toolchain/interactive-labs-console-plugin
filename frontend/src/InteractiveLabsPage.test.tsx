@@ -201,7 +201,7 @@ describe('InteractiveLabsPage', () => {
     await act(async () => { resolveList(emptyCatalog); });
   });
 
-  test('shows every title and description after successful response', async () => {
+  test('shows each catalog title as a large heading above its description', async () => {
     mockListCatalog.mockResolvedValue(sampleCatalog);
     mockRenderAsciiDoc.mockResolvedValue({ html: '<p>First lab description</p>', warnings: [] });
 
@@ -211,12 +211,41 @@ describe('InteractiveLabsPage', () => {
 
     expect(container.textContent).toContain('Lab One');
     expect(container.textContent).toContain('First lab description');
-    expect(container.querySelector('button[aria-label="Toggle description for Lab One"]')).toBeNull();
+    expect(container.querySelector('#lab-lab-1')?.nextElementSibling?.classList.contains('catalog-description')).toBe(true);
+    for (const item of sampleCatalog.items) {
+      const heading = container.querySelector(`#lab-${item.catalogRef}`);
+      expect(heading?.id).toBe(`lab-${item.catalogRef}`);
+      expect(heading?.textContent).toBe(item.title);
+      expect(heading?.tagName).toBe('H2');
+      expect(heading?.classList.contains('pf-v6-c-title')).toBe(true);
+      expect(heading?.classList.contains('pf-m-lg')).toBe(true);
+    }
+    expect(container.querySelector('#lab-lab-1')?.closest('.pf-v6-c-data-list__item-row')?.querySelectorAll('button')).toHaveLength(1);
     expect(container.textContent).toContain('Lab Two');
     expect(container.querySelector('[role="progressbar"]')).toBeNull();
   });
 
-  test('shows first rendered paragraph, then reveals remaining description without duplication', async () => {
+  test('spaces the filter wrapper below the page heading', async () => {
+    await renderCatalog();
+
+    const filter = container.querySelector('input[aria-label="Filter labs"]')!;
+    const wrapper = filter.parentElement?.parentElement;
+    expect(wrapper?.tagName).toBe('DIV');
+    expect(wrapper?.style.marginBlockStart).toBe('var(--pf-t--global--spacer--lg)');
+  });
+
+  test('pads each catalog row so heading and Launch sit below the divider', async () => {
+    await renderCatalog();
+
+    for (const item of sampleCatalog.items) {
+      const heading = container.querySelector(`#lab-${item.catalogRef}`)!;
+      const row = heading.closest<HTMLElement>('.pf-v6-c-data-list__item-row')!;
+      expect(row.querySelector('button')?.textContent?.trim()).toBe('Launch');
+      expect(row.style.paddingBlockStart).toBe('var(--pf-t--global--spacer--md)');
+    }
+  });
+
+  test('shows first rendered paragraph and toggles remaining description without duplication', async () => {
     mockRenderAsciiDoc.mockResolvedValue({
       html: '<div class="paragraph"><p>First <strong>intro</strong> paragraph.</p></div>' +
         '<div class="paragraph"><p>Additional details.</p></div>',
@@ -224,32 +253,38 @@ describe('InteractiveLabsPage', () => {
     });
     await renderCatalog();
 
-    const toggle = getButton(/Toggle description for Lab One/);
-    const titleRow = toggle.closest('.pf-v6-c-data-list__item-row')!;
+    const titleRow = container.querySelector('#lab-lab-1')!.closest('.pf-v6-c-data-list__item-row')!;
     const preview = container.querySelector('.catalog-description')!;
     const remaining = container.querySelectorAll('.catalog-description')[1]!;
-    expect(titleRow.querySelector('strong')?.textContent).toBe('Lab One');
-    expect(titleRow.querySelector('button')?.getAttribute('aria-label')).toBe('Toggle description for Lab One');
+    const toggle = Array.from(titleRow.querySelectorAll('button')).find((button) => button.textContent?.trim() === 'Show more…')!;
+    expect(titleRow.querySelector('.pf-v6-c-data-list__toggle')).toBeNull();
+    expect(toggle).toBeDefined();
+    expect(titleRow.querySelector('button[aria-label^="Toggle description"]')).toBeNull();
     expect(titleRow.querySelectorAll('button')).toHaveLength(2);
     expect(titleRow.contains(preview)).toBe(true);
-    expect(remaining.closest('.pf-v6-c-data-list__expandable-content')?.id).toBe(toggle.getAttribute('aria-controls'));
-    expect(container.textContent).not.toContain('Show more');
+    expect(preview.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(preview.textContent).toContain('First intro paragraph.');
     expect(preview.querySelector('p strong')?.textContent).toBe('intro');
-    expect(remaining.closest('[hidden]')).not.toBeNull();
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.getAttribute('aria-controls')).toBeTruthy();
+    expect(container.querySelector(`#${toggle.getAttribute('aria-controls')}`)?.contains(remaining)).toBe(true);
+    expect(remaining.closest('[hidden]')).not.toBeNull();
     expect(container.textContent).toContain('Unsafe include was omitted.');
     await act(async () => { toggle.click(); });
     expect(remaining.closest('[hidden]')).toBeNull();
+    expect(toggle.textContent?.trim()).toBe('Show less');
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
     expect(remaining.textContent).toContain('Additional details.');
     expect(container.querySelectorAll('.catalog-description p')).toHaveLength(2);
     await act(async () => { toggle.click(); });
+    expect(toggle.textContent?.trim()).toBe('Show more…');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(remaining.closest('[hidden]')).not.toBeNull();
+    expect(preview.closest('[hidden]')).toBeNull();
     expect(mockRenderAsciiDoc).toHaveBeenCalledTimes(1);
   });
 
-  test('shows a single rendered paragraph in the row without an empty description toggle', async () => {
+  test('shows a single rendered paragraph in the row without a description button', async () => {
     mockRenderAsciiDoc.mockResolvedValue({
       html: '<div class="paragraph"><p>Only description.</p></div>',
       warnings: [],
@@ -258,44 +293,66 @@ describe('InteractiveLabsPage', () => {
 
     const preview = container.querySelector('.catalog-description')!;
     expect(preview.textContent).toContain('Only description.');
-    expect(preview.closest('.pf-v6-c-data-list__item-row')).not.toBeNull();
-    expect(container.querySelector('button[aria-label="Toggle description for Lab One"]')).toBeNull();
+    const row = preview.closest('.pf-v6-c-data-list__item-row')!;
+    expect(row.querySelectorAll('button')).toHaveLength(1);
+    expect(row.querySelector('button')?.textContent?.trim()).toBe('Launch');
   });
 
-  test('does not leave an empty toggle after extracting a nested sole paragraph', async () => {
+  test('does not leave a description button after extracting a nested sole paragraph', async () => {
     mockRenderAsciiDoc.mockResolvedValue({
       html: '<div id="preamble"><div class="sectionbody"><div class="paragraph"><p>Nested intro.</p></div></div></div>',
       warnings: [],
     });
     await renderCatalog();
     expect(container.querySelector('.catalog-description')?.textContent).toContain('Nested intro.');
-    expect(container.querySelector('button[aria-label="Toggle description for Lab One"]')).toBeNull();
+    expect(container.querySelector('#lab-lab-1')?.closest('.pf-v6-c-data-list__item-row')?.querySelectorAll('button')).toHaveLength(1);
   });
 
-  test('keeps descriptions without paragraphs behind an expansion toggle', async () => {
+  test('puts description button after title when no paragraph exists', async () => {
     mockRenderAsciiDoc.mockResolvedValue({ html: '<div class="imageblock">Image only</div>', warnings: [] });
     await renderCatalog();
-    const toggle = getButton(/Toggle description for Lab One/);
+    const title = container.querySelector('#lab-lab-1')!;
+    const row = title.closest('.pf-v6-c-data-list__item-row')!;
+    const toggle = Array.from(row.querySelectorAll('button')).find((button) => button.textContent?.trim() === 'Show more…')!;
     const description = container.querySelector('.catalog-description')!;
+    expect(row.querySelector('.pf-v6-c-data-list__toggle')).toBeNull();
+    expect(title.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(container.querySelector(`#${toggle.getAttribute('aria-controls')}`)?.contains(description)).toBe(true);
     expect(description.closest('[hidden]')).not.toBeNull();
     await act(async () => { toggle.click(); });
+    expect(toggle.textContent?.trim()).toBe('Show less');
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
     expect(description.closest('[hidden]')).toBeNull();
     expect(description.textContent).toContain('Image only');
   });
 
-  test('expands only the selected lab in a list of labs', async () => {
+  test('toggles only the selected lab in a list of labs', async () => {
     const labs = { ...sampleCatalog, items: [sampleCatalog.items[0], { ...sampleCatalog.items[1], description: 'Second lab description' }] };
     mockRenderAsciiDoc.mockImplementation(({ source }) => Promise.resolve({ html: `<p>${source} intro</p><p>${source} details</p>`, warnings: [] }));
     await renderCatalog(labs);
-    const first = getButton(/Toggle description for Lab One/);
-    const second = getButton(/Toggle description for Lab Two/);
-    expect(first.closest('.pf-v6-c-data-list__item-row')?.textContent).toContain('Lab One');
-    expect(second.closest('.pf-v6-c-data-list__item-row')?.textContent).toContain('Lab Two');
+    const firstRow = container.querySelector('#lab-lab-1')!.closest('.pf-v6-c-data-list__item-row')!;
+    const secondRow = container.querySelector('#lab-lab-2')!.closest('.pf-v6-c-data-list__item-row')!;
+    const first = Array.from(firstRow.querySelectorAll('button')).find((button) => button.textContent?.trim() === 'Show more…')!;
+    const second = Array.from(secondRow.querySelectorAll('button')).find((button) => button.textContent?.trim() === 'Show more…')!;
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    expect(first.getAttribute('aria-controls')).not.toBe(second.getAttribute('aria-controls'));
+    expect(firstRow.textContent).toContain('First lab description intro');
+    expect(secondRow.textContent).toContain('Second lab description intro');
     await act(async () => { second.click(); });
+    expect(first.textContent?.trim()).toBe('Show more…');
+    expect(second.textContent?.trim()).toBe('Show less');
     expect(first.getAttribute('aria-expanded')).toBe('false');
     expect(second.getAttribute('aria-expanded')).toBe('true');
     expect(container.querySelector(`#${first.getAttribute('aria-controls')}`)?.hasAttribute('hidden')).toBe(true);
     expect(container.querySelector(`#${second.getAttribute('aria-controls')}`)?.hasAttribute('hidden')).toBe(false);
+    await act(async () => { first.click(); });
+    expect(first.textContent?.trim()).toBe('Show less');
+    expect(second.textContent?.trim()).toBe('Show less');
+    await act(async () => { second.click(); });
+    expect(first.getAttribute('aria-expanded')).toBe('true');
+    expect(second.getAttribute('aria-expanded')).toBe('false');
   });
 
   test('handles links from collapsed preview and expanded description', async () => {
@@ -314,7 +371,7 @@ describe('InteractiveLabsPage', () => {
         expect(event.defaultPrevented).toBe(true);
       };
       await click('Intro');
-      await act(async () => { getButton(/Toggle description for Lab One/).click(); });
+      await act(async () => { getButton(/Show more…/).click(); });
       await click('Details');
       expect(open).toHaveBeenNthCalledWith(1, 'https://docs.example.test/intro', '_blank', 'noopener,noreferrer');
       expect(open).toHaveBeenNthCalledWith(2, 'https://docs.example.test/details', '_blank', 'noopener,noreferrer');
@@ -328,7 +385,7 @@ describe('InteractiveLabsPage', () => {
     await renderCatalog();
     expect(container.textContent).toContain('Visible intro.');
     expect(container.textContent).toContain('Unsafe include was omitted.');
-    expect(container.querySelector('button[aria-label="Toggle description for Lab One"]')).toBeNull();
+    expect(container.querySelector('#lab-lab-1')?.closest('.pf-v6-c-data-list__item-row')?.querySelectorAll('button')).toHaveLength(1);
   });
 
   test('shows description render errors without expansion', async () => {
@@ -686,7 +743,7 @@ describe('InteractiveLabsPage', () => {
     mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Sanitized description</p>', warnings: [] });
     await renderCatalog();
 
-    expect(container.querySelector('button[aria-label="Toggle description for Lab One"]')).toBeNull();
+    expect(container.querySelector('#lab-lab-1')?.closest('.pf-v6-c-data-list__item-row')?.querySelectorAll('button')).toHaveLength(1);
     expect(container.querySelector('.catalog-description')?.textContent).toContain('Sanitized description');
     expect(mockRenderAsciiDoc).toHaveBeenCalledWith(expect.objectContaining({
       source: 'First lab description',

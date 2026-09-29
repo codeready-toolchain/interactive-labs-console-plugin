@@ -14,7 +14,6 @@ import {
   DataListItem,
   DataListItemCells,
   DataListItemRow,
-  DataListToggle,
   Drawer,
   DrawerActions,
   DrawerContent,
@@ -938,19 +937,10 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
 
   return (
     <DataListItem aria-labelledby={itemId} isExpanded={isExpanded}>
-      <DataListItemRow>
-        {remainingHTML && (
-          <DataListToggle
-            id={`${itemId}-toggle`}
-            aria-controls={descriptionId}
-            aria-label={`Toggle description for ${item.title}`}
-            isExpanded={isExpanded}
-            buttonProps={{ onClick: () => setIsExpanded((expanded) => !expanded) }}
-          />
-        )}
+      <DataListItemRow style={{ paddingBlockStart: "var(--pf-t--global--spacer--md)" }}>
         <DataListItemCells dataListCells={[
           <DataListCell key="name" width={5}>
-            <strong id={itemId}>{item.title}</strong>
+            <Title headingLevel="h2" size="lg" id={itemId}>{item.title}</Title>
             {linkWarning && <Alert variant="warning" title={linkWarning} isInline />}
             {item.description && state.status === "loading" && <Spinner aria-label={`Loading description for ${item.title}`} />}
             {state.status === "error" && <Alert variant="warning" title={state.message} isInline />}
@@ -959,6 +949,16 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
             ))}
             {previewHTML && (
               <div className="interactive-labs-content doc catalog-description" onClick={handleLink} dangerouslySetInnerHTML={{ __html: previewHTML }} />
+            )}
+            {remainingHTML && (
+              <Button
+                variant="link"
+                aria-controls={descriptionId}
+                aria-expanded={isExpanded}
+                onClick={() => setIsExpanded((expanded) => !expanded)}
+              >
+                {isExpanded ? "Show less" : "Show more…"}
+              </Button>
             )}
           </DataListCell>,
         ]} />
@@ -1041,7 +1041,7 @@ const InteractiveLabsPage: React.FC = () => {
 
       {state.status === "success" && state.items.length > 0 && (
         <>
-          <div style={{ marginBottom: "var(--pf-t--global--spacer--md)" }}>
+          <div style={{ marginBlockStart: "var(--pf-t--global--spacer--lg)", marginBottom: "var(--pf-t--global--spacer--md)" }}>
             <TextInput
               aria-label="Filter labs"
               type="search"
