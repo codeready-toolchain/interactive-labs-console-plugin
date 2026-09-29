@@ -8,23 +8,23 @@ status: Advisory
 
 Interactive Labs adds guided, multi-page tasks to OpenShift Console without turning Console, browser, or lab authors into cluster administrators. This note designs client side of MVP and records backend contracts client requires. Product goal and acceptance criteria remain in [proposal.md](proposal.md).
 
-Evidence: `proposal.md`, `stories.md`, and OpenShift Console Dynamic Plugin documentation. STORY-1, STORY-2, and STORY-9 source, tests, and deployment records exist; later-story paths below remain target structure until their story is implemented.
+Evidence: `proposal.md`, `stories.md`, repository source and tests, and OpenShift Console Dynamic Plugin documentation. This note mixes implemented behavior and provisional design; current author contract is [lab content contract](../../docs/lab-content-contract.md), and current setup flow is [lab setup design](../../docs/lab-setup-design.md).
 
 ## Design Principles
 
 - **Console-native.** Use Dynamic Plugin SDK, Console navigation, `consoleFetch`, Console service proxy, and existing `data-quickstart-id` targets. Do not recreate Console routing or Quick Starts.
 - **Browser is untrusted.** Client never clones arbitrary repositories, runs Helm, stores user tokens, or decides authorization.
 - **Content is data, not code.** Lab content comes only from catalog-approved Red Hat branches. STORY-10 service-account refresh replaces validated snapshots on an administrator-configured cadence with default concurrency four and a ten-minute per-source deadline; ticks skip while prior sweep remains active. `go-git` checkout always uses private staging, so deadline cancellation cannot corrupt published content; backend never invokes or packages a Git executable for any Git-related operation. It does not notify, reconcile, or migrate active content. Rendering navigates only `labPath/content` pages and loads same-repository supporting resources through backend-approved URLs. The current `type: manual` checkpoint proposal is provisional pending evidence and checkpoint rules.
-- **Explicit user intent.** Current namespace-selection proposal requires confirmation; selection and lifecycle policy remain open. Navigation must not claim progress completion.
-- **Small MVP.** One lab path, one optional prerequisite chart, and synchronous bounded setup. Browser-local manual progress is a provisional candidate, not a settled completion model. STORY-10 adds one limited source-refresh loop; no general background worker, CRD, namespace creation, user cancellation, or automated solving.
-- **Recoverable failures.** Every lab-content, setup, render, route, and verification failure gives user an actionable manual next step. MVP never retries, cleans up, or recovers Helm automatically.
+- **Explicit user intent.** Current chart setup provisions namespaces through SpaceRequests; existing-namespace selection remains a provisional proposal, not current UI. Selection/lifecycle policy remains open. Navigation must not claim progress completion.
+- **Small MVP.** One lab path and one optional repository-root prerequisite chart. Current chart setup creates SpaceRequests and runs a bounded asynchronous Helm worker; no user cancellation, automatic cleanup, or automated solving. Browser-local manual progress remains a provisional candidate, not a settled completion model.
+- **Recoverable failures.** Every lab-content, setup, render, route, and verification failure gives user an actionable manual next step.  Setup worker retries transient readiness checks, but no automatic Helm recovery, cleanup, or user cancellation exists.
 - **Accessible overlay.** Keyboard operation, focus management, semantic controls, and non-pointer spotlight dismissal are baseline requirements.
 
 ## Architecture / How It Works
 
 ### Deployment boundary
 
-Console loads browser assets from Dynamic Plugin service. Plugin calls backend only through its declared `UserToken` Console service proxy using `consoleFetch`; backend receives current user's forwarded access token, derives authenticated identity, and performs repository access and Helm operations with current-user RBAC. Dynamic-plugin proxy configuration uses a HTTPS Service endpoint. Backend must not persist or log forwarded tokens. Deployment declares one tested OpenShift Console/Dynamic Plugin SDK compatibility range.
+Console loads browser assets from Dynamic Plugin service. Plugin calls backend only through its declared `UserToken` Console service proxy using `consoleFetch`; backend receives current user's forwarded access token, derives authenticated identity, and performs repository access and Helm operations with current-user RBAC. Dynamic-plugin proxy configuration uses a HTTPS Service endpoint. Backend must not persist or log forwarded tokens; async setup worker holds the forwarded token in memory beyond POST response. Deployment declares one tested OpenShift Console/Dynamic Plugin SDK compatibility range.
 
 ```mermaid
 flowchart LR
@@ -39,54 +39,30 @@ flowchart LR
 
 ### Backend MVP contract
 
-Backend exposes three operations through the declared `UserToken` Console service proxy. Transport paths are implementation detail; operation semantics below are MVP contract.
+Backend exposes catalog, bundle, resource, setup, and setup-status operations through the declared `UserToken` Console service proxy.
 
 | Operation | Client input | Backend requirements | Result |
 | --- | --- | --- | --- |
-| **List catalog** | None | Read admin-configured approved source entries; derive `catalogRef` before reading each cached snapshot; return validated `lab.yaml` `metadata.displayName`, optional `metadata.description`, and normalized `labPath`. Unavailable, missing-manifest, or invalid labs are omitted; unsafe configuration is typed `configuration_error`. | Ordered valid catalog entries or typed catalog/configuration error. |
-| **Load lab bundle** | Selected catalog lab ID | Resolve configured repository and branch server-side from immutable hashed snapshot storage; validate supported manifest `apiVersion`; return manifest, normalized page descriptors carrying backend-relative approved resource paths, and optional-chart availability. | Validated bundle plus runtime context, or typed content/version/repository error. |
-| **Setup lab** | Selected lab ID and confirmed namespace bindings | Revalidate catalog, bundle, namespace bindings, current-user access, release ownership, and chart inputs. Derive release identity server-side; Helm execution remains deferred. | Success-shaped deferred `SetupResult`, or typed input/auth/content error. |
+| **List catalog** | None | Read admin-configured approved sources; derive `catalogRef`; return validated `lab.yaml` `metadata.title`, optional `description`, and normalized `labPath`. Unavailable, missing-manifest, or invalid labs are omitted; unsafe configuration is typed `configuration_error`. | Ordered valid catalog entries or typed error. |
+| **Load lab bundle** | Selected `catalogRef` | Resolve approved snapshot, validate `v1alpha1` manifest and modules; return `manifest`, `runtimeContext`, and ordered `modules: [{id, pages: [{path, url}]}]` with module-qualified paths and approved backend-relative URLs. No flat `pages` or checkpoint payload. | Validated bundle or typed error. |
+| **Read resource** | Selected `catalogRef` and repository-relative path | Authorize and constrain to approved repository snapshot, including module pages and same-repository includes/images. | Resource bytes with private cache headers or typed error. |
+| **Start/check setup** | Selected `catalogRef` | Create/reuse current-user SpaceRequests, start async Helm worker on POST, reconstruct status on GET. | `SetupStatus` (`POST /setup`, `GET /setup/status`) or typed error. |
 
-Backend must treat catalog repository, branch, lab path, Helm release identity, and authorization identity as server-derived values. Client input must not override them. Forwarded user tokens are request-scoped only: backend must neither persist nor log them.
-
-Current setup does not invoke Helm. Setup cancellation, automatic retry, cleanup, recovery, asynchronous status, durable lab-session state, automated completion verification, and section-solving API remain deferred. A future terminal Helm error can leave resources behind and require manual user or administrator intervention.
+Backend derives catalog repository, branch, lab path, Helm release identity, and authorization identity; client cannot override them. Forwarded user tokens must not be persisted or logged; current setup worker retains token in memory while running. No automatic Helm recovery, cleanup, user cancellation, durable lab-session state, automated completion verification, or section-solving API. A terminal Helm failure can leave resources behind and require manual intervention.
 
 ### Launch and setup flow
 
 1. **Implemented backend behavior:** Catalog, bundle, setup, and resource loading share one immutable configured repository/branch snapshot at `/var/lib/interactive-labs/cache/<sha256 canonical repository+branch>/content`. `Close` preserves it; no PVC is mounted today, so pod/container replacement loses cache. A future PVC mounts this fixed path. Catalog metadata comes from each validated manifest; resource route serves approved snapshot bytes.
-2. **Implemented frontend behavior:** Plugin validates client-facing manifest, normalized `labPath`, and page-descriptor shape before using them. Backend remains trust boundary for catalog, branch, paths, and lab-content retrieval. Backend returns backend-relative resource paths; client resolves them only through known Console proxy base. Page navigation uses descriptor membership; rendering fetches sources only through resolved server-approved paths. MVP does not check upstream changes during session.
-3. Namespace-selection policy remains open. Current provisional direction derives fields from chart metadata, optionally preselects accessible current Console namespace, and requires user confirmation; implementation must not freeze this direction as final policy.
-4. Backend derives stable Helm release identity from authenticated user subject, lab ID, configured branch, and normalized namespace bindings: `il-` plus a truncated SHA-256 digest of their canonical representation. Client never supplies release identity; backend derives expected identity again before reusing a release.
-5. Labs without charts open their first page. Chart-backed launches display that setup is deferred to STORY-5; frontend does not call setup.
-6. Backend setup validates current request inputs and returns a success-shaped response with derived release identity, but does not invoke Helm.
+2. **Implemented frontend behavior:** Plugin validates manifest, normalized `labPath`, modules, module-qualified page descriptors, and exact resource URLs before using them. Backend remains trust boundary for catalog, branch, paths, and lab-content retrieval. Client resolves URLs through known Console proxy base. Navigation uses descriptor membership across modules; rendering fetches only approved resource paths. MVP does not check upstream changes during session.
+3. Namespace-selection/lifecycle policy remains open. Existing-namespace selection is a provisional proposal, not current behavior: chart-backed setup currently derives SpaceRequests from repository-root schema annotations and uses current-user RBAC.
+4. Backend derives stable Helm release identity from authenticated user, `catalogRef`, and namespace bindings. Client never supplies release identity.
+5. Labs without charts open first page of first module. Chart-backed launches POST setup, poll status, then open content when provisioned/deployed. Module title requests start in background after setup; selector shows literal IDs until plain-text first-page titles are available.
 
-Planned setup uses one bounded request and an indeterminate accessible progress state, not a progress protocol. Closing, minimizing, or resetting panel does not cancel setup. Client exposes no Cancel control: Helm `Install.RunWithContext` can return on context cancellation while a started install continues in background, so cancellation does not reliably mean stop. Backend must return enough error detail to explain RBAC, repository, chart, and timeout failures.
-
-**Planned STORY-5 setup flow:**
-
-```mermaid
-sequenceDiagram
-  actor User
-  participant UI as Plugin UI
-  participant API as Backend through Console proxy
-
-  User->>UI: Select lab
-  UI->>API: Get validated manifest
-  API-->>UI: Manifest + runtime context
-  UI->>User: Select and confirm namespace(s)
-  User->>UI: Start lab
-  UI->>API: Setup(namespace bindings)
-  API-->>UI: success | failure | timeout
-  alt success or no chart
-    UI->>User: Open first lab page
-  else failure or timeout
-    UI->>User: Explain outcome; retain selection
-  end
-```
+**Current setup flow:** chart-backed launch POSTs setup without namespace bindings, then polls setup status while SpaceRequests provision and worker installs Helm. UI shows progress and opens content only when ready/deployed; failures surface to user. Closing panel does not cancel worker. Worker may be lost on process restart; re-launch explicitly starts setup again. [Lab setup design](../../docs/lab-setup-design.md) documents this flow.
 
 ### Content, routes, and spotlight flow
 
-**Implemented and verified:** Plugin renders AsciiDoc in browser through exact pinned Asciidoctor.js, DOMPurify, highlight.js, and Mermaid dependencies. DOMPurify's final AsciiDoc pass uses its default allowlist (HTML, SVG, SVG filters, and MathML) and forbids `style`/`form` elements and `style` attributes; Mermaid SVG receives a separate SVG/SVG-filter-profile pass and is inserted afterward. No custom allowlist or hook is configured. Catalog supplies normalized `labPath`, allowing client to form `lab.yaml` base while description remains raw text. Bundle supplies normalized navigable page paths and backend-relative approved resource paths; client resolves only through its declared Console proxy base. Asciidoctor's include processor requests same-repository includes through `GET /api/v1alpha1/labs/{catalogRef}/resources/{repositoryRelativePath...}`; images use route after inert HTML `src` rewrite. Relative image targets use flattened-document top-level page base. Resource handler has no size caps; it uses a quoted cached snapshot Git-HEAD SHA as `ETag` and `Cache-Control: private, no-cache`. A `_` path is include-only; remaining paths sort lexically for entry/previous/next navigation. Backend runtime attributes are passed hard-set to Asciidoctor and override author attributes. Renderer enforces include depth 64 and adds no include-count or aggregate-content cap.
+**Implemented and verified:** Plugin renders AsciiDoc in browser through exact pinned Asciidoctor.js, DOMPurify, highlight.js, and Mermaid dependencies. DOMPurify's final AsciiDoc pass uses its default allowlist (HTML, SVG, SVG filters, and MathML) and forbids `style`/`form` elements and `style` attributes; Mermaid SVG receives a separate SVG/SVG-filter-profile pass and is inserted afterward. No custom allowlist or hook is configured. Catalog supplies normalized `labPath`, allowing client to form `lab.yaml` base while description remains raw text. Bundle supplies normalized navigable page paths and backend-relative approved resource paths; client resolves only through its declared Console proxy base. Asciidoctor's include processor requests same-repository includes through `GET /api/v1alpha1/labs/{catalogRef}/resources/{repositoryRelativePath...}`; images use route after inert HTML `src` rewrite. Relative image targets use flattened-document top-level page base. Resource handler has no size caps; it uses a quoted cached snapshot Git-HEAD SHA as `ETag` and `Cache-Control: private, no-cache`. A `_`-leading path segment is include-only. Modules and their navigable content-relative `.adoc` paths sort bytewise. First page of first module is entry; Previous/Next spans module boundaries while counter is module-local. Backend runtime attributes are passed hard-set to Asciidoctor and override author attributes. Renderer enforces include depth 64 and adds no include-count or aggregate-content cap.
 
 Relative links resolve by browser URL semantics from active source and navigate drawer only when result exactly matches known page descriptor. Same-page fragments remain anchors. Absolute HTTP(S) targets outside Console origin open safe new tab; same-origin non-plugin-proxy targets use native Console navigation while drawer remains open. Plugin proxy/resource targets and unknown relative pages warn rather than navigate. A validated description page link explicitly launches target after bundle validation without bypassing chart setup. Remote includes, executable extensions, arbitrary filesystem access, repository-root escapes, raw HTML outside supported subset, and arbitrary DOM selectors are rejected.
 
@@ -117,23 +93,24 @@ sequenceDiagram
 
 ### Panel and progress flow
 
-Overlay state contains active lab/version, current page, panel mode (`open` or `minimized`), namespace bindings, and local section progress. Closing hides panel; explicit user activation reopens valid state. Route remount and browser refresh never auto-open the panel. Reset removes only this browser state. It does not call cleanup, stop setup, delete cluster resources, or alter any future audit record.
+Overlay persists only `{currentPagePath, panelMode}` under per-`catalogRef` browser-local key. Closing hides panel; explicit relaunch restores a currently valid module-qualified page or starts at first page of first module. Route remount and browser refresh never auto-open the panel. Reset removes only browser state, never cluster resources or setup worker. Active module follows current page, including direct links/resume; selecting module opens its first page. A native dropdown appears only for multiple modules. Its labels begin as literal directory names and update in background after setup from first-page AsciiDoc titles with effective attributes, sanitized to inert text; missing/failed/empty titles retain name. Title lookup cannot block drawer or page loading.
 
-Evidence, checkpoint, and completion rules remain open. Current provisional direction is an explicit browser-local `type: manual` checkpoint whose `Confirmed` state is user attestation, not evidence that instructions were completed. Neither page visit nor cached page state may claim confirmation. Browser-local state would be lost when storage is cleared or browser/device changes. Automated verification, solver behavior, and durable progress remain deferred pending this model.
+Evidence, checkpoint, and completion rules remain open. Optional module-local `module.yaml` manual checkpoint data is validated but not included in bundle or displayed as progress. Browser-local user attestation remains a provisional idea, not current completion behavior. Automated verification, solver behavior, and durable progress remain deferred.
 
 ## Core Concepts
 
 | Concept | Role | Client responsibility |
 | --- | --- | --- |
-| **Catalog entry** | Admin-visible lab locator: approved Red Hat repository, branch, AsciiDoc path, optional chart path, and `lab.yaml` description. | List, select, render description through restricted path using `lab.yaml` base, display availability/error. Never dereference arbitrary URLs. |
-| **Lab manifest** | Versioned lab-content contract: attributes, optional setup, links, and typed `checkpoints`. Page paths and entry order derive from loaded content. | Validate schema before use; render only supported features. |
-| **Lab session** | Loaded lab bundle plus browser-local state for one selected lab and namespace bindings. | Navigate within loaded bundle; persist/restore panel and progress state. |
-| **Namespace binding** | Provisional mapping from chart release namespace or annotated chart value to a namespace. | Do not treat current explicit-selection approach as settled policy. |
-| **Helm release identity** | Server-derived identity for one user's deployment of one configured lab branch into one normalized set of namespace bindings. | Never generate, persist as authority, or submit it; use it only as backend-provided correlation context. |
-| **Setup result** | Final backend result for optional Helm prerequisite installation. | Show typed status and safe next action. |
+| **Catalog entry** | Admin-visible lab locator: approved Red Hat repository, branch, lab path, and `lab.yaml` title/optional description. Chart lives at repository root. | List, select, render catalog description using `lab.yaml` base. Never dereference arbitrary URLs. |
+| **Lab manifest** | `v1alpha1` lab-content contract: required `metadata.title`, optional description and string attributes. Module-local manual checkpoints live in optional `module.yaml`, not manifest or bundle. | Validate schema before use; render only supported features. |
+| **Lab module** | Immediate safe directory under `modules/` with `content/` and ordered navigable pages. | Show module selector when multiple, derive active module from current page, navigate across modules. |
+| **Lab session** | Loaded lab bundle plus per-`catalogRef` browser-local page path and panel mode. | Navigate within loaded bundle; persist/restore only valid page path and mode. |
+| **Namespace binding** | Current setup derives annotated chart values from ready SpaceRequests; existing-namespace selection remains a separate proposal. | Do not treat provisional explicit selection as current UI or settled policy. |
+| **Helm release identity** | Server-derived identity from user, `catalogRef`, and namespace binding keys. | Never generate, persist as authority, or submit it; use only as backend-provided correlation context. |
+| **Setup status** | SpaceRequest and Helm phases from async setup. | Poll until ready/deployed or show failure. |
 | **Lab page** | One lab-local AsciiDoc page. | Resolve allowed relative links; show loading, missing-page, malformed-content states. |
 | **Console guidance link** | Renderer-generated `console:<quickstart-data-id>[label]` using fixed registry route/target behavior, not URL/selector escape hatch. | Revalidate, route only when registry requires it, attempt spotlight, fallback safely. |
-| **Checkpoint** | Provisional typed section-progress marker; current candidate is `type: manual`. | Never present user attestation as automated verification or settled completion evidence. |
+| **Checkpoint** | Module-local validated `type: manual` authoring data, inert at runtime; completion model remains open. | Do not present user attestation as automated verification or settled completion evidence. |
 
 ### Lab content delivery
 
@@ -155,15 +132,13 @@ Current candidate asks user to bind each selector to an existing namespace and m
 | Catalog validation, lab-content retrieval, setup, authorization | Backend | Backend-defined operational state |
 | Current user/namespace/routing | OpenShift Console | Console |
 | Overlay/page/minimized state | Plugin | Namespaced browser local storage |
-| Provisional `type: manual` checkpoint | Plugin | Candidate: browser local storage; user attestation only |
+| Module-local checkpoint definitions | Lab source | Validated, not sent to browser; no attestation state |
 
 Local storage key must include lab identity and configured branch. On manifest incompatibility or reset, discard incompatible client state rather than attempting migration.
 
-### Future asynchronous setup
+### Current asynchronous setup limits
 
-Asynchronous setup is feasible without a durable operation ID: Helm release identity is correlation key, and Helm release state is source for later status/recovery. One release may have zero or one active deployment. A future `POST /setup` can return while backend runs; a later authenticated browser request with a fresh token asks for same release state or explicitly re-deploys it. That future work is independent of upstream branch-update handling.
-
-That future path needs release-scoped mutual exclusion across backend replicas—Kubernetes `Lease` is smallest durable option—and a server-side deadline. While lease is held or Helm reports `pending-*`, response is `in_progress`; expired/missing lease plus pending release is abandoned and requires explicit user-authorized recovery. No token, operation log, or cancellation record needs persistence. This remains future work; MVP is synchronous.
+Current setup already uses a background worker and status polling; it retains forwarded token in memory for worker lifetime, not in persisted storage. Helm release and SpaceRequest state support status reconstruction; a process restart loses worker and requires explicit re-launch. In-memory worker guard is not cross-replica coordination. Durable/cross-replica locking and explicit recovery remain future work; see [lab setup design](../../docs/lab-setup-design.md).
 
 ## Implementation Plan
 
@@ -201,7 +176,7 @@ That future path needs release-scoped mutual exclusion across backend replicas�
 
 - **Lab author validation tool.** Validate lab content, manifest, chart `values.schema.json` namespace annotations, and Helm chart before publication.
 - **Verification and solver model.** Decide evidence, checkpoint, automated-verification, and section-solver rules before adding non-manual checkpoint types.
-- **Asynchronous setup lifecycle.** Add release lease, status/recovery UI, and server-side deadline when synchronous setup no longer meets user needs.
+- **Durable setup recovery.** Cross-replica coordination, durable operation/recovery semantics, and cleanup remain future work; async setup and status polling already exist.
 - **Upstream-content lifecycle.** Add revision visibility, update notification, migration/reconciliation, and rollback behavior for branch-delivered lab content.
 - **Offline/change-controlled delivery.** Add digest-published lab content for disconnected or tightly governed clusters.
 
@@ -257,7 +232,7 @@ _Considered and rejected: Option B (author-controlled target definitions cannot 
 
 ## ☐ Q5: Evidence, checkpoint, and section-solver rules
 
-Labs need an honest way to describe progress and, if supported later, prove completion or solve a section. Arbitrary manifest checks risk becoming an ad-hoc execution language.
+Labs need an honest way to describe progress and, if supported later, prove completion or solve a section. Module-local `module.yaml` manual checkpoints are currently validated but inert; adding active checks risks an ad-hoc execution language.
 
 ### Option A: Typed browser-local manual checkpoint (provisional)
 - **Pro:** Smallest initial user-attestation experience; avoids premature check DSL and arbitrary cluster-query surface.
@@ -294,10 +269,10 @@ Charts can target one release namespace and, through values, additional namespac
 Plugin, backend, and lab content update independently. Version mismatch must fail predictably rather than partially render or install.
 
 ### Option A: Semantic manifest `apiVersion`; backend rejects unsupported versions; plugin rejects unsupported capabilities
-- **Pro:** Clear compatibility/error behavior; permits additive evolution.
+- **Pro:** Clear compatibility/error behavior for future versioned changes.
 - **Con:** Needs schema/version maintenance.
 
-**Decision:** Option A — support one `v1alpha1` manifest in MVP. Backend and plugin reject unsupported versions; no general migration framework.
+**Decision:** Option A — keep `v1alpha1` while explicitly breaking old flat manifest/bundle shape for modules. `lab.yaml` requires `metadata.title`, rejects `metadata.name`, `metadata.displayName`, and root `spec.checkpoints`; bundle exposes only module-qualified paths grouped under `modules`, not root `pages`. Convert old flat labs before rollout. Old cached snapshots are not auto-refreshed and are safely omitted if invalid; no session migration or general migration framework. Backend and plugin also reject unsupported versions.
 
 _Considered and rejected: Option B (branch-delivered lab content could silently break as format evolves.)_
 

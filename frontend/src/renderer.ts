@@ -56,14 +56,15 @@ const abort = (): DOMException => new DOMException("Aborted", "AbortError");
 
 const warningSource = (message: string): string => `WARNING: ${message}`;
 
-function resourceURL(target: string, sourceURL: string): string | undefined {
+function resourceURL(target: string, baseURL: string, sourceURL: string): string | undefined {
   try {
-    const base = new URL(sourceURL, window.location.origin);
-    const resolved = new URL(target, base);
-    return resolved.origin === base.origin &&
+    const source = new URL(sourceURL, window.location.origin);
+    const prefix = source.pathname.match(resourcePattern)?.[0];
+    const resolved = new URL(target, new URL(baseURL, window.location.origin));
+    return prefix && resolved.origin === source.origin &&
       !resolved.search &&
       !resolved.hash &&
-      resourcePattern.test(resolved.pathname)
+      resolved.pathname.startsWith(prefix)
       ? resolved.toString()
       : undefined;
   } catch {
@@ -85,7 +86,7 @@ function registry(
 
     async process(_document: unknown, reader: PreprocessorReader, target: string, attributes: Record<string, string>): Promise<void> {
       const baseURL = reader.getIncludeDepth() === 0 ? sourceURL : reader.getCursor().getPath();
-      const resolved = resourceURL(target, baseURL);
+      const resolved = resourceURL(target, baseURL, sourceURL);
       if (!resolved || reader.getIncludeDepth() >= MAX_INCLUDE_DEPTH) {
         warnings.push(INCLUDE_WARNING);
         reader.pushInclude(warningSource(INCLUDE_WARNING), resolved ?? target, resolved ?? target, 1, attributes);
@@ -148,7 +149,7 @@ function approvedPageURL(target: string, sourceURL: string, pageURLs: string[]):
     const current = new URL(sourceURL, window.location.origin);
     resolved.hash = "";
     current.hash = "";
-    if (resolved.search || resolved.href === current.href) return undefined;
+    if (resolved.search || resolved.href === current.href || !resourceURL(resolved.href, sourceURL, sourceURL)) return undefined;
     return pageURLs.find((pageURL) => {
       const approved = new URL(pageURL, window.location.origin);
       approved.hash = "";
@@ -222,7 +223,7 @@ function replaceGuidanceLinks(root: DocumentFragment, guidanceLinks: Map<string,
 
 function rewriteImages(root: DocumentFragment, sourceURL: string): void {
   root.querySelectorAll("img[src]").forEach((image) => {
-    const target = resourceURL(image.getAttribute("src") ?? "", sourceURL);
+    const target = resourceURL(image.getAttribute("src") ?? "", sourceURL, sourceURL);
     if (target) image.setAttribute("src", target);
     else image.remove();
   });
@@ -284,6 +285,34 @@ async function renderMermaid(root: DocumentFragment, warnings: string[], prefix:
   }
 }
 
+function parserOptions(input: RenderInput, controller: AbortController, warnings: string[], guidanceLinks: Map<string, GuidanceLink>) {
+  return {
+    attributes: {
+      ...Object.fromEntries(Object.entries(input.attributes).map(([name, value]) => [`${name}@`, value])),
+      relfilesuffix: ".adoc",
+    },
+    extension_registry: registry(input.sourceURL, input.loadResource, controller, warnings, guidanceLinks),
+    safe: "secure" as const,
+    standalone: false,
+    to_file: false,
+  };
+}
+
+export async function extractAsciiDocTitle(input: RenderInput): Promise<string | undefined> {
+  if (input.signal?.aborted) throw abort();
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort();
+  input.signal?.addEventListener("abort", forwardAbort, { once: true });
+  try {
+    const document = await load(input.source, { ...parserOptions(input, controller, [], new Map()), parse_header_only: true });
+    if (controller.signal.aborted) throw abort();
+    const title = document.getDocumentTitle();
+    return typeof title === "string" ? title : undefined;
+  } finally {
+    input.signal?.removeEventListener("abort", forwardAbort);
+  }
+}
+
 export async function renderAsciiDoc(input: RenderInput): Promise<RenderResult> {
   if (input.signal?.aborted) throw abort();
   const controller = new AbortController();
@@ -333,17 +362,7 @@ export async function renderAsciiDoc(input: RenderInput): Promise<RenderResult> 
         }
       }
     }
-    const options = {
-      attributes: {
-        ...Object.fromEntries(Object.entries(input.attributes).map(([name, value]) => [`${name}@`, value])),
-        relfilesuffix: ".adoc",
-      },
-      converter: XrefTitleConverter,
-      extension_registry: registry(input.sourceURL, input.loadResource, controller, warnings, guidanceLinks),
-      safe: "secure" as const,
-      standalone: false,
-      to_file: false,
-    };
+    const options = { ...parserOptions(input, controller, warnings, guidanceLinks), converter: XrefTitleConverter };
     const asciidocDocument = await load(input.source, options);
     const converted = await asciidocDocument.convert({ standalone: false });
     if (typeof converted !== "string") throw new Error("AsciiDoc conversion did not return markup.");

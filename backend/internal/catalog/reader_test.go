@@ -144,10 +144,28 @@ func TestReadCatalog(t *testing.T) {
 			`- repository: https://github.com/redhat/lab
   branch: main
   labPath: lab/../../etc`,
+			`- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: 'lab\topic'`,
+			`- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: 'lab/%2e%2e/topic'`,
+			`- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: "lab/line\nbreak"`,
 		} {
 			_, err := catalog.Read(catalogCM(content))
 			require.ErrorContains(t, err, "configuration_error")
 		}
+	})
+
+	t.Run("hash and question mark in labPath accepted", func(t *testing.T) {
+		entries, err := catalog.Read(catalogCM(`- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: 'lab/#topic?'`))
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		assert.Equal(t, "lab/#topic?", entries[0].LabPath)
 	})
 
 	t.Run("no YAML id required", func(t *testing.T) {

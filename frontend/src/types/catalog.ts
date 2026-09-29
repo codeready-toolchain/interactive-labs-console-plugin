@@ -1,6 +1,6 @@
 export interface CatalogEntry {
   catalogRef: string;
-  displayName: string;
+  title: string;
   description?: string;
   labPath: string;
 }

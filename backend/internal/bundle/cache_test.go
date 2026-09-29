@@ -127,18 +127,17 @@ func (f *fakeGitClient) headCount() int {
 
 func writeSnapshotLab(root, labPath, content string) error {
 	lab := filepath.Join(root, filepath.FromSlash(labPath))
-	if err := os.MkdirAll(filepath.Join(lab, "content"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(lab, "modules", "010-intro", "content"), 0o755); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(lab, "lab.yaml"), []byte(`apiVersion: v1alpha1
 kind: Lab
 metadata:
-  name: test
-  displayName: Test
+  title: Test
 spec: {}`), 0o600); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(lab, "content", "intro.adoc"), []byte(content), 0o600)
+	return os.WriteFile(filepath.Join(lab, "modules", "010-intro", "content", "intro.adoc"), []byte(content), 0o600)
 }
 
 func refresh(cache *Cache, repository, branch string) error {
@@ -156,7 +155,7 @@ func TestCache(t *testing.T) {
 		for _, labPath := range []string{"lab", "other", "lab"} {
 			result, err := cache.LoadBundle(context.Background(), testRepository, testBranch, labPath)
 			require.NoError(t, err)
-			assert.Contains(t, result.Pages, "intro.adoc")
+			assert.Equal(t, []Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}}, result.Modules)
 		}
 		assert.Equal(t, 1, client.cloneCount(testRepository, testBranch))
 	})
@@ -172,10 +171,10 @@ func TestCache(t *testing.T) {
 		require.NoError(t, refresh(cache, testRepository, testBranch))
 		result, err := cache.LoadBundle(context.Background(), testRepository, testBranch, "lab")
 		require.NoError(t, err)
-		assert.Contains(t, result.Pages, "intro.adoc")
+		assert.Contains(t, result.Modules[0].Pages, "intro.adoc")
 		for range 2 {
 			var resource *Resource
-			resource, err = cache.ReadResource(context.Background(), testRepository, testBranch, "lab/content/intro.adoc")
+			resource, err = cache.ReadResource(context.Background(), testRepository, testBranch, "lab/modules/010-intro/content/intro.adoc")
 			require.NoError(t, err)
 			assert.Equal(t, []byte("= New"), resource.Bytes)
 			assert.Equal(t, newRevision, resource.Revision)
@@ -197,7 +196,7 @@ func TestCache(t *testing.T) {
 		_, err := cache.LoadBundle(context.Background(), testRepository, testBranch, "lab")
 		require.NoError(t, err)
 		for range 2 {
-			resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/content/intro.adoc")
+			resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/modules/010-intro/content/intro.adoc")
 			require.NoError(t, err)
 			assert.Equal(t, []byte("= Test"), resource.Bytes)
 			assert.Equal(t, oldRevision, resource.Revision)
@@ -358,7 +357,7 @@ func TestCache(t *testing.T) {
 		entry, err := cache.entry(testRepository, testBranch)
 		require.NoError(t, err)
 		require.NoError(t, os.Remove(filepath.Join(entry.checkoutDirectory, "lab", "lab.yaml")))
-		resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/content/intro.adoc")
+		resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/modules/010-intro/content/intro.adoc")
 		require.NoError(t, err)
 		assert.Equal(t, []byte("= Old"), resource.Bytes)
 	})
@@ -373,7 +372,7 @@ func TestCache(t *testing.T) {
 		client.refs[key], client.cloneErr[key] = newRevision, errors.New("raw git output must not escape")
 		err := refresh(cache, testRepository, testBranch)
 		require.ErrorIs(t, err, ErrCloneFailed)
-		resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/content/intro.adoc")
+		resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/modules/010-intro/content/intro.adoc")
 		require.NoError(t, err)
 		assert.Equal(t, []byte("= Old"), resource.Bytes)
 		assert.Equal(t, oldRevision, resource.Revision)
@@ -453,7 +452,7 @@ func TestCache(t *testing.T) {
 		assert.Empty(t, cache.entries)
 
 		cache = newCache(t.TempDir(), newFakeGit())
-		_, err = cache.ReadResource(context.Background(), testRepository, "-untrusted", "lab/content/intro.adoc")
+		_, err = cache.ReadResource(context.Background(), testRepository, "-untrusted", "lab/modules/010-intro/content/intro.adoc")
 		require.ErrorIs(t, err, ErrRepositoryUnavailable)
 		assert.Empty(t, cache.entries)
 	})
@@ -478,7 +477,7 @@ func TestCache(t *testing.T) {
 			err      error
 		}, 1)
 		go func() {
-			resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/content/intro.adoc")
+			resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/modules/010-intro/content/intro.adoc")
 			readerDone <- struct {
 				resource *Resource
 				err      error

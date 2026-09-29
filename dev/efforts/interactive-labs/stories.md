@@ -165,3 +165,19 @@ Cached approved sources must receive branch updates without repeated user-reques
 - Refresh introduces no user-facing update notification, revision pinning, migration, or session reconciliation.
 
 **Dependencies:** STORY-9.
+
+## ☑ STORY-14: Organize lab pages into modules
+
+Long labs need meaningful module boundaries without treating page visits as evidence of completion.
+
+**Goal:** Replace flat page navigation with ordered modules across authoring, bundle API, and drawer.
+
+**Acceptance criteria:**
+- `lab.yaml` v1alpha1 requires `metadata.title`, permits optional description and `spec.attributes`, and rejects old metadata fields and root `spec.checkpoints`.
+- Every immediate directory in `modules/` is a module with `content/` and at least one navigable `.adoc` page; modules and pages sort bytewise lexically, underscore-leading page segments are include-only, and root `content/` may coexist with valid modules, but flat labs without required `modules/` remain invalid. Recommend zero-padded directory names.
+- Optional `module.yaml` holds top-level checkpoints only: module-content-relative `pagePath` must name a navigable page in that module; IDs are unique within each module, reusable across modules. No progress or completion behavior added.
+- Catalog returns `title` instead of `displayName`; bundle returns `modules: [{id, pages}]` only, with module-qualified paths and approved resource URLs, no backend-derived module titles.
+- Drawer opens before background module-title fetches; dropdown uses first page's resolved AsciiDoc title as plain text or literal directory name on failure, hides for one module, and selects a module's first page. Previous/Next cross modules with module-local counter; valid stored page resumes, otherwise first page of first module.
+- Description remains catalog-only; setup remains lab-wide; same-repository resources and cross-module known-page links remain safe. No source-revision lifecycle or checkpoint policy change.
+
+**Dependencies:** STORY-4 (including STORY-3 and STORY-9); STORY-7 completion rules remain independent.
