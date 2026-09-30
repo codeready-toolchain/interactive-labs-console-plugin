@@ -2,4 +2,4 @@
 
 ## Git
 
-- Never push worktree branches to origin. Leave them as local commits.
+- Never use worktrees. Make all changes directly on the current branch in the local repo.
