@@ -12,11 +12,11 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 ## Q2 — Failed setup handling
 
-**Decision:** no automatic retry, cleanup, or recovery in MVP.
+**Decision:** recover abandoned operations with best-effort renewable Lease exclusion; never blindly reinstall over an existing Helm release. Setup resumes from verified SRs on a fresh authenticated POST when no release exists; verified safe interrupted `pending-install` releases can be explicitly torn down before relaunch.
 
-**Why:** retrying or cleaning partially installed charts needs an explicit chart lifecycle policy. Terminal errors require manual user or administrator intervention.
+**Why:** waiting forever after backend restart is unacceptable, but an expired Lease does not fence an in-flight Helm call. A 20-second renewal and 200-second takeover window bound the common crash while acknowledging rare overlap risk; resource identity checks and current-user RBAC still apply. Unsafe hooks, retained resources, or ambiguous Helm state remain blocked rather than silently deleted.
 
-**Implemented:** async SpaceRequests/Helm worker with setup status polling. **Deferred:** cancellation, durable operation records, and automatic cleanup/recovery.
+**Implemented:** async SpaceRequests/Helm setup and explicitly confirmed asynchronous teardown of dedicated identity-marked setups, including removed-catalog labs. Both use in-memory current-user tokens and renewable per-user/lab Leases; browser polling retries setup on next authenticated request when safe. Teardown stores a non-secret operation receipt on the Lease and reports expired running work as unknown. **Deferred:** unattended resume without current-user token, guaranteed fencing, durable execution journals, automated cleanup of unsafe or partial Helm states.
 
 ## Q3 — Rendered content safety
 

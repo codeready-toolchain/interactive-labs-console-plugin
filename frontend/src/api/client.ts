@@ -1,7 +1,7 @@
 import { consoleFetch } from "@openshift-console/dynamic-plugin-sdk";
 import type { CatalogEntry, CatalogList } from "../types/catalog";
 import type { LabBundle, LabManifest, LabModule, LabPage } from "../types/manifest";
-import type { SetupResult, SetupStatus } from "../types/setup";
+import { blockedReasons, type BlockedReason, type LabSetup, type SetupList, type SetupResult, type SetupStatus, type TeardownProgress } from "../types/setup";
 import { isKnownErrorType, type LabError } from "../types/errors";
 
 const PROXY_BASE = "/api/proxy/plugin/interactive-labs-console-plugin/backend";
@@ -75,6 +75,73 @@ export async function setupLab(catalogRef: string, signal?: AbortSignal): Promis
 export async function getSetupStatus(catalogRef: string, signal?: AbortSignal): Promise<SetupStatus> {
   const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/setup/status`, { signal });
   return parseResponse<SetupStatus>(res);
+}
+
+const isDigest = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+
+export async function listSetups(): Promise<SetupList> {
+  const response = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/setups`);
+  const body = await parseResponse<unknown>(response);
+  if (!isRecord(body) || body.apiVersion !== "v1alpha1" || body.kind !== "SetupList" || !Array.isArray(body.items)) {
+    throw new Error("Invalid lab setup list.");
+  }
+  const items: LabSetup[] = body.items.map((item: unknown) => {
+    if (!isRecord(item) || !isDigest(item.catalogRef) || !isDigest(item.generation) ||
+        (item.status !== "pending" && item.status !== "deployed" && item.status !== "failed") ||
+        !Array.isArray(item.spaceRequests) || !item.spaceRequests.every((name: unknown) => typeof name === "string" && name.length > 0) ||
+        (item.blocked !== undefined && typeof item.blocked !== "boolean") ||
+        (item.blockedReason !== undefined && !blockedReasons.includes(item.blockedReason as BlockedReason))) {
+      throw new Error("Invalid lab setup identity.");
+    }
+    const result: LabSetup = { catalogRef: item.catalogRef, generation: item.generation, status: item.status, spaceRequests: item.spaceRequests, blocked: item.blocked as boolean | undefined };
+    if (item.blockedReason !== undefined) result.blockedReason = item.blockedReason as BlockedReason;
+    if (item.release !== undefined) {
+      const release = item.release;
+      if (!isRecord(release) || release.catalogRef !== item.catalogRef || typeof release.name !== "string" || !release.name || typeof release.status !== "string" ||
+          (release.cleanupBlocked !== undefined && typeof release.cleanupBlocked !== "boolean")) {
+        throw new Error("Invalid lab release identity.");
+      }
+      result.release = { name: release.name };
+    }
+    return result;
+  });
+  return { apiVersion: "v1alpha1", kind: "SetupList", items };
+}
+
+const isOperationID = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
+
+function parseTeardownProgress(body: unknown, catalogRef: string, operationId?: string): TeardownProgress {
+  if (!isRecord(body) || body.apiVersion !== "v1alpha1" || body.kind !== "TeardownStatus" ||
+      body.catalogRef !== catalogRef || !isOperationID(body.operationId) ||
+      (operationId !== undefined && body.operationId !== operationId) ||
+      (body.status !== "running" && body.status !== "succeeded" && body.status !== "failed" && body.status !== "unknown")) {
+    throw new Error("Invalid teardown status.");
+  }
+  return body as unknown as TeardownProgress;
+}
+
+export async function teardownLab(catalogRef: string, generation: string): Promise<TeardownProgress> {
+  if (!isDigest(catalogRef) || !isDigest(generation)) throw new Error("Invalid lab setup identity.");
+  const response = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/teardown`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ generation }),
+  });
+  return parseTeardownProgress(await parseResponse<unknown>(response), catalogRef);
+}
+
+export async function getTeardownStatus(catalogRef: string, operationId?: string, signal?: AbortSignal): Promise<TeardownProgress> {
+  if (!isDigest(catalogRef) || (operationId !== undefined && !isOperationID(operationId))) throw new Error("Invalid teardown identity.");
+  const url = `${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/teardown/status${operationId ? `?operationId=${operationId}` : ''}`;
+  let response: Response;
+  try {
+    response = await consoleFetch(url, { signal });
+  } catch (error: unknown) {
+    if ((error as { response?: { status?: number } })?.response?.status === 404) {
+      throw Object.assign(new Error("Teardown operation not found."), { status: 404 });
+    }
+    throw error;
+  }
+  if (response.status === 404) throw Object.assign(new Error("Teardown operation not found."), { status: 404 });
+  return parseTeardownProgress(await parseResponse<unknown>(response), catalogRef, operationId);
 }
 
 // --- Bundle validation ---

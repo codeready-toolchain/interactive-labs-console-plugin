@@ -1,14 +1,26 @@
 package setup
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"helm.sh/helm/v3/pkg/release"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func TestBuildValues(t *testing.T) {
@@ -62,62 +74,34 @@ func TestHelmStatusLabel(t *testing.T) {
 	}
 }
 
-func TestMapBindingsToValues(t *testing.T) {
-	t.Run("all ready", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if r.URL.Path[len(r.URL.Path)-len("gitea"):] == "gitea" {
-				fmt.Fprint(w, `{"metadata":{"name":"gitea"},"status":{"namespaceAccess":[{"name":"ns-gitea-123","secretRef":"s"}],"conditions":[{"type":"Ready","status":"True"}]}}`)
+func TestVerifiedNamespaceBinding(t *testing.T) {
+	ref := "abababababababababababababababababababababababababababababababab"
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name, uid, label string
+		wantErr          bool
+	}{
+		{"verified ready SR", "expected-uid", label, false},
+		{"replacement UID rejected", "replacement", label, true},
+		{"foreign lab rejected", "expected-uid", "other", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"metadata":{"name":"gitea","namespace":"alice-dev","uid":%q,"labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"ns-ready"}],"conditions":[{"type":"Ready","status":"True"}]}}`, tc.uid, CatalogRefLabelKey, tc.label, BindingKeyAnnotation)
+			}))
+			defer server.Close()
+			client := &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}
+			values, err := mapVerifiedBindingsToValues(context.Background(), client, "token", "alice-dev", ref, []NamespaceBinding{{Key: "gitea", Path: "namespace"}}, map[string]string{"gitea": "expected-uid"})
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Empty(t, values)
 			} else {
-				fmt.Fprint(w, `{"metadata":{"name":"lab"},"status":{"namespaceAccess":[{"name":"ns-lab-456","secretRef":"s"}],"conditions":[{"type":"Ready","status":"True"}]}}`)
+				require.NoError(t, err)
+				assert.Equal(t, "ns-ready", values["namespace"])
 			}
-		}))
-		defer server.Close()
-
-		client := &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}
-		bindings := []NamespaceBinding{
-			{Key: "gitea", Path: "namespaces.gitea"},
-			{Key: "lab", Path: "namespaces.lab"},
-		}
-		values, err := MapBindingsToValues(context.Background(), client, "token", "user1-dev", bindings)
-		require.NoError(t, err)
-		assert.Equal(t, "ns-gitea-123", values["namespaces.gitea"])
-		assert.Equal(t, "ns-lab-456", values["namespaces.lab"])
-	})
-
-	t.Run("not found", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusNotFound)
-		}))
-		defer server.Close()
-
-		client := &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}
-		bindings := []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}
-		_, err := MapBindingsToValues(context.Background(), client, "token", "user1-dev", bindings)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "not found")
-	})
-
-	t.Run("not ready", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"metadata":{"name":"gitea"},"status":{"conditions":[{"type":"Ready","status":"False","reason":"Provisioning"}]}}`)
-		}))
-		defer server.Close()
-
-		client := &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}
-		bindings := []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}
-		_, err := MapBindingsToValues(context.Background(), client, "token", "user1-dev", bindings)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "not ready")
-	})
-
-	t.Run("empty bindings", func(t *testing.T) {
-		client := &SpaceRequestClient{HTTPClient: http.DefaultClient, APIHost: "http://unused"}
-		values, err := MapBindingsToValues(context.Background(), client, "token", "user1-dev", nil)
-		require.NoError(t, err)
-		assert.Empty(t, values)
-	})
+		})
+	}
 }
 
 func TestExtractNestedValue(t *testing.T) {
@@ -149,4 +133,196 @@ func TestExtractNestedValue(t *testing.T) {
 
 	_, ok = extractNestedValue(m, "passwords.postgres.deep")
 	assert.False(t, ok)
+}
+
+func cleanupTestSpaceRequest(t *testing.T, ref, target string) SpaceRequestResult {
+	t.Helper()
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	return SpaceRequestResult{
+		Name: "gitea", Namespace: "alice-dev", UID: "sr-uid",
+		Labels:          map[string]string{CatalogRefLabelKey: label},
+		Annotations:     map[string]string{BindingKeyAnnotation: "gitea"},
+		Conditions:      []SpaceRequestCondition{{Type: "Ready", Status: "True"}},
+		NamespaceAccess: []SpaceRequestNamespaceAccess{{Name: target}},
+	}
+}
+
+// Exercise the public Helm API against local storage only. No uninstall may run.
+func cleanupTestHelm(t *testing.T, rel *release.Release, uid string) (*HelmClient, *[]string) {
+	t.Helper()
+	payload, err := json.Marshal(rel)
+	require.NoError(t, err)
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	_, err = writer.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	secret := corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("sh.helm.release.v1.%s.v%d", rel.Name, rel.Version),
+			Namespace: rel.Namespace, UID: types.UID(uid),
+			Labels: map[string]string{"owner": "helm", "name": rel.Name, "status": string(rel.Info.Status), CatalogRefLabelKey: rel.Labels[CatalogRefLabelKey]},
+		},
+		Data: map[string][]byte{"release": []byte(base64.StdEncoding.EncodeToString(compressed.Bytes()))},
+	}
+	mutations := []string{}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet {
+			mutations = append(mutations, r.Method+" "+r.URL.Path)
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if r.URL.Path == "/version" {
+			_, _ = fmt.Fprint(w, `{"major":"1","minor":"30","gitVersion":"v1.30.0"}`)
+			return
+		}
+		if r.URL.Path == "/api/v1/namespaces/alice-dev/secrets" {
+			require.NoError(t, json.NewEncoder(w).Encode(corev1.SecretList{Items: []corev1.Secret{secret}}))
+			return
+		}
+		if r.URL.Path == "/api/v1/namespaces/alice-dev/secrets/"+secret.Name {
+			require.NoError(t, json.NewEncoder(w).Encode(secret))
+			return
+		}
+		assert.Fail(t, "unexpected Helm API request", "%s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	caFile := filepath.Join(t.TempDir(), "ca.crt")
+	require.NoError(t, os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600))
+	return &HelmClient{APIHost: server.URL, CAFile: caFile}, &mutations
+}
+
+func TestHelmCleanupEligibility(t *testing.T) {
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	job := "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: hook\n  namespace: alice-gitea\n"
+	for _, tc := range []struct {
+		name, manifest, hook, reason string
+		srs                          func() []SpaceRequestResult
+		extraHook                    *release.Hook
+	}{
+		{name: "no hooks"},
+		{name: "regular resource", manifest: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: normal\n"},
+		{name: "dedicated Job", hook: job},
+		{name: "multiple dedicated Jobs", hook: job + "---\n" + strings.ReplaceAll(job, "name: hook", "name: hook-two")},
+		{name: "empty separator documents", hook: "---\n" + job + "---\n"},
+		{name: "JSON Job", hook: `{"apiVersion":"batch/v1","kind":"Job","metadata":{"name":"hook","namespace":"alice-gitea"}}`},
+		{name: "duplicate hook keys", hook: job + "kind: ClusterRole\n", reason: "helm-manifest"},
+		{name: "invalid annotation type", hook: job + "  annotations: [keep]\n", reason: "helm-manifest"},
+		{name: "unknown hook list", hook: "apiVersion: v1\nkind: List\nitems: []\n", reason: "helm-hook"},
+		{name: "invalid main resource", manifest: "{}", hook: job, reason: "helm-manifest"},
+		{name: "home Job", hook: strings.ReplaceAll(job, "alice-gitea", "alice-dev"), reason: "helm-hook"},
+		{name: "unverified namespace", hook: strings.ReplaceAll(job, "alice-gitea", "foreign"), reason: "helm-hook"},
+		{name: "missing explicit namespace", hook: strings.ReplaceAll(job, "  namespace: alice-gitea\n", ""), reason: "helm-hook"},
+		{name: "cluster scoped hook", hook: strings.ReplaceAll(job, "kind: Job", "kind: ClusterRole"), reason: "helm-hook"},
+		{name: "other namespaced kind", hook: strings.ReplaceAll(job, "kind: Job", "kind: ConfigMap"), reason: "helm-hook"},
+		{name: "old Job API", hook: strings.ReplaceAll(job, "batch/v1", "batch/v1beta1"), reason: "helm-hook"},
+		{name: "unnamed Job", hook: strings.ReplaceAll(job, "  name: hook\n", ""), reason: "helm-hook"},
+		{name: "unknown second document", hook: job + "---\napiVersion: v1\nkind: Unknown\n", reason: "helm-hook"},
+		{name: "invalid hook YAML", hook: job + "spec: [", reason: "helm-manifest"},
+		{name: "invalid second document", hook: job + "---\ninvalid: [", reason: "helm-manifest"},
+		{name: "empty hook manifest", extraHook: &release.Hook{Kind: "Job"}, reason: "helm-hook"},
+		{name: "safe and unsafe hooks", hook: job, extraHook: &release.Hook{Kind: "Job", Manifest: strings.ReplaceAll(job, "alice-gitea", "alice-dev")}, reason: "helm-hook"},
+		{name: "retained hook Job", hook: job + "  annotations:\n    helm.sh/resource-policy: keep\n", reason: "helm-retained"},
+		{name: "normalized retained hook policy", hook: job + "  annotations:\n    helm.sh/resource-policy: ' KEEP '\n", reason: "helm-retained"},
+		{name: "retained regular resource", manifest: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: retained\n  annotations:\n    helm.sh/resource-policy: keep\n", hook: job, reason: "helm-retained"},
+		{name: "invalid main YAML", manifest: "metadata: [", hook: job, reason: "helm-manifest"},
+		{name: "no SR", hook: job, srs: func() []SpaceRequestResult { return nil }, reason: "helm-hook"},
+		{name: "not Ready SR", hook: job, srs: func() []SpaceRequestResult {
+			sr := cleanupTestSpaceRequest(t, ref, "alice-gitea")
+			sr.Conditions = nil
+			return []SpaceRequestResult{sr}
+		}, reason: "helm-hook"},
+		{name: "unmarked SR", hook: job, srs: func() []SpaceRequestResult {
+			sr := cleanupTestSpaceRequest(t, ref, "alice-gitea")
+			sr.Labels = nil
+			return []SpaceRequestResult{sr}
+		}, reason: "helm-hook"},
+		{name: "foreign catalog SR", hook: job, srs: func() []SpaceRequestResult {
+			return []SpaceRequestResult{cleanupTestSpaceRequest(t, strings.Repeat("cd", 32), "alice-gitea")}
+		}, reason: "helm-hook"},
+		{name: "shared target namespace", hook: job, srs: func() []SpaceRequestResult {
+			return []SpaceRequestResult{cleanupTestSpaceRequest(t, ref, "alice-gitea"), cleanupTestSpaceRequest(t, strings.Repeat("cd", 32), "alice-gitea")}
+		}, reason: "helm-hook"},
+		{name: "missing UID SR", hook: job, srs: func() []SpaceRequestResult {
+			sr := cleanupTestSpaceRequest(t, ref, "alice-gitea")
+			sr.UID = ""
+			return []SpaceRequestResult{sr}
+		}, reason: "helm-hook"},
+		{name: "missing binding marker SR", hook: job, srs: func() []SpaceRequestResult {
+			sr := cleanupTestSpaceRequest(t, ref, "alice-gitea")
+			sr.Annotations = nil
+			return []SpaceRequestResult{sr}
+		}, reason: "helm-hook"},
+		{name: "foreign home SR", hook: job, srs: func() []SpaceRequestResult {
+			sr := cleanupTestSpaceRequest(t, ref, "alice-gitea")
+			sr.Namespace = "bob-dev"
+			return []SpaceRequestResult{sr}
+		}, reason: "helm-hook"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rel := &release.Release{Name: "il-lab", Namespace: "alice-dev", Version: 1, Info: &release.Info{Status: release.StatusDeployed}, Labels: map[string]string{CatalogRefLabelKey: label}, Manifest: tc.manifest}
+			if tc.hook != "" {
+				rel.Hooks = append(rel.Hooks, &release.Hook{Kind: "Job", Manifest: tc.hook})
+			}
+			if tc.extraHook != nil {
+				rel.Hooks = append(rel.Hooks, tc.extraHook)
+			}
+			srs := []SpaceRequestResult{cleanupTestSpaceRequest(t, ref, "alice-gitea")}
+			if tc.srs != nil {
+				srs = tc.srs()
+			}
+			client, mutations := cleanupTestHelm(t, rel, "helm-uid")
+			items, err := client.ListLabReleases(context.Background(), "alice-dev", "user-token", srs)
+			require.NoError(t, err)
+			require.Len(t, items, 1)
+			assert.Equal(t, tc.reason != "", items[0].CleanupBlocked)
+			assert.EqualValues(t, tc.reason, items[0].BlockedReason)
+			assert.Empty(t, *mutations)
+		})
+	}
+}
+
+func TestHelmUninstallInterruptedPendingInstall(t *testing.T) {
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	rel := &release.Release{Name: "il-lab", Namespace: "alice-dev", Version: 1,
+		Info: &release.Info{Status: release.StatusPendingInstall}, Labels: map[string]string{CatalogRefLabelKey: label}}
+	client, mutations := cleanupTestHelm(t, rel, "helm-uid")
+	target := LabRelease{Name: rel.Name, Namespace: rel.Namespace, CatalogRef: ref, Status: "pending-install", Revision: 1, UID: "helm-uid"}
+	uninstallErr := client.UninstallLabRelease(context.Background(), "alice-dev", "user-token", target, []SpaceRequestResult{cleanupTestSpaceRequest(t, ref, "alice-gitea")})
+	require.Error(t, uninstallErr, "fixture forbids mutation but eligible pending install must attempt managed cleanup")
+	assert.NotEqual(t, "lab release changed or requires manual recovery", uninstallErr.Error())
+	assert.NotEmpty(t, *mutations)
+}
+
+func TestHelmUninstallRechecksEligibility(t *testing.T) {
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name, namespace string
+		status          release.Status
+		uid             string
+	}{
+		{"home hook introduced", "alice-dev", release.StatusDeployed, "helm-uid"},
+		{"unverified hook introduced", "other", release.StatusDeployed, "helm-uid"},
+		{"pending release", "alice-gitea", release.StatusPendingUpgrade, "helm-uid"},
+		{"storage replaced", "alice-gitea", release.StatusDeployed, "replacement"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rel := &release.Release{Name: "il-lab", Namespace: "alice-dev", Version: 1, Info: &release.Info{Status: tc.status}, Labels: map[string]string{CatalogRefLabelKey: label}, Hooks: []*release.Hook{{Kind: "Job", Manifest: fmt.Sprintf("apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: hook\n  namespace: %s\n", tc.namespace)}}}
+			client, mutations := cleanupTestHelm(t, rel, tc.uid)
+			target := LabRelease{Name: "il-lab", Namespace: "alice-dev", CatalogRef: ref, Status: "deployed", Revision: 1, UID: "helm-uid"}
+			err := client.UninstallLabRelease(context.Background(), "alice-dev", "user-token", target, []SpaceRequestResult{cleanupTestSpaceRequest(t, ref, "alice-gitea")})
+			require.EqualError(t, err, "lab release changed or requires manual recovery")
+			assert.Empty(t, *mutations)
+		})
+	}
 }

@@ -40,7 +40,8 @@ Do not represent planned behavior as shipped.
 | Catalog-listing page, loading/empty/error/retry states | **Implemented and verified** |
 | Modules-only lab bundle, single/multi-module drawer navigation and title fallback, AsciiDoc rendering, browser page/include/image resource endpoint | **Implemented and verified** |
 | Typed Console guidance/resource links | **Implemented and verified** |
-| Chart-backed async SpaceRequests/Helm setup with frontend status polling | **Implemented and verified** |
+| Chart-backed async SpaceRequests/Helm setup with frontend status polling; renewable per-lab Lease and request-driven no-release restart recovery | **Implemented and verified by automated tests** |
+| Explicit identity-marked setup inventory/teardown, including removed catalog entries; best-effort Lease takeover and confirmed safe interrupted-install cleanup | **Implemented and verified by automated tests**; rollout depends on dedicated SR naming |
 | Explicit existing-namespace selection; browser-local manual-checkpoint attestation | **Provisional direction** |
 | Namespace selection/lifecycle; completion evidence and checkpoint rules; section solving; automated verification; durable/audited progress; durable setup recovery; revision lifecycle; offline delivery; author validation tool | **Open or deferred** |
 
