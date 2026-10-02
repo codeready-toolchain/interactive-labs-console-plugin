@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -125,7 +126,7 @@ func completeRuntimeAttributes(attrs map[string]string) bool {
 	if len(attrs) != 4 {
 		return false
 	}
-	for _, key := range []string{"user", "openshift_api_url", "openshift_console_url", "openshift_cluster_ingress_domain"} {
+	for _, key := range []string{"user", "openshift-api-url", "openshift-console-url", "openshift-cluster-ingress-domain"} {
 		if attrs[key] == "" {
 			return false
 		}
@@ -370,6 +371,7 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 	result.Manifest.Spec.Attributes = mergeAttributes(staticAttrs, runtimeAttrs)
+	cfg.Logger.Info("bundle attributes", "keys", slices.Sorted(maps.Keys(result.Manifest.Spec.Attributes)))
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"apiVersion": "v1alpha1",
@@ -735,11 +737,11 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 	if allReady && helmStatus == "deployed" {
 		attributes = make(map[string]string, len(sctx.bindings.Namespaces)+len(sctx.bindings.Passwords)+len(sctx.bindings.RootURLs))
 		for _, b := range sctx.bindings.Namespaces {
-			attributes[strings.ReplaceAll(b.Key, ".", "-")] = namespaces[b.Key].Name
+			attributes[strings.ReplaceAll(b.Path, ".", "-")] = namespaces[b.Key].Name
 		}
 		for _, b := range sctx.bindings.Passwords {
 			if v, ok := generatedValues[b.Path]; ok {
-				attributes[strings.ReplaceAll(b.Key, ".", "-")] = v
+				attributes[strings.ReplaceAll(b.Path, ".", "-")] = v
 			}
 		}
 		for _, b := range sctx.bindings.RootURLs {
@@ -750,10 +752,13 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 			if !ok {
 				continue
 			}
-			attributes[strings.ReplaceAll(b.Key, ".", "-")] = fmt.Sprintf("%s-%s.%s", b.RouteName, ns.Name, cfg.ClusterIngressDomain)
+			attributes[strings.ReplaceAll(b.Path, ".", "-")] = fmt.Sprintf("%s-%s.%s", b.RouteName, ns.Name, cfg.ClusterIngressDomain)
 		}
 	}
 
+	if len(attributes) > 0 {
+		cfg.Logger.Info("setup status attributes", "keys", slices.Sorted(maps.Keys(attributes)))
+	}
 	writeJSON(w, http.StatusOK, buildSetupStatusResponse(srStatus, namespaces, helmStatus, releaseName, helmMessage, generatedValues, attributes))
 }
 

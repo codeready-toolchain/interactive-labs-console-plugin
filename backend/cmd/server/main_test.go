@@ -48,9 +48,9 @@ func TestRuntimeAttributes(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, map[string]string{
 			"user":                             "alice",
-			"openshift_api_url":                apiServerURL,
-			"openshift_console_url":            consoleURL,
-			"openshift_cluster_ingress_domain": ingressDomain,
+			"openshift-api-url":                apiServerURL,
+			"openshift-console-url":            consoleURL,
+			"openshift-cluster-ingress-domain": ingressDomain,
 		}, attributes)
 	})
 
@@ -74,22 +74,22 @@ func TestRuntimeAttributes(t *testing.T) {
 		}{
 			{
 				name:      "missing API URL",
-				attribute: "openshift_api_url",
+				attribute: "openshift-api-url",
 				client:    typedConfigClient(configv1.InfrastructureStatus{}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain}),
 			},
 			{
 				name:      "missing console URL",
-				attribute: "openshift_console_url",
+				attribute: "openshift-console-url",
 				client:    typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{}, configv1.IngressSpec{Domain: ingressDomain}),
 			},
 			{
 				name:      "missing ingress domain",
-				attribute: "openshift_cluster_ingress_domain",
+				attribute: "openshift-cluster-ingress-domain",
 				client:    typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{}),
 			},
 			{
 				name:      "typed client error",
-				attribute: "openshift_console_url",
+				attribute: "openshift-console-url",
 				client: func() *configfake.Clientset {
 					client := typedConfigClient(configv1.InfrastructureStatus{APIServerURL: apiServerURL}, configv1.ConsoleStatus{ConsoleURL: consoleURL}, configv1.IngressSpec{Domain: ingressDomain})
 					client.PrependReactor("get", "consoles", func(k8stesting.Action) (bool, runtime.Object, error) {

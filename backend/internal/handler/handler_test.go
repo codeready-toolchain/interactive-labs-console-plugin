@@ -59,7 +59,7 @@ func newRouter(t *testing.T) http.Handler {
 		},
 		RuntimeAttributes: func(_ *http.Request, subject string) (map[string]string, error) {
 			return map[string]string{
-				"user": subject, "openshift_api_url": "https://api.example.test", "openshift_console_url": "https://console.example.test", "openshift_cluster_ingress_domain": "apps.example.test",
+				"user": subject, "openshift-api-url": "https://api.example.test", "openshift-console-url": "https://console.example.test", "openshift-cluster-ingress-domain": "apps.example.test",
 			}, nil
 		},
 	})
@@ -293,7 +293,7 @@ func TestModuleWireContract(t *testing.T) {
 		},
 		Authenticate: func(_ context.Context, _, token string) (string, error) { return token, nil },
 		RuntimeAttributes: func(_ *http.Request, subject string) (map[string]string, error) {
-			return map[string]string{"user": subject, "openshift_api_url": "https://api.example.test", "openshift_console_url": "https://console.example.test", "openshift_cluster_ingress_domain": "apps.example.test"}, nil
+			return map[string]string{"user": subject, "openshift-api-url": "https://api.example.test", "openshift-console-url": "https://console.example.test", "openshift-cluster-ingress-domain": "apps.example.test"}, nil
 		},
 		ResourceLoader: func(_ context.Context, _, _, resourcePath string) (*bundle.Resource, error) {
 			res, err := bundle.ReadResource(root, resourcePath)
@@ -482,7 +482,7 @@ func TestBundleHandler(t *testing.T) {
 			},
 			RuntimeAttributes: func(_ *http.Request, _ string) (map[string]string, error) {
 				return map[string]string{
-					"user": "runtime-val", "openshift_api_url": "https://api.example.test", "openshift_console_url": "https://console.example.test", "openshift_cluster_ingress_domain": "apps.example.test",
+					"user": "runtime-val", "openshift-api-url": "https://api.example.test", "openshift-console-url": "https://console.example.test", "openshift-cluster-ingress-domain": "apps.example.test",
 				}, nil
 			},
 		})
@@ -499,7 +499,7 @@ func TestBundleHandler(t *testing.T) {
 		assert.Equal(t, "runtime-val", attrs["user"], "runtime must win over catalog and manifest")
 		assert.Equal(t, "yes", attrs["manifest-only"], "manifest-only key must be present")
 		assert.Equal(t, "yes", attrs["catalog-only"], "catalog-only key must be present")
-		assert.Equal(t, "https://api.example.test", attrs["openshift_api_url"], "runtime values must be present")
+		assert.Equal(t, "https://api.example.test", attrs["openshift-api-url"], "runtime values must be present")
 	})
 
 	t.Run("runtime attributes are all or safe failure", func(t *testing.T) {
@@ -511,7 +511,7 @@ func TestBundleHandler(t *testing.T) {
 		}{
 			{name: "callback failure", err: errors.New("cluster config unavailable")},
 			{name: "incomplete values", attrs: map[string]string{
-				"user": "user1", "openshift_api_url": "https://api.example.test", "openshift_console_url": "https://console.example.test",
+				"user": "user1", "openshift-api-url": "https://api.example.test", "openshift-console-url": "https://console.example.test",
 			}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
@@ -1119,8 +1119,8 @@ func TestSetupStatusHandler(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
 		require.IsType(t, map[string]any{}, body["attributes"])
 		attrs := body["attributes"].(map[string]any)
-		assert.Equal(t, "ns-abc", attrs["gitea"])
-		assert.Equal(t, "ns-abc", attrs["datasphere"])
+		assert.Equal(t, "ns-abc", attrs["gitea-namespace"])
+		assert.Equal(t, "ns-abc", attrs["datasphere-namespace"])
 	})
 
 	t.Run("attributes absent during provisioning", func(t *testing.T) {
@@ -1197,8 +1197,8 @@ func TestSetupStatusHandler(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
 		require.IsType(t, map[string]any{}, body["attributes"])
 		attrs := body["attributes"].(map[string]any)
-		assert.Equal(t, "ns-abc", attrs["gitea"])
-		assert.Equal(t, "secret123", attrs["postgres"])
+		assert.Equal(t, "ns-abc", attrs["namespaces-gitea"])
+		assert.Equal(t, "secret123", attrs["passwords-postgres"])
 	})
 
 	t.Run("attributes with root URLs when deployed", func(t *testing.T) {
@@ -1234,8 +1234,8 @@ func TestSetupStatusHandler(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
 		require.IsType(t, map[string]any{}, body["attributes"])
 		attrs := body["attributes"].(map[string]any)
-		assert.Equal(t, "ns-gitea-xyz", attrs["gitea"])
-		assert.Equal(t, "gitea-ns-gitea-xyz.apps.example.com", attrs["rootUrl"])
+		assert.Equal(t, "ns-gitea-xyz", attrs["namespaces-gitea"])
+		assert.Equal(t, "gitea-ns-gitea-xyz.apps.example.com", attrs["gitea-rootUrl"])
 	})
 }
 

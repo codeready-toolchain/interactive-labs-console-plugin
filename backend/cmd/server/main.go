@@ -200,22 +200,22 @@ func newClusterRuntimeAttributes(client configclient.Interface, log *slog.Logger
 
 		infrastructure, err := client.ConfigV1().Infrastructures().Get(r.Context(), "cluster", metav1.GetOptions{})
 		if err != nil || infrastructure.Status.APIServerURL == "" {
-			return fail("openshift_api_url")
+			return fail("openshift-api-url")
 		}
 		console, err := client.ConfigV1().Consoles().Get(r.Context(), "cluster", metav1.GetOptions{})
 		if err != nil || console.Status.ConsoleURL == "" {
-			return fail("openshift_console_url")
+			return fail("openshift-console-url")
 		}
 		ingress, err := client.ConfigV1().Ingresses().Get(r.Context(), "cluster", metav1.GetOptions{})
 		if err != nil || ingress.Spec.Domain == "" {
-			return fail("openshift_cluster_ingress_domain")
+			return fail("openshift-cluster-ingress-domain")
 		}
 
 		return map[string]string{
 			"user":                             subject,
-			"openshift_api_url":                infrastructure.Status.APIServerURL,
-			"openshift_console_url":            console.Status.ConsoleURL,
-			"openshift_cluster_ingress_domain": ingress.Spec.Domain,
+			"openshift-api-url":                infrastructure.Status.APIServerURL,
+			"openshift-console-url":            console.Status.ConsoleURL,
+			"openshift-cluster-ingress-domain": ingress.Spec.Domain,
 		}, nil
 	}
 }
