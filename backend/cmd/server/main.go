@@ -19,8 +19,10 @@ import (
 	userclient "github.com/openshift/client-go/user/clientset/versioned"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	k8scache "k8s.io/client-go/tools/cache"
 
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/bundle"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/catalog"
@@ -45,12 +47,16 @@ var (
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	serverConfig := config.LoadFromEnv(log)
+	if serverConfig.Namespace == "" {
+		serverConfig.Namespace = "interactive-labs-console-plugin"
+	}
 	cache, err := bundle.NewCache(snapshotCacheRoot)
 	if err != nil {
 		log.Error("create snapshot cache failed")
 		return
 	}
-	catalogSource := inClusterCatalogSource(serverConfig.Namespace)
+	catalogClient := inClusterCatalogClient()
+	catalogSource := newClusterCatalogSource(catalogClient, serverConfig.Namespace)
 	catalogEvents := inClusterCatalogEventPoster(log, serverConfig.Namespace)
 
 	cfg := handler.Config{
@@ -87,7 +93,14 @@ func main() {
 		serverConfig.CacheRefreshInterval,
 		int(serverConfig.CacheConcurrentRefreshLimit),
 	)
-	// make sure the refresh is completed before we exit
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		if err := watchCatalog(ctx, catalogClient, serverConfig.Namespace, refreshCoordinator.RequestRefresh); err != nil {
+			log.Warn("catalog watcher unavailable")
+		}
+	}()
+	// Wait for both background workers before closing the cache.
 	refreshDone := make(chan struct{})
 	go func() {
 		defer close(refreshDone)
@@ -100,6 +113,7 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	backend.Shutdown(shutCtx) //nolint:errcheck
+	<-watchDone
 	<-refreshDone
 	cache.Close() // preserves successful snapshots for next process
 }
@@ -220,20 +234,46 @@ func newClusterRuntimeAttributes(client configclient.Interface, log *slog.Logger
 	}
 }
 
-// inClusterCatalogSource reads the catalog ConfigMap through the service-account-authenticated typed client.
-func inClusterCatalogSource(namespace string) func(ctx context.Context) (*corev1.ConfigMap, error) {
-	if namespace == "" {
-		namespace = "interactive-labs-console-plugin"
-	}
+// inClusterCatalogClient shares service-account authentication between catalog reads and watches.
+func inClusterCatalogClient() kubernetes.Interface {
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		return newClusterCatalogSource(nil, namespace)
+		return nil
 	}
 	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		return newClusterCatalogSource(nil, namespace)
+		return nil
 	}
-	return newClusterCatalogSource(client, namespace)
+	return client
+}
+
+// watchCatalog runs until cancellation; events only request a fresh, validated catalog read.
+func watchCatalog(ctx context.Context, client kubernetes.Interface, namespace string, requestRefresh func()) error {
+	if client == nil {
+		return nil
+	}
+	informer := coreinformers.NewFilteredConfigMapInformer(client, namespace, 0, nil, func(options *metav1.ListOptions) {
+		options.FieldSelector = "metadata.name=interactive-labs-catalog"
+	})
+	notify := func(object any) {
+		if tombstone, ok := object.(k8scache.DeletedFinalStateUnknown); ok {
+			object = tombstone.Obj
+		}
+		cm, ok := object.(*corev1.ConfigMap)
+		if ok && cm != nil && cm.Namespace == namespace && cm.Name == "interactive-labs-catalog" {
+			requestRefresh()
+		}
+	}
+	_, err := informer.AddEventHandler(k8scache.ResourceEventHandlerFuncs{
+		AddFunc:    notify,
+		UpdateFunc: func(_, object any) { notify(object) },
+		DeleteFunc: notify,
+	})
+	if err != nil {
+		return err
+	}
+	informer.RunWithContext(ctx)
+	return nil
 }
 
 func newClusterCatalogSource(client kubernetes.Interface, namespace string) func(context.Context) (*corev1.ConfigMap, error) {

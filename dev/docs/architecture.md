@@ -35,6 +35,10 @@ Evidence: [Containerfile](../../Containerfile), [server](../../backend/cmd/serve
 3. Backend validates source locators, derives each opaque `catalogRef`, resolves each lab from its cached approved snapshot, and returns manifest `title`, optional `description`, and normalized `labPath` in declared order. Invalid flat or malformed module labs are omitted safely.
 4. An unavailable repository, missing manifest, or invalid lab omits only that item. Backend logs safe opaque context and emits one deduplicated namespaced Warning Event per `(catalogRef, reason)` for its lifetime.
 
+### Catalog configuration refresh
+
+**Implemented and verified:** A client-go informer watches only the named `interactive-labs-catalog` ConfigMap in the configured namespace. Create, update, and delete signal a coalescing coordinator; sweeps do not overlap, and changes during a sweep cause one follow-up. Every sweep performs a fresh ConfigMap `Get` and validates the full catalog; event payloads are not refresh configuration. Startup and periodic sweeps remain, and the informer reconnects/re-lists after interruption. Deletion fails safely without evicting snapshots; recreation can trigger recovery. No browser notification is added.
+
 ### Bundle
 
 1. Browser requests `GET /api/v1alpha1/labs/{catalogRef}/bundle` through same proxy.
@@ -66,7 +70,7 @@ All non-success API responses use `v1alpha1/Error`. Unknown client error types n
 - Service requests OpenShift serving certificate and backend mounts its TLS secret.
 - ConsolePlugin defines `backend` proxy alias with mandatory `UserToken` authorization.
 - One backend replica runs as non-root with all Linux capabilities dropped, privilege escalation disabled, and RuntimeDefault seccomp.
-- Backend service account has only `get` access to named catalog ConfigMap, `create` access to namespaced Events, and `get` access to named `config.openshift.io` `cluster` infrastructure, ingress, and console configuration objects for runtime attributes.
+- Backend service account has `get`, `list`, and `watch` access to the named catalog ConfigMap (list/watch require `metadata.name` field selector). It also has `create` access to namespaced Events and `get` access to named `config.openshift.io` `cluster` infrastructure, ingress, and console configuration objects for runtime attributes.
 
 See [administrator guide](administrator-guide.md).
 

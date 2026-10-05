@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,8 +23,12 @@ import (
 	userclient "github.com/openshift/client-go/user/clientset/versioned"
 	userfake "github.com/openshift/client-go/user/clientset/versioned/fake"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -336,6 +341,434 @@ func TestRefreshCatalogEntriesParsesConfigMap(t *testing.T) {
 		assert.Equal(t, "main", entries[i].Branch)
 		assert.Equal(t, labPath, entries[i].LabPath)
 	}
+}
+
+func TestCatalogWatcher(t *testing.T) {
+	// given
+	const namespace = "configured-catalog-namespace"
+	wait := func(t *testing.T, signal <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-signal:
+		case <-time.After(10 * time.Second):
+			require.FailNow(t, "timed out waiting for catalog watcher")
+		}
+	}
+	start := func(t *testing.T, client kubernetes.Interface) (context.CancelFunc, <-chan struct{}, <-chan struct{}) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		notifications, done := make(chan struct{}, 1), make(chan struct{})
+		go func() {
+			defer close(done)
+			// when
+			err := watchCatalog(ctx, client, namespace, func() {
+				select {
+				case notifications <- struct{}{}:
+				default:
+				}
+			})
+
+			// then
+			assert.NoError(t, err)
+		}()
+		t.Cleanup(func() {
+			cancel()
+			wait(t, done)
+		})
+		return cancel, notifications, done
+	}
+
+	catalogConfigMap := func() *corev1.ConfigMap {
+		return &corev1.ConfigMap{
+			Namespace: namespace, Name: "interactive-labs-catalog", ResourceVersion: "1",
+			Data: map[string]string{"catalog.yaml": "invalid data is only a signal"},
+		}
+	}
+	watchConfigMaps := func(client *k8sfake.Clientset) (*watch.RaceFreeFakeWatcher, <-chan struct{}) {
+		events := watch.NewRaceFreeFake()
+		watchStarted := make(chan struct{}, 1)
+		client.PrependWatchReactor("configmaps", func(k8stesting.Action) (bool, watch.Interface, error) {
+			watchStarted <- struct{}{}
+			return true, events, nil
+		})
+		return events, watchStarted
+	}
+	assertStopped := func(t *testing.T, client *k8sfake.Clientset, events *watch.RaceFreeFakeWatcher, done <-chan struct{}) {
+		t.Helper()
+		wait(t, done)
+		assert.True(t, events.IsStopped(), "cancellation must stop the active watch before returning")
+		actions := client.Actions()
+		require.Len(t, actions, 2)
+
+		list := actions[0]
+		require.Equal(t, "list", list.GetVerb())
+		assert.Equal(t, namespace, list.GetNamespace())
+		assert.Equal(t, "configmaps", list.GetResource().Resource)
+		assert.Equal(t, "metadata.name=interactive-labs-catalog", list.(k8stesting.ListAction).GetListRestrictions().Fields.String())
+
+		watchAction := actions[1]
+		require.Equal(t, "watch", watchAction.GetVerb())
+		assert.Equal(t, namespace, watchAction.GetNamespace())
+		assert.Equal(t, "configmaps", watchAction.GetResource().Resource)
+		assert.Equal(t, "metadata.name=interactive-labs-catalog", watchAction.(k8stesting.WatchAction).GetWatchRestrictions().Fields.String())
+	}
+
+	t.Run("add (initial list)", func(t *testing.T) {
+		// given
+		cm := catalogConfigMap()
+		client := k8sfake.NewSimpleClientset(cm)
+		events, watchStarted := watchConfigMaps(client)
+
+		// when
+		cancel, notifications, done := start(t, client)
+		wait(t, watchStarted)
+
+		// then
+		wait(t, notifications)
+
+		// when
+		cancel()
+
+		// then
+		assertStopped(t, client, events, done)
+	})
+
+	t.Run("update", func(t *testing.T) {
+		// given
+		cm := catalogConfigMap()
+		client := k8sfake.NewSimpleClientset(cm)
+		events, watchStarted := watchConfigMaps(client)
+
+		// when
+		cancel, notifications, done := start(t, client)
+		wait(t, watchStarted)
+
+		// then
+		wait(t, notifications)
+
+		// when
+		updated := cm.DeepCopy()
+		updated.ResourceVersion = "2"
+		events.Modify(updated)
+
+		// then
+		wait(t, notifications)
+
+		// when
+		cancel()
+
+		// then
+		assertStopped(t, client, events, done)
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		// given
+		cm := catalogConfigMap()
+		client := k8sfake.NewSimpleClientset(cm)
+		events, watchStarted := watchConfigMaps(client)
+
+		// when
+		cancel, notifications, done := start(t, client)
+		wait(t, watchStarted)
+
+		// then
+		wait(t, notifications)
+
+		// when
+		events.Delete(cm)
+
+		// then
+		wait(t, notifications)
+
+		// when
+		cancel()
+
+		// then
+		assertStopped(t, client, events, done)
+	})
+
+	t.Run("creation (watch add)", func(t *testing.T) {
+		// given
+		cm := catalogConfigMap()
+		client := k8sfake.NewSimpleClientset()
+		events, watchStarted := watchConfigMaps(client)
+
+		// when
+		cancel, notifications, done := start(t, client)
+		wait(t, watchStarted)
+		events.Add(cm)
+
+		// then
+		wait(t, notifications)
+
+		// when
+		cancel()
+
+		// then
+		assertStopped(t, client, events, done)
+	})
+
+	t.Run("ignores unrelated names and namespaces from permissive watch", func(t *testing.T) {
+		// given
+		for _, identity := range []struct{ namespace, name string }{
+			{namespace, "another-configmap"},
+			{"another-namespace", "interactive-labs-catalog"},
+		} {
+			t.Run(identity.namespace+"/"+identity.name, func(t *testing.T) {
+				// given
+				client := k8sfake.NewSimpleClientset()
+				events := watch.NewRaceFreeFake()
+				watchStarted := make(chan struct{}, 1)
+				client.PrependWatchReactor("configmaps", func(k8stesting.Action) (bool, watch.Interface, error) {
+					watchStarted <- struct{}{}
+					return true, events, nil
+				})
+				cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+					Namespace: identity.namespace, Name: identity.name, ResourceVersion: "1",
+				}}
+				updated := cm.DeepCopy()
+				updated.ResourceVersion = "2"
+
+				// when
+				_, notifications, _ := start(t, client)
+
+				// then
+				wait(t, watchStarted)
+
+				for _, event := range []struct {
+					name string
+					send func()
+				}{
+					{"add", func() { events.Add(cm) }},
+					{"update", func() { events.Modify(updated) }},
+					{"delete", func() { events.Delete(updated) }},
+				} {
+					// when
+					event.send()
+
+					// then
+					assert.Never(t, func() bool { return len(notifications) != 0 }, 150*time.Millisecond, 10*time.Millisecond,
+						"unrelated %s must not signal refresh", event.name)
+					// Discard any unexpected signal before checking the next event.
+					select {
+					case <-notifications:
+					default:
+					}
+				}
+
+				// when
+				events.Add(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace, Name: "interactive-labs-catalog", ResourceVersion: "3",
+				}})
+
+				// then
+				wait(t, notifications)
+			})
+		}
+	})
+
+	t.Run("closed watch reconnects and later event signals", func(t *testing.T) {
+		// given
+		client := k8sfake.NewSimpleClientset()
+		watches := make(chan *watch.RaceFreeFakeWatcher, 2)
+		client.PrependWatchReactor("configmaps", func(k8stesting.Action) (bool, watch.Interface, error) {
+			events := watch.NewRaceFreeFake()
+			watches <- events
+			return true, events, nil
+		})
+		nextWatch := func() *watch.RaceFreeFakeWatcher {
+			select {
+			case events := <-watches:
+				return events
+			case <-time.After(10 * time.Second):
+				require.FailNow(t, "timed out waiting for watch reconnect")
+				return nil
+			}
+		}
+
+		// when
+		cancel, notifications, done := start(t, client)
+		first := nextWatch()
+		first.Stop()
+
+		// then
+		reconnected := nextWatch()
+
+		// when
+		reconnected.Add(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "interactive-labs-catalog", ResourceVersion: "2",
+		}})
+
+		// then
+		wait(t, notifications)
+
+		// when
+		cancel()
+
+		// then
+		wait(t, done)
+		assert.True(t, reconnected.IsStopped())
+		for _, action := range client.Actions() {
+			assert.Equal(t, namespace, action.GetNamespace())
+			if action.GetVerb() == "watch" {
+				assert.Equal(t, "metadata.name=interactive-labs-catalog", action.(k8stesting.WatchAction).GetWatchRestrictions().Fields.String())
+			} else {
+				require.Equal(t, "list", action.GetVerb())
+				assert.Equal(t, "metadata.name=interactive-labs-catalog", action.(k8stesting.ListAction).GetListRestrictions().Fields.String())
+			}
+		}
+	})
+
+	t.Run("relist signals deletion missed while disconnected", func(t *testing.T) {
+		// given
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "interactive-labs-catalog", ResourceVersion: "1",
+		}}
+		client := k8sfake.NewSimpleClientset(cm)
+		events := watch.NewRaceFreeFake()
+		watchStarted := make(chan struct{}, 1)
+		firstWatch := true
+		client.PrependWatchReactor("configmaps", func(k8stesting.Action) (bool, watch.Interface, error) {
+			if !firstWatch {
+				return true, watch.NewRaceFreeFake(), nil
+			}
+			firstWatch = false
+			watchStarted <- struct{}{}
+			return true, events, nil
+		})
+
+		// when
+		_, notifications, _ := start(t, client)
+		wait(t, watchStarted)
+
+		// then
+		wait(t, notifications)
+
+		// when
+		// Remove without delivering a watch event.
+		err := client.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("configmaps"), namespace, cm.Name)
+
+		// then
+		require.NoError(t, err)
+
+		// when
+		events.Error(&metav1.Status{Code: http.StatusGone, Reason: metav1.StatusReasonExpired})
+
+		// then
+		wait(t, notifications)
+	})
+
+	t.Run("nil client disables watcher and catalog source fails safely", func(t *testing.T) {
+		// given
+		var client kubernetes.Interface
+
+		// when
+		_, notifications, done := start(t, client)
+
+		// then
+		wait(t, done)
+		assert.Empty(t, notifications)
+
+		// when
+		cm, err := newClusterCatalogSource(client, namespace)(context.Background())
+
+		// then
+		require.EqualError(t, err, "catalog unavailable")
+		assert.Nil(t, cm)
+	})
+}
+
+func TestCatalogWatcherRole(t *testing.T) {
+	// given
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "base", "role.yaml"))
+	require.NoError(t, err)
+	var role rbacv1.Role
+
+	// when
+	err = yaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096).Decode(&role)
+
+	// then
+	require.NoError(t, err)
+	assert.Equal(t, "interactive-labs-console-plugin", role.Namespace)
+	require.NotEmpty(t, role.Rules)
+	assert.Equal(t, rbacv1.PolicyRule{
+		APIGroups: []string{""}, Resources: []string{"configmaps"},
+		ResourceNames: []string{"interactive-labs-catalog"}, Verbs: []string{"get", "list", "watch"},
+	}, role.Rules[0])
+}
+
+func TestRefreshCatalogEntriesReloadsCurrentConfigMap(t *testing.T) {
+	// given
+	const namespace = "configured-catalog-namespace"
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Namespace: namespace, Name: "interactive-labs-catalog",
+	}, Data: map[string]string{"catalog.yaml": `- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: one`}}
+	client := k8sfake.NewSimpleClientset(cm)
+	load := loadCatalogEntries(newClusterCatalogSource(client, namespace))
+
+	// when
+	entries, err := load(context.Background())
+
+	// then
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "one", entries[0].LabPath)
+
+	// when
+	cm.Data["catalog.yaml"] = `- repository: https://github.com/redhat/lab
+  branch: main
+  labPath: two`
+	_, err = client.CoreV1().ConfigMaps(namespace).Update(context.Background(), cm, metav1.UpdateOptions{})
+
+	// then
+	require.NoError(t, err)
+
+	// when
+	entries, err = load(context.Background())
+
+	// then
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "two", entries[0].LabPath)
+
+	// when
+	cm.Data["catalog.yaml"] = "not a catalog sequence"
+	_, err = client.CoreV1().ConfigMaps(namespace).Update(context.Background(), cm, metav1.UpdateOptions{})
+
+	// then
+	require.NoError(t, err)
+
+	// when
+	entries, err = load(context.Background())
+
+	// then
+	require.EqualError(t, err, "catalog configuration error")
+	assert.Nil(t, entries)
+
+	// when
+	err = client.CoreV1().ConfigMaps(namespace).Delete(context.Background(), cm.Name, metav1.DeleteOptions{})
+
+	// then
+	require.NoError(t, err)
+
+	// when
+	entries, err = load(context.Background())
+
+	// then
+	require.EqualError(t, err, "catalog unavailable")
+	assert.Nil(t, entries)
+
+	gets := 0
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "get" {
+			gets++
+			assert.Equal(t, namespace, action.GetNamespace())
+			assert.Equal(t, "interactive-labs-catalog", action.(k8stesting.GetAction).GetName())
+		}
+	}
+	assert.Equal(t, 4, gets, "every sweep must freshly read and validate the current ConfigMap")
 }
 
 func mustWrite(t *testing.T, path, content string) {

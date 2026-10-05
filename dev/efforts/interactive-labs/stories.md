@@ -166,15 +166,15 @@ Cached approved sources must receive branch updates without repeated user-reques
 
 **Dependencies:** STORY-9.
 
-## ☐ STORY-12: Refresh approved sources when catalog configuration changes
+## ☑ STORY-12: Refresh approved sources when catalog configuration changes
 
-Administrators should not wait for the periodic refresh after creating or updating the catalog ConfigMap.
+Administrators should not wait for the periodic refresh after creating, updating, or deleting the catalog ConfigMap.
 
-**Goal:** Watch `interactive-labs-catalog` and promptly refresh configured source snapshots after its creation or update.
+**Goal:** Watch `interactive-labs-catalog` and promptly attempt a refresh after its creation, update, or deletion.
 
 **Acceptance criteria:**
 - Backend watches only the catalog ConfigMap in its configured namespace, using service-account RBAC.
-- Create and update events trigger a refresh using the latest validated configuration; periodic and startup refresh remain in place.
+- Create, update, and delete events trigger a sweep that reads and validates the current catalog; deletion fails safely without evicting cached snapshots, and recreation can trigger recovery. Periodic and startup refresh remain in place.
 - Refresh sweeps never overlap. Changes received during a sweep cause one coalesced follow-up sweep.
 - Watch interruptions recover without permanently losing change detection; shutdown stops the watch.
 - Existing atomic snapshot publication, failure handling, and browser API behavior remain unchanged.

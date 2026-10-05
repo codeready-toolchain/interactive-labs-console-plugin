@@ -38,21 +38,33 @@ type refreshGroup struct {
 	entries []RefreshEntry
 }
 
-// RefreshCoordinator refreshes configured source snapshots periodically.
+// RefreshCoordinator refreshes configured source snapshots periodically and on request.
 type RefreshCoordinator struct {
 	entries     LoadEntries
 	refresh     RepositoryRefresher
 	report      RefreshFailureReporter
 	interval    time.Duration
 	concurrency int
+	requests    chan struct{}
 }
 
-// NewRefreshCoordinator creates a coordinator for periodic source refreshes.
+// NewRefreshCoordinator creates a coordinator for periodic and requested source refreshes.
 func NewRefreshCoordinator(entries LoadEntries, refresh RepositoryRefresher, report RefreshFailureReporter, interval time.Duration, concurrency int) *RefreshCoordinator {
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	return &RefreshCoordinator{entries: entries, refresh: refresh, report: report, interval: interval, concurrency: concurrency}
+	return &RefreshCoordinator{
+		entries: entries, refresh: refresh, report: report,
+		interval: interval, concurrency: concurrency, requests: make(chan struct{}, 1),
+	}
+}
+
+// RequestRefresh nonblockingly queues a sweep, coalescing pending requests into one.
+func (c *RefreshCoordinator) RequestRefresh() {
+	select {
+	case c.requests <- struct{}{}:
+	default:
+	}
 }
 
 // Refresh performs one grouped source refresh sweep.
@@ -104,38 +116,30 @@ func (c *RefreshCoordinator) Refresh(ctx context.Context) error {
 	return nil
 }
 
-// Run performs an immediate sweep then repeats at interval without overlapping sweeps.
+// Run performs an immediate sweep then refreshes at interval or on request without overlapping sweeps.
 func (c *RefreshCoordinator) Run(ctx context.Context, onError ...func(error)) {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
-	done := make(chan struct{}, 1)
-	running := false
-	start := func() {
-		if running {
+	for {
+		if ctx.Err() != nil {
 			return
 		}
-		running = true
-		go func() {
-			if err := c.Refresh(ctx); err != nil && ctx.Err() == nil && len(onError) > 0 && onError[0] != nil {
-				onError[0](err)
-			}
-			done <- struct{}{}
-		}()
-	}
-	start()
-	for {
+		if err := c.Refresh(ctx); err != nil && ctx.Err() == nil && len(onError) > 0 && onError[0] != nil {
+			onError[0](err)
+		}
+		discardReadyTicks(ticker.C)
+
 		select {
 		case <-ctx.Done():
-			if running {
-				<-done
-			}
 			return
-		case <-done:
-			discardReadyTicks(ticker.C)
-			running = false
+		case <-c.requests:
 		case <-ticker.C:
-			start()
+			// The next sweep also covers any already-pending catalog change.
+			select {
+			case <-c.requests:
+			default:
+			}
 		}
 	}
 }
