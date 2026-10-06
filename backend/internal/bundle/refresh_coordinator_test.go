@@ -464,7 +464,7 @@ func TestRefreshCoordinatorRun(t *testing.T) {
 
 			// then
 			require.Len(t, reported, 1)
-			assert.ErrorIs(t, reported[0], catalogError)
+			require.ErrorIs(t, reported[0], catalogError)
 
 			// when
 			coordinator.RequestRefresh()
