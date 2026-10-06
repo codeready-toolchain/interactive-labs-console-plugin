@@ -112,6 +112,6 @@ x-interactive-labs:
 
 ## Not supported or deferred
 
-No author validation tool, settled namespace policy, completion evidence/checkpoint UI, section solver, revision pinning, automatic migration, rollback, or offline content delivery exists today. **Breaking `v1alpha1` cutover:** convert old flat labs before rollout. Cached old snapshots are not auto-refreshed; invalid old content is safely omitted from catalog until cache is replaced or lost. No session migration or upstream-change reconciliation.
+No author validation tool, settled namespace policy, completion evidence/checkpoint UI, section solver, revision pinning, automatic migration, rollback, or offline content delivery exists today. **Breaking `v1alpha1` cutover:** convert old flat labs before rollout. Invalid cached old content is safely omitted from catalog until a successful refresh replaces it or cache is lost. No session migration or upstream-change reconciliation.
 
 Authoring policy and rationale: [design decisions](design-decisions.md); full target detail: [architect notes](../efforts/interactive-labs/architect-notes.md).

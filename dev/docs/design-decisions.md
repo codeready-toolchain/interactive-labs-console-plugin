@@ -58,7 +58,7 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 **Decision:** keep `apiVersion: v1alpha1` while deliberately breaking its old flat lab shape. This is an explicit incompatible cutover, not additive evolution: `lab.yaml` now requires `metadata.title`, rejects old name/displayName and root checkpoints, and pages live in `modules/<id>/content/`; bundle has modules, not root pages. Backend and plugin reject unsupported versions **and** old/unknown fields. No general migration framework.
 
-**Implemented and verified:** backend and browser validate new manifest/bundle shapes. Authors must convert old flat labs before rollout. Invalid cached old snapshots are omitted safely from catalog; cache does not auto-refresh, and active sessions are not migrated. Change to a new `apiVersion` if future compatibility promises require coexistence rather than treating this breaking `v1alpha1` change as additive.
+**Implemented and verified:** backend and browser validate new manifest/bundle shapes. Authors must convert old flat labs before rollout. Invalid cached old snapshots are omitted safely until a later successful refresh replaces them; active sessions are not migrated. Change to a new `apiVersion` if future compatibility promises require coexistence rather than treating this breaking `v1alpha1` change as additive.
 
 ## Q9 — Lab-content delivery
 
@@ -66,7 +66,7 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 **Why:** centrally maintained branches avoid customer ConfigMap changes for each content update.
 
-**Tradeoff:** Service-account refresh transparently stages and replaces changed branch snapshots on validated cadence, while cached-resource responses expose current generation Git `HEAD` as HTTP `ETag`. MVP has no revision identity in catalog, bundle, or session data; no update notification, pinning, migration, rollback, or running-session reconciliation.
+**Tradeoff:** Service-account refresh stages and replaces changed branch snapshots on validated cadence or after catalog ConfigMap changes, while cached-resource responses expose current generation Git `HEAD` as HTTP `ETag`. MVP has no revision identity in catalog, bundle, or session data; no update notification, pinning, migration, rollback, or running-session reconciliation.
 
 ## Cross-cutting decisions
 

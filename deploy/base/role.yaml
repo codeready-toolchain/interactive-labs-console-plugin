@@ -12,6 +12,8 @@ rules:
       - interactive-labs-catalog
     verbs:
       - get
+      - list
+      - watch
   - apiGroups:
     - ""
     resources:

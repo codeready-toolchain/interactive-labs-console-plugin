@@ -235,49 +235,248 @@ func TestRefreshCoordinatorCancellationReporting(t *testing.T) {
 	})
 }
 
-func TestRefreshCoordinatorRunSkipsQueuedTicksAndDrainsActiveSweep(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-		firstStarted := make(chan struct{})
-		firstFinished := make(chan struct{})
-		secondStarted := make(chan struct{})
-		releaseFirst := make(chan struct{})
-		var sweeps atomic.Int32
-		coordinator := NewRefreshCoordinator(
-			func(context.Context) ([]RefreshEntry, error) {
-				return []RefreshEntry{{Repository: "https://example.test/labs.git", Branch: "main", LabPath: "lab"}}, nil
-			},
-			func(ctx context.Context, _ RepositoryRefreshRequest) error {
-				if sweeps.Add(1) == 1 {
-					close(firstStarted)
-					<-releaseFirst
-					close(firstFinished)
-					return nil
+func TestRefreshCoordinatorRun(t *testing.T) {
+	t.Run("coalesces changes during each sweep and reloads latest catalog", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// given
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			started := make(chan string, 4)
+			release := make(chan struct{})
+			var loads, sweeps atomic.Int32
+			var branch atomic.Value
+			branch.Store("main")
+			coordinator := NewRefreshCoordinator(
+				func(context.Context) ([]RefreshEntry, error) {
+					loads.Add(1)
+					return []RefreshEntry{{Repository: "https://example.test/labs.git", Branch: branch.Load().(string), LabPath: "lab"}}, nil
+				},
+				func(ctx context.Context, request RepositoryRefreshRequest) error {
+					sweeps.Add(1)
+					started <- request.Branch
+					select {
+					case <-release:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				},
+				nil,
+				time.Minute,
+				1,
+			)
+			done := make(chan struct{})
+
+			// when
+			go func() { coordinator.Run(ctx); close(done) }()
+			synctest.Wait()
+
+			// then
+			require.Equal(t, int32(1), sweeps.Load(), "startup sweep must be immediate")
+			assert.Equal(t, "main", <-started)
+
+			for i, nextBranch := range []string{"release", "latest"} {
+				// when
+				for range 10 {
+					coordinator.RequestRefresh()
 				}
-				close(secondStarted)
-				<-ctx.Done()
-				return ctx.Err()
-			},
-			nil,
-			time.Minute,
-			2,
-		)
-		done := make(chan struct{})
-		go func() { coordinator.Run(ctx); close(done) }()
+				synctest.Wait()
 
-		<-firstStarted
-		time.Sleep(3 * time.Minute)
-		close(releaseFirst)
-		<-firstFinished
-		synctest.Wait()
-		assert.Equal(t, int32(1), sweeps.Load(), "ticks queued during a sweep must be discarded")
+				// then
+				assert.Equal(t, int32(i+1), sweeps.Load(), "notifications must not overlap the active sweep")
 
-		time.Sleep(time.Minute)
-		<-secondStarted
+				// when
+				time.Sleep(3 * time.Minute)
+				branch.Store(nextBranch)
+				coordinator.RequestRefresh()
+				release <- struct{}{}
+				synctest.Wait()
+
+				// then
+				require.Equal(t, int32(i+2), sweeps.Load(), "each burst must cause exactly one follow-up")
+				assert.Equal(t, int32(i+2), loads.Load(), "each sweep must reload the catalog")
+				assert.Equal(t, nextBranch, <-started)
+			}
+
+			// when
+			release <- struct{}{}
+			synctest.Wait()
+
+			// then
+			assert.Equal(t, int32(3), sweeps.Load(), "no catch-up ticks or duplicate notifications")
+
+			// Cleanup: stop the run loop.
+			cancel()
+			<-done
+		})
+	})
+
+	t.Run("idle notification starts a sweep without waiting for interval", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// given
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var loads atomic.Int32
+			coordinator := NewRefreshCoordinator(
+				func(context.Context) ([]RefreshEntry, error) { loads.Add(1); return nil, nil },
+				nil, nil, time.Hour, 1,
+			)
+			done := make(chan struct{})
+
+			// when
+			go func() { coordinator.Run(ctx); close(done) }()
+			synctest.Wait()
+
+			// then
+			require.Equal(t, int32(1), loads.Load())
+
+			// when
+			coordinator.RequestRefresh()
+			synctest.Wait()
+
+			// then
+			assert.Equal(t, int32(2), loads.Load())
+
+			// Cleanup: stop the run loop.
+			cancel()
+			<-done
+		})
+	})
+
+	t.Run("skips queued ticks and cancellation drains active sweep without pending work", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// given
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			firstStarted := make(chan struct{})
+			secondStarted := make(chan struct{})
+			cancellationObserved := make(chan struct{})
+			releaseFirst := make(chan struct{})
+			releaseSecond := make(chan struct{})
+			var loads, sweeps atomic.Int32
+			coordinator := NewRefreshCoordinator(
+				func(context.Context) ([]RefreshEntry, error) {
+					loads.Add(1)
+					return []RefreshEntry{{Repository: "https://example.test/labs.git", Branch: "main", LabPath: "lab"}}, nil
+				},
+				func(ctx context.Context, _ RepositoryRefreshRequest) error {
+					if sweeps.Add(1) == 1 {
+						close(firstStarted)
+						<-releaseFirst
+						return nil
+					}
+					close(secondStarted)
+					<-ctx.Done()
+					close(cancellationObserved)
+					<-releaseSecond
+					return ctx.Err()
+				},
+				nil,
+				time.Minute,
+				2,
+			)
+			done := make(chan struct{})
+
+			// when
+			go func() { coordinator.Run(ctx); close(done) }()
+
+			// then
+			<-firstStarted
+
+			// when
+			time.Sleep(3 * time.Minute)
+			close(releaseFirst)
+			synctest.Wait()
+
+			// then
+			assert.Equal(t, int32(1), sweeps.Load(), "ticks queued during a sweep must be discarded")
+
+			// when
+			time.Sleep(time.Minute)
+
+			// then
+			<-secondStarted
+
+			// when
+			coordinator.RequestRefresh()
+			time.Sleep(3 * time.Minute)
+			cancel()
+			<-cancellationObserved
+			synctest.Wait()
+
+			// then
+			select {
+			case <-done:
+				assert.Fail(t, "Run returned before active sweep drained")
+			default:
+			}
+
+			// when
+			close(releaseSecond)
+
+			// then
+			<-done
+			assert.Equal(t, int32(2), sweeps.Load())
+			assert.Equal(t, int32(2), loads.Load(), "cancelled pending work must not even load catalog")
+		})
+	})
+
+	t.Run("already cancelled context starts no sweep", func(t *testing.T) {
+		// given
+		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		synctest.Wait()
-		<-done
-		assert.Equal(t, int32(2), sweeps.Load())
+		var loads int
+		coordinator := NewRefreshCoordinator(
+			func(context.Context) ([]RefreshEntry, error) { loads++; return nil, nil },
+			nil, nil, time.Hour, 1,
+		)
+		coordinator.RequestRefresh()
+
+		// when
+		coordinator.Run(ctx)
+
+		// then
+		assert.Zero(t, loads)
+	})
+
+	t.Run("reports loader errors and remains available for requested refresh", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// given
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			catalogError := errors.New("catalog unavailable")
+			var loads atomic.Int32
+			coordinator := NewRefreshCoordinator(
+				func(context.Context) ([]RefreshEntry, error) {
+					if loads.Add(1) == 1 {
+						return nil, catalogError
+					}
+					return nil, nil
+				},
+				nil, nil, time.Hour, 1,
+			)
+			var reported []error
+			done := make(chan struct{})
+
+			// when
+			go func() { coordinator.Run(ctx, func(err error) { reported = append(reported, err) }); close(done) }()
+			synctest.Wait()
+
+			// then
+			require.Len(t, reported, 1)
+			require.ErrorIs(t, reported[0], catalogError)
+
+			// when
+			coordinator.RequestRefresh()
+			synctest.Wait()
+
+			// then
+			assert.Equal(t, int32(2), loads.Load())
+			assert.Len(t, reported, 1)
+
+			// Cleanup: stop the run loop.
+			cancel()
+			<-done
+		})
 	})
 }
