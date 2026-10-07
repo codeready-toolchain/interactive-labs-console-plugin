@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs';
 import * as React from 'react';
 import * as ReactDOM from 'react-dom';
 import { act } from 'react-dom/test-utils';
+import { useActiveNamespace } from '@openshift-console/dynamic-plugin-sdk';
 import { InteractiveLabsPage, InteractiveLabsProvider } from './InteractiveLabsPage';
 import type { CatalogList } from './types/catalog';
 import type { LabError } from './types/errors';
@@ -30,6 +31,7 @@ const mockGetSetupStatus = client.getSetupStatus as jest.MockedFunction<typeof c
 const mockFetchResourceText = client.fetchResourceText as jest.MockedFunction<typeof client.fetchResourceText>;
 const mockRenderAsciiDoc = renderAsciiDoc as jest.MockedFunction<typeof renderAsciiDoc>;
 const mockExtractAsciiDocTitle = extractAsciiDocTitle as jest.MockedFunction<typeof extractAsciiDocTitle>;
+const mockUseActiveNamespace = useActiveNamespace as jest.MockedFunction<typeof useActiveNamespace>;
 
 const SESSION_PREFIX = 'interactive-labs-console-plugin:session:';
 
@@ -49,6 +51,8 @@ beforeEach(() => {
   mockExtractAsciiDocTitle.mockReset();
   mockExtractAsciiDocTitle.mockResolvedValue(undefined);
   mockNavigate.mockReset();
+  mockUseActiveNamespace.mockReset();
+  mockUseActiveNamespace.mockReturnValue(['#ALL_NS#', jest.fn()]);
   mockLocation = { pathname: '/interactive-labs', search: '' };
   localStorage.clear();
   document.querySelectorAll('[data-test-guidance-target]').forEach((target) => target.remove());
@@ -752,6 +756,101 @@ describe('InteractiveLabsPage', () => {
       loadResource: mockFetchResourceText,
     }));
     expect(container.innerHTML).toContain('Sanitized description');
+  });
+
+  describe('active Console project', () => {
+    test.each<[string, string | undefined]>([
+      ['team-a', 'team-a'],
+      ['#ALL_NS#', undefined],
+      ['', undefined],
+    ])('given project %s, passes fallback %s to drawer and descriptions', async (namespace, defaultNamespace) => {
+      // Given the public Console namespace hook and an ordinary no-chart lab.
+      mockUseActiveNamespace.mockReturnValue([namespace, jest.fn()]);
+      mockLoadLabBundle.mockResolvedValue(noChartBundle);
+      mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Rendered</p>', warnings: [] });
+      await renderCatalog();
+
+      // When a lab launches.
+      await act(async () => { getButton(/^Launch$/).click(); });
+
+      // Then both rendering paths receive context, not an authored attribute.
+      for (const sourceURL of [firstPage.url, firstPage.url.replace('modules/010-intro/content/pages/a-first.adoc', 'lab.yaml')]) {
+        expect(mockRenderAsciiDoc).toHaveBeenCalledWith(expect.objectContaining({ sourceURL, defaultNamespace, attributes: {} }));
+      }
+    });
+
+    test('given a mounted drawer, project changes regenerate both paths and scoped navigation preserves drawer', async () => {
+      // Given resource links rendered from Console context.
+      mockUseActiveNamespace.mockReturnValue(['team-a', jest.fn()]);
+      mockLoadLabBundle.mockResolvedValue(noChartBundle);
+      mockRenderAsciiDoc.mockImplementation(({ defaultNamespace }) => Promise.resolve({
+        html: `<p><a href="/k8s/${defaultNamespace ? `ns/${defaultNamespace}` : 'all-namespaces'}/core~v1~Pod?name=api%2Fworker">Pods</a></p>`,
+        warnings: [],
+      }));
+      await renderCatalog();
+      await act(async () => { getButton(/^Launch$/).click(); });
+      const links = () => [
+        container.querySelector('.catalog-description a'),
+        container.querySelector('#interactive-labs-drawer-panel .interactive-labs-content a'),
+      ];
+      for (const link of links()) expect(link?.getAttribute('href')).toBe('/k8s/ns/team-a/core~v1~Pod?name=api%2Fworker');
+      const oldSignals = mockRenderAsciiDoc.mock.calls.map(([input]) => input.signal!);
+
+      // When Console selection changes to All Projects without unmounting the provider.
+      mockUseActiveNamespace.mockReturnValue(['#ALL_NS#', jest.fn()]);
+      await renderCatalog();
+
+      // Then both links refresh and obsolete work aborts.
+      for (const link of links()) expect(link?.getAttribute('href')).toBe('/k8s/all-namespaces/core~v1~Pod?name=api%2Fworker');
+      expect(oldSignals.every((signal) => signal.aborted)).toBe(true);
+      expect(mockRenderAsciiDoc).toHaveBeenCalledTimes(4);
+
+      // When another project is selected and a scoped link navigates Console.
+      mockUseActiveNamespace.mockReturnValue(['team-b', jest.fn()]);
+      await renderCatalog();
+      for (const link of links()) expect(link?.getAttribute('href')).toBe('/k8s/ns/team-b/core~v1~Pod?name=api%2Fworker');
+      expect(mockRenderAsciiDoc).toHaveBeenCalledTimes(6);
+      const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+      await act(async () => { links()[1]!.dispatchEvent(click); });
+      expect(click.defaultPrevented).toBe(true);
+      expect(mockNavigate).toHaveBeenLastCalledWith('/k8s/ns/team-b/core~v1~Pod?name=api%2Fworker');
+      await act(async () => {
+        ReactDOM.render(<InteractiveLabsProvider><p>Other Console page</p></InteractiveLabsProvider>, container);
+      });
+
+      // Then the same drawer survives the route's child replacement without relaunch.
+      expect(container.textContent).toContain('Other Console page');
+      expect(container.querySelector('button[aria-label="Close lab"]')).not.toBeNull();
+      expect(container.querySelector('#interactive-labs-drawer-panel .interactive-labs-content a')?.getAttribute('href')).toBe('/k8s/ns/team-b/core~v1~Pod?name=api%2Fworker');
+      expect(mockLoadLabBundle).toHaveBeenCalledTimes(1);
+    });
+
+    test('given obsolete pending renders, project changes prevent stale drawer and description output', async () => {
+      // Given both render paths are waiting on old-project output.
+      const oldDescription = deferred<Awaited<ReturnType<typeof renderAsciiDoc>>>();
+      const oldPage = deferred<Awaited<ReturnType<typeof renderAsciiDoc>>>();
+      mockUseActiveNamespace.mockReturnValue(['team-a', jest.fn()]);
+      mockLoadLabBundle.mockResolvedValue(noChartBundle);
+      mockRenderAsciiDoc.mockImplementation(({ sourceURL }) => sourceURL.endsWith('/lab.yaml') ? oldDescription.promise : oldPage.promise);
+      await renderCatalog();
+      await act(async () => { getButton(/^Launch$/).click(); });
+      const oldSignals = mockRenderAsciiDoc.mock.calls.map(([input]) => input.signal!);
+
+      // When a new project finishes rendering before the obsolete promises.
+      mockUseActiveNamespace.mockReturnValue(['team-b', jest.fn()]);
+      mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Current project</p>', warnings: [] });
+      await renderCatalog();
+      await act(async () => {
+        oldDescription.resolve({ html: '<p>Stale description</p>', warnings: [] });
+        oldPage.resolve({ html: '<p>Stale page</p>', warnings: [] });
+      });
+
+      // Then abort guards protect both mounted outputs.
+      expect(oldSignals.every((signal) => signal.aborted)).toBe(true);
+      expect(container.querySelector('.catalog-description')?.textContent).toBe('Current project');
+      expect(container.querySelector('#interactive-labs-drawer-panel .interactive-labs-content')?.textContent).toBe('Current project');
+      expect(container.textContent).not.toContain('Stale');
+    });
   });
 
   test.each([
