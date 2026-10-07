@@ -1,5 +1,6 @@
 import * as React from "react";
 import { useLocation, useNavigate } from "react-router-dom-v5-compat";
+import { isAllNamespacesKey, useActiveNamespace } from "@openshift-console/dynamic-plugin-sdk";
 import "./interactive-labs.css";
 import {
   ActionList,
@@ -86,6 +87,7 @@ type InteractiveLabsContextValue = {
   launch: (catalogRef: string, labPath: string, trigger: HTMLElement, requestedPageURL?: string) => Promise<void>;
   loadingCatalogRef?: string;
   launchError?: string;
+  defaultNamespace?: string;
 };
 
 const SESSION_PREFIX = "interactive-labs-console-plugin:session:";
@@ -230,6 +232,8 @@ const pollSetupUntilReady = async (catalogRef: string, signal: AbortSignal): Pro
   throw new DOMException("Aborted", "AbortError");
 };
 const InteractiveLabsProvider: React.FC = ({ children }) => {
+  const [activeNamespace] = useActiveNamespace();
+  const defaultNamespace = isAllNamespacesKey(activeNamespace) ? undefined : activeNamespace || undefined;
   const [activePanel, setActivePanel] = React.useState<ActivePanel | null>(null);
   const [loadingCatalogRef, setLoadingCatalogRef] = React.useState<string>();
   const [launchError, setLaunchError] = React.useState<string>();
@@ -623,6 +627,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
         attributes: activePanel.attributes,
         loadResource: fetchResourceText,
         pageURLs: activePanel.pages.map((candidate) => candidate.url),
+        defaultNamespace,
         signal: controller.signal,
       }))
       .then((result) => {
@@ -634,7 +639,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
         }
       });
     return () => controller.abort();
-  }, [activePanel, renderRetry, setupState]);
+  }, [activePanel, defaultNamespace, renderRetry, setupState]);
 
   React.useEffect(() => {
     if (renderState.status !== "success" || !pendingFragmentRef.current) return;
@@ -646,8 +651,8 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   }, [renderState]);
 
   const value = React.useMemo(
-    () => ({ launch, loadingCatalogRef, launchError }),
-    [launch, launchError, loadingCatalogRef],
+    () => ({ launch, loadingCatalogRef, launchError, defaultNamespace }),
+    [launch, launchError, loadingCatalogRef, defaultNamespace],
   );
   const spotlightRect = guidance?.phase === "spotlight" && guidance.target
     ? guidance.target.getBoundingClientRect()
@@ -865,6 +870,7 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
   const [isExpanded, setIsExpanded] = React.useState(false);
   const [linkWarning, setLinkWarning] = React.useState<string>();
   const interactiveLabs = useInteractiveLabs();
+  const defaultNamespace = interactiveLabs?.defaultNamespace;
   const resourceRoot = `${PROXY_BASE}/api/v1alpha1/labs/${item.catalogRef}/resources/${item.labPath === "." ? "" : `${item.labPath.split("/").map(encodeURIComponent).join("/")}/`}`;
   const sourceURL = `${resourceRoot}lab.yaml`;
   const itemId = `lab-${item.catalogRef}`;
@@ -905,6 +911,7 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
     void renderAsciiDoc({
       source: item.description,
       sourceURL,
+      defaultNamespace,
       attributes: {},
       loadResource: fetchResourceText,
       signal: controller.signal,
@@ -919,7 +926,7 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
       },
     );
     return () => controller.abort();
-  }, [item]);
+  }, [item, defaultNamespace]);
 
   const template = document.createElement("template");
   if (state.status === "success") template.innerHTML = state.result.html;
