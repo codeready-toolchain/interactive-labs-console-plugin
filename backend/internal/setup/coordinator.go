@@ -145,7 +145,7 @@ func (c *OperationCoordinator) acquire(ctx context.Context, subject, catalogRef 
 	operationCtx, cancel := context.WithCancel(context.Background())
 	stopRenewal := make(chan struct{})
 	renewalDone := make(chan struct{})
-	go c.renewLease(name, holder, stopRenewal, renewalDone, cancel)
+	go c.renewLease(name, holder, stopRenewal, renewalDone, cancel) // #nosec G118 -- Renewal outlives the request; each call has a 10s timeout, finish stops it, and lease loss cancels work.
 
 	var once sync.Once
 	var finishErr error
@@ -176,8 +176,8 @@ func (c *OperationCoordinator) reserveLease(ctx context.Context, subject, catalo
 		return "", "", err
 	}
 	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return "", "", fmt.Errorf("create lease identity: %w", err)
+	if _, nonceErr := rand.Read(nonce[:]); nonceErr != nil {
+		return "", "", fmt.Errorf("create lease identity: %w", nonceErr)
 	}
 	holder := hex.EncodeToString(nonce[:])
 	name := operationLeaseName(subject, catalogRef)

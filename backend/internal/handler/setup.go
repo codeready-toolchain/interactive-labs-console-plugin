@@ -143,6 +143,8 @@ func writeSetupManagerError(w http.ResponseWriter, err error) {
 		status = http.StatusBadGateway
 	case setup.ManagerNotFound:
 		status = http.StatusNotFound
+	case setup.ManagerUnavailable:
+		status = http.StatusServiceUnavailable
 	}
 	writeError(w, status, laberr.New(laberr.TypeConfigurationError, managerErr.Message, nil))
 }

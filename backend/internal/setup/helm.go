@@ -43,6 +43,10 @@ type LabRelease struct {
 	Config         map[string]interface{} `json:"-"`
 }
 
+func (r LabRelease) hasStorageIdentity(namespace string) bool {
+	return r.Name != "" && r.Namespace == namespace && r.UID != ""
+}
+
 // sameSummary preserves mutation/preflight guards without comparing secret values.
 func (r LabRelease) sameSummary(other LabRelease) bool {
 	return r.Name == other.Name && r.Namespace == other.Namespace && r.CatalogRef == other.CatalogRef &&
@@ -227,10 +231,10 @@ func verifiedHookNamespaces(home, ref string, srs []SpaceRequestResult) map[stri
 		return allowed
 	}
 	for _, sr := range srs {
-		namespace := sr.TargetNamespace()
+		namespace := sr.readyNamespace()
 		if sr.Name != "" && sr.Namespace == home && sr.UID != "" &&
 			sr.Labels[CatalogRefLabelKey] == label && sr.Annotations[BindingKeyAnnotation] != "" &&
-			sr.IsReady() && !sr.IsFailed() && namespace != "" && namespace != home {
+			!sr.IsFailed() && namespace != "" && namespace != home {
 			allowed[namespace] = true
 		}
 	}
@@ -265,7 +269,7 @@ func manifestCleanupBlockedReason(manifest string, hook bool, namespaces map[str
 	for {
 		var document map[string]any
 		err := decoder.Decode(&document)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			if hook && resources == 0 {
 				return BlockedHelmHook
 			}
@@ -322,8 +326,8 @@ func (c *HelmClient) UninstallLabRelease(ctx context.Context, namespace, token s
 	if !found {
 		return errors.New("lab release disappeared before uninstall")
 	}
-	if err := ctx.Err(); err != nil {
-		return err
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
 	cfg, err := c.newActionConfig(namespace, token, false)
 	if err != nil {
@@ -332,8 +336,8 @@ func (c *HelmClient) UninstallLabRelease(ctx context.Context, namespace, token s
 	uninstall := action.NewUninstall(cfg)
 	uninstall.Wait = true
 	uninstall.Timeout = 300 * time.Second
-	if _, err := uninstall.Run(target.Name); err != nil {
-		return fmt.Errorf("uninstall lab release: %w", err)
+	if _, uninstallErr := uninstall.Run(target.Name); uninstallErr != nil {
+		return fmt.Errorf("uninstall lab release: %w", uninstallErr)
 	}
 	status := action.NewStatus(cfg)
 	_, err = status.Run(target.Name)
@@ -371,8 +375,7 @@ func mapVerifiedBindingsToValues(ctx context.Context, client *SpaceRequestClient
 		if sr == nil {
 			return nil, fmt.Errorf("SpaceRequest %q not found", b.Key)
 		}
-		if sr.Name != b.Key || sr.Namespace != namespace || sr.UID == "" || sr.UID != uids[b.Key] ||
-			sr.Labels[CatalogRefLabelKey] != label || sr.Annotations[BindingKeyAnnotation] != b.Key {
+		if !sr.matchesLabBinding(namespace, b.Key, label, b.Key) || sr.UID != uids[b.Key] {
 			return nil, errors.New("SpaceRequest identity changed")
 		}
 		if !sr.IsReady() {

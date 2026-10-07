@@ -87,7 +87,7 @@ func TestVerifiedNamespaceBinding(t *testing.T) {
 		{"foreign lab rejected", "expected-uid", "other", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = fmt.Fprintf(w, `{"metadata":{"name":"gitea","namespace":"alice-dev","uid":%q,"labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"ns-ready"}],"conditions":[{"type":"Ready","status":"True"}]}}`, tc.uid, CatalogRefLabelKey, tc.label, BindingKeyAnnotation)
 			}))
 			defer server.Close()
@@ -135,7 +135,7 @@ func TestExtractNestedValue(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func cleanupTestSpaceRequest(t *testing.T, ref, target string) SpaceRequestResult {
+func cleanupTestSpaceRequest(t *testing.T, ref string) SpaceRequestResult {
 	t.Helper()
 	label, err := CatalogRefLabel(ref)
 	require.NoError(t, err)
@@ -144,7 +144,7 @@ func cleanupTestSpaceRequest(t *testing.T, ref, target string) SpaceRequestResul
 		Labels:          map[string]string{CatalogRefLabelKey: label},
 		Annotations:     map[string]string{BindingKeyAnnotation: "gitea"},
 		Conditions:      []SpaceRequestCondition{{Type: "Ready", Status: "True"}},
-		NamespaceAccess: []SpaceRequestNamespaceAccess{{Name: target}},
+		NamespaceAccess: []SpaceRequestNamespaceAccess{{Name: "alice-gitea"}},
 	}
 }
 
@@ -180,11 +180,11 @@ func cleanupTestHelm(t *testing.T, rel *release.Release, uid string) (*HelmClien
 			return
 		}
 		if r.URL.Path == "/api/v1/namespaces/alice-dev/secrets" {
-			require.NoError(t, json.NewEncoder(w).Encode(corev1.SecretList{Items: []corev1.Secret{secret}}))
+			assert.NoError(t, json.NewEncoder(w).Encode(corev1.SecretList{Items: []corev1.Secret{secret}}))
 			return
 		}
 		if r.URL.Path == "/api/v1/namespaces/alice-dev/secrets/"+secret.Name {
-			require.NoError(t, json.NewEncoder(w).Encode(secret))
+			assert.NoError(t, json.NewEncoder(w).Encode(secret))
 			return
 		}
 		assert.Fail(t, "unexpected Helm API request", "%s %s", r.Method, r.URL.Path)
@@ -234,33 +234,48 @@ func TestHelmCleanupEligibility(t *testing.T) {
 		{name: "invalid main YAML", manifest: "metadata: [", hook: job, reason: "helm-manifest"},
 		{name: "no SR", hook: job, srs: func() []SpaceRequestResult { return nil }, reason: "helm-hook"},
 		{name: "not Ready SR", hook: job, srs: func() []SpaceRequestResult {
-			sr := cleanupTestSpaceRequest(t, ref, "alice-gitea")
+			sr := cleanupTestSpaceRequest(t, ref)
 			sr.Conditions = nil
 			return []SpaceRequestResult{sr}
 		}, reason: "helm-hook"},
+		{name: "given ready SR without target when listing then hook cleanup stays blocked", hook: job, srs: func() []SpaceRequestResult {
+			sr := cleanupTestSpaceRequest(t, ref)
+			sr.NamespaceAccess = nil
+			return []SpaceRequestResult{sr}
+		}, reason: "helm-hook"},
+		{name: "given terminating ready SR when listing then hook cleanup stays blocked", hook: job, srs: func() []SpaceRequestResult {
+			sr := cleanupTestSpaceRequest(t, ref)
+			sr.DeletionTimestamp = "2026-10-01T00:00:00Z"
+			return []SpaceRequestResult{sr}
+		}, reason: "helm-hook"},
+		{name: "given contradictory ready and failed SR when listing then hook cleanup stays blocked", hook: job, srs: func() []SpaceRequestResult {
+			sr := cleanupTestSpaceRequest(t, ref)
+			sr.Conditions = append(sr.Conditions, SpaceRequestCondition{Type: "Ready", Status: "False", Reason: "UnableToCreateSpace"})
+			return []SpaceRequestResult{sr}
+		}, reason: "helm-hook"},
 		{name: "unmarked SR", hook: job, srs: func() []SpaceRequestResult {
-			sr := cleanupTestSpaceRequest(t, ref, "alice-gitea")
+			sr := cleanupTestSpaceRequest(t, ref)
 			sr.Labels = nil
 			return []SpaceRequestResult{sr}
 		}, reason: "helm-hook"},
 		{name: "foreign catalog SR", hook: job, srs: func() []SpaceRequestResult {
-			return []SpaceRequestResult{cleanupTestSpaceRequest(t, strings.Repeat("cd", 32), "alice-gitea")}
+			return []SpaceRequestResult{cleanupTestSpaceRequest(t, strings.Repeat("cd", 32))}
 		}, reason: "helm-hook"},
 		{name: "shared target namespace", hook: job, srs: func() []SpaceRequestResult {
-			return []SpaceRequestResult{cleanupTestSpaceRequest(t, ref, "alice-gitea"), cleanupTestSpaceRequest(t, strings.Repeat("cd", 32), "alice-gitea")}
+			return []SpaceRequestResult{cleanupTestSpaceRequest(t, ref), cleanupTestSpaceRequest(t, strings.Repeat("cd", 32))}
 		}, reason: "helm-hook"},
 		{name: "missing UID SR", hook: job, srs: func() []SpaceRequestResult {
-			sr := cleanupTestSpaceRequest(t, ref, "alice-gitea")
+			sr := cleanupTestSpaceRequest(t, ref)
 			sr.UID = ""
 			return []SpaceRequestResult{sr}
 		}, reason: "helm-hook"},
 		{name: "missing binding marker SR", hook: job, srs: func() []SpaceRequestResult {
-			sr := cleanupTestSpaceRequest(t, ref, "alice-gitea")
+			sr := cleanupTestSpaceRequest(t, ref)
 			sr.Annotations = nil
 			return []SpaceRequestResult{sr}
 		}, reason: "helm-hook"},
 		{name: "foreign home SR", hook: job, srs: func() []SpaceRequestResult {
-			sr := cleanupTestSpaceRequest(t, ref, "alice-gitea")
+			sr := cleanupTestSpaceRequest(t, ref)
 			sr.Namespace = "bob-dev"
 			return []SpaceRequestResult{sr}
 		}, reason: "helm-hook"},
@@ -273,7 +288,7 @@ func TestHelmCleanupEligibility(t *testing.T) {
 			if tc.extraHook != nil {
 				rel.Hooks = append(rel.Hooks, tc.extraHook)
 			}
-			srs := []SpaceRequestResult{cleanupTestSpaceRequest(t, ref, "alice-gitea")}
+			srs := []SpaceRequestResult{cleanupTestSpaceRequest(t, ref)}
 			if tc.srs != nil {
 				srs = tc.srs()
 			}
@@ -296,7 +311,7 @@ func TestHelmUninstallInterruptedPendingInstall(t *testing.T) {
 		Info: &release.Info{Status: release.StatusPendingInstall}, Labels: map[string]string{CatalogRefLabelKey: label}}
 	client, mutations := cleanupTestHelm(t, rel, "helm-uid")
 	target := LabRelease{Name: rel.Name, Namespace: rel.Namespace, CatalogRef: ref, Status: "pending-install", Revision: 1, UID: "helm-uid"}
-	uninstallErr := client.UninstallLabRelease(context.Background(), "alice-dev", "user-token", target, []SpaceRequestResult{cleanupTestSpaceRequest(t, ref, "alice-gitea")})
+	uninstallErr := client.UninstallLabRelease(context.Background(), "alice-dev", "user-token", target, []SpaceRequestResult{cleanupTestSpaceRequest(t, ref)})
 	require.Error(t, uninstallErr, "fixture forbids mutation but eligible pending install must attempt managed cleanup")
 	assert.NotEqual(t, "lab release changed or requires manual recovery", uninstallErr.Error())
 	assert.NotEmpty(t, *mutations)
@@ -320,7 +335,7 @@ func TestHelmUninstallRechecksEligibility(t *testing.T) {
 			rel := &release.Release{Name: "il-lab", Namespace: "alice-dev", Version: 1, Info: &release.Info{Status: tc.status}, Labels: map[string]string{CatalogRefLabelKey: label}, Hooks: []*release.Hook{{Kind: "Job", Manifest: fmt.Sprintf("apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: hook\n  namespace: %s\n", tc.namespace)}}}
 			client, mutations := cleanupTestHelm(t, rel, tc.uid)
 			target := LabRelease{Name: "il-lab", Namespace: "alice-dev", CatalogRef: ref, Status: "deployed", Revision: 1, UID: "helm-uid"}
-			err := client.UninstallLabRelease(context.Background(), "alice-dev", "user-token", target, []SpaceRequestResult{cleanupTestSpaceRequest(t, ref, "alice-gitea")})
+			err := client.UninstallLabRelease(context.Background(), "alice-dev", "user-token", target, []SpaceRequestResult{cleanupTestSpaceRequest(t, ref)})
 			require.EqualError(t, err, "lab release changed or requires manual recovery")
 			assert.Empty(t, *mutations)
 		})

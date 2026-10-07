@@ -607,7 +607,9 @@ describe('catalog setup actions', () => {
         expect(notice).toBeDefined();
         expect(buttons[1].compareDocumentPosition(notice!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
         expect(buttons.some((button) => button.contains(notice!))).toBe(false);
-        expect(notice?.querySelector('[aria-label="Tearing down lab"]')).not.toBeNull();
+        expect(buttons[1].querySelector('[role="progressbar"]')).not.toBeNull();
+        expect(notice?.querySelector('[role="progressbar"]')).toBeNull();
+        expect(notice?.querySelector('[aria-label="Tearing down lab"]')).toBeNull();
         expect(stack.querySelector('.pf-v6-c-alert')).toBeNull();
       }
       expect(getButton(/Refresh setups/).parentElement?.textContent).not.toContain('Lab teardown in progress');
@@ -637,8 +639,10 @@ describe('catalog setup actions', () => {
       expect(labButton().textContent).toBe('Open');
       expect(labButton().disabled).toBe(true);
       expect(labButton().querySelector('[role="progressbar"]')).toBeNull();
-      expect(labActions().textContent).toContain('Waiting for previous lab resources to disappear.');
-      expect(labActions().textContent).toContain('Checking setups automatically every 10 seconds.');
+      expect(labActions().querySelectorAll('button')[1].querySelector('[role="progressbar"]')).toBeNull();
+      expect(labActions().textContent).toContain('Lab namespace cleanup is still in progress. Wait for previous lab resources to disappear before opening or launching; contact an administrator if cleanup stalls.');
+      expect(labActions().textContent).not.toContain('Waiting for previous lab resources to disappear.');
+      expect(labActions().textContent).not.toContain('Checking setups automatically every 10 seconds.');
       expect(labActions().textContent).not.toContain('Managed lab cleanup completed.');
       expect(labActions().querySelector('.pf-v6-c-alert')).toBeNull();
       expect(labActions().textContent).not.toMatch(/namespace.*(gone|deleted)|SpaceRequest deletion requested/i);
@@ -650,7 +654,7 @@ describe('catalog setup actions', () => {
       expect(labButton().textContent).toBe('Launch');
       expect(labButton().disabled).toBe(false);
       expect(labActions().textContent).not.toContain('Managed lab cleanup completed.');
-      expect(labActions().textContent).not.toContain('Waiting for previous lab resources to disappear.');
+      expect(labActions().textContent).not.toContain('Lab namespace cleanup is still in progress.');
       expect(labActions().textContent?.trim()).toBe('Launch');
       expect(labActions().querySelector('.pf-v6-c-alert')).toBeNull();
     } finally { confirm.mockRestore(); }

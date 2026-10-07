@@ -51,6 +51,12 @@ type SpaceRequestResult struct {
 	Conditions        []SpaceRequestCondition
 }
 
+// matchesLabBinding checks base identity; callers own lifecycle and pinned UID checks.
+func (r *SpaceRequestResult) matchesLabBinding(namespace, name, catalogLabel, bindingKey string) bool {
+	return r != nil && r.Name == name && r.Namespace == namespace && r.UID != "" &&
+		r.Labels[CatalogRefLabelKey] == catalogLabel && r.Annotations[BindingKeyAnnotation] == bindingKey
+}
+
 // IsReady returns true if the SpaceRequest is not terminating and has Ready=True.
 func (r *SpaceRequestResult) IsReady() bool {
 	if r.DeletionTimestamp != "" {
@@ -62,6 +68,14 @@ func (r *SpaceRequestResult) IsReady() bool {
 		}
 	}
 	return false
+}
+
+// readyNamespace returns a provisioned target only while the request is ready.
+func (r *SpaceRequestResult) readyNamespace() string {
+	if !r.IsReady() {
+		return ""
+	}
+	return r.TargetNamespace()
 }
 
 // TargetNamespace returns the first provisioned namespace name, or empty string.
@@ -126,8 +140,7 @@ func (c *SpaceRequestClient) EnsureSpaceRequestForLab(ctx context.Context, token
 		return fmt.Errorf("check SpaceRequest: %w", err)
 	}
 	if existing != nil {
-		if existing.Name != name || existing.Namespace != namespace || existing.UID == "" ||
-			existing.Labels[CatalogRefLabelKey] != label || existing.Annotations[BindingKeyAnnotation] != bindingKey {
+		if !existing.matchesLabBinding(namespace, name, label, bindingKey) {
 			return errors.New("SpaceRequest identity mismatch")
 		}
 		if existing.DeletionTimestamp != "" {
@@ -242,8 +255,8 @@ func (c *SpaceRequestClient) ListSpaceRequestsForLab(ctx context.Context, token,
 // DeleteVerifiedSpaceRequest checks current identity and UID before UID-preconditioned deletion.
 func (c *SpaceRequestClient) DeleteVerifiedSpaceRequest(ctx context.Context, token, namespace, catalogRef string, target SpaceRequestResult) error {
 	label, err := CatalogRefLabel(catalogRef)
-	if err != nil || target.Name == "" || target.UID == "" || target.Namespace != namespace ||
-		target.Labels[CatalogRefLabelKey] != label || target.Annotations[BindingKeyAnnotation] == "" {
+	bindingKey := target.Annotations[BindingKeyAnnotation]
+	if err != nil || target.Name == "" || bindingKey == "" || !target.matchesLabBinding(namespace, target.Name, label, bindingKey) {
 		return errors.New("invalid SpaceRequest target")
 	}
 	current, err := c.GetSpaceRequest(ctx, token, namespace, target.Name)
@@ -253,8 +266,7 @@ func (c *SpaceRequestClient) DeleteVerifiedSpaceRequest(ctx context.Context, tok
 	if current == nil {
 		return nil // identified target already gone
 	}
-	if current.Name != target.Name || current.Namespace != namespace || current.UID != target.UID ||
-		current.Labels[CatalogRefLabelKey] != label || current.Annotations[BindingKeyAnnotation] != target.Annotations[BindingKeyAnnotation] {
+	if !current.matchesLabBinding(namespace, target.Name, label, bindingKey) || current.UID != target.UID {
 		return errors.New("SpaceRequest identity changed")
 	}
 	payload, err := json.Marshal(map[string]any{

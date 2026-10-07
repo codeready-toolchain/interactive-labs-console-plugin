@@ -585,12 +585,12 @@ func prepareSetupClient(t *testing.T, catalogRefs ...string) *setup.SpaceRequest
 	if len(catalogRefs) > 0 {
 		ref = catalogRefs[0]
 	}
+	label, err := setup.CatalogRefLabel(ref)
+	require.NoError(t, err)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			w.Header().Set("Content-Type", "application/json")
 			name := filepath.Base(r.URL.Path)
-			label, err := setup.CatalogRefLabel(ref)
-			require.NoError(t, err)
 			ns := filepath.Base(filepath.Dir(filepath.Dir(r.URL.Path)))
 			if name == "spacerequests" {
 				ns = filepath.Base(filepath.Dir(r.URL.Path))
@@ -601,7 +601,16 @@ func prepareSetupClient(t *testing.T, catalogRefs ...string) *setup.SpaceRequest
 				_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
 				return
 			}
-			fmt.Fprintf(w, `{"metadata":{"name":%q,"namespace":%q,"uid":"uid-1","labels":{%q:%q},"annotations":{%q:%q}},"status":{"namespaceAccess":[{"name":"ns-%s","secretRef":"s"}],"conditions":[{"type":"Ready","status":"True"}]}}`, name, ns, setup.CatalogRefLabelKey, label, setup.BindingKeyAnnotation, name, name) //nolint:gosec
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{
+					"name": name, "namespace": ns, "uid": "uid-1",
+					"labels": map[string]string{setup.CatalogRefLabelKey: label}, "annotations": map[string]string{setup.BindingKeyAnnotation: name},
+				},
+				"status": map[string]any{
+					"namespaceAccess": []map[string]string{{"name": "ns-" + name, "secretRef": "s"}},
+					"conditions":      []map[string]string{{"type": "Ready", "status": "True"}},
+				},
+			}))
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
@@ -663,7 +672,16 @@ func TestSetupHandler(t *testing.T) {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			_, _ = fmt.Fprintf(w, `{"metadata":{"name":%q,"namespace":"user1-dev","uid":"uid-1","labels":{%q:%q},"annotations":{%q:%q}},"status":{"namespaceAccess":[{"name":"ns-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, name, setup.CatalogRefLabelKey, label, setup.BindingKeyAnnotation, name)
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{
+					"name": name, "namespace": "user1-dev", "uid": "uid-1",
+					"labels": map[string]string{setup.CatalogRefLabelKey: label}, "annotations": map[string]string{setup.BindingKeyAnnotation: name},
+				},
+				"status": map[string]any{
+					"namespaceAccess": []map[string]string{{"name": "ns-gitea"}},
+					"conditions":      []map[string]string{{"type": "Ready", "status": "True"}},
+				},
+			}))
 		}))
 		defer server.Close()
 		installCh := make(chan struct{})
@@ -676,7 +694,7 @@ func TestSetupHandler(t *testing.T) {
 			},
 			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
 		})
-		req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
 		req.Header.Set("Authorization", "Bearer user1")
 		rw := httptest.NewRecorder()
 		router.ServeHTTP(rw, req)
@@ -698,7 +716,7 @@ func TestSetupHandler(t *testing.T) {
 		require.NoError(t, err)
 		defer release()
 		var calls atomic.Int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			calls.Add(1)
 			w.WriteHeader(http.StatusNotFound)
 		}))
@@ -711,7 +729,7 @@ func TestSetupHandler(t *testing.T) {
 			},
 			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, &stubHelmManager{}, func(c *setup.ManagerConfig) { c.Coordinator = second }),
 		})
-		req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
 		req.Header.Set("Authorization", "Bearer user1")
 		rw := httptest.NewRecorder()
 		router.ServeHTTP(rw, req)
@@ -728,7 +746,7 @@ func TestSetupHandler(t *testing.T) {
 			},
 			SetupManager: newTestManager(t, prepareSetupClient(t), &stubHelmManager{}, func(c *setup.ManagerConfig) { c.Coordinator = nil }),
 		})
-		req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
 		req.Header.Set("Authorization", "Bearer user1")
 		rw := httptest.NewRecorder()
 		router.ServeHTTP(rw, req)
@@ -826,14 +844,23 @@ func TestSetupHandler(t *testing.T) {
 		originalInstall := helm.Install
 		_ = originalInstall
 
+		label, err := setup.CatalogRefLabel(goodCatalogRef())
+		require.NoError(t, err)
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			if r.Method == http.MethodGet {
-				label, err := setup.CatalogRefLabel(goodCatalogRef())
-				require.NoError(t, err)
 				name := filepath.Base(r.URL.Path)
 				ns := filepath.Base(filepath.Dir(filepath.Dir(r.URL.Path)))
-				fmt.Fprintf(w, `{"metadata":{"name":%q,"namespace":%q,"uid":"uid-1","labels":{%q:%q},"annotations":{%q:%q}},"status":{"namespaceAccess":[{"name":"ns-abc","secretRef":"s"}],"conditions":[{"type":"Ready","status":"True"}]}}`, name, ns, setup.CatalogRefLabelKey, label, setup.BindingKeyAnnotation, name)
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+					"metadata": map[string]any{
+						"name": name, "namespace": ns, "uid": "uid-1",
+						"labels": map[string]string{setup.CatalogRefLabelKey: label}, "annotations": map[string]string{setup.BindingKeyAnnotation: name},
+					},
+					"status": map[string]any{
+						"namespaceAccess": []map[string]string{{"name": "ns-abc", "secretRef": "s"}},
+						"conditions":      []map[string]string{{"type": "Ready", "status": "True"}},
+					},
+				}))
 				return
 			}
 			w.WriteHeader(http.StatusCreated)
@@ -903,7 +930,16 @@ func TestSetupStatusHandler(t *testing.T) {
 	t.Run("rejects mismatched SpaceRequest identity", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			name := filepath.Base(r.URL.Path)
-			_, _ = fmt.Fprintf(w, `{"metadata":{"name":%q,"namespace":"user1-dev","uid":"uid-1","labels":{%q:"foreign"},"annotations":{%q:%q}},"status":{"namespaceAccess":[{"name":"ns-abc"}],"conditions":[{"type":"Ready","status":"True"}]}}`, name, setup.CatalogRefLabelKey, setup.BindingKeyAnnotation, name)
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{
+					"name": name, "namespace": "user1-dev", "uid": "uid-1",
+					"labels": map[string]string{setup.CatalogRefLabelKey: "foreign"}, "annotations": map[string]string{setup.BindingKeyAnnotation: name},
+				},
+				"status": map[string]any{
+					"namespaceAccess": []map[string]string{{"name": "ns-abc"}},
+					"conditions":      []map[string]string{{"type": "Ready", "status": "True"}},
+				},
+			}))
 		}))
 		t.Cleanup(server.Close)
 		router := handler.NewRouter(handler.Config{
@@ -914,7 +950,7 @@ func TestSetupStatusHandler(t *testing.T) {
 			},
 			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
 		})
-		req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup/status", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup/status", nil)
 		req.Header.Set("Authorization", "Bearer user1")
 		rw := httptest.NewRecorder()
 		router.ServeHTTP(rw, req)
@@ -1572,20 +1608,38 @@ func statusSpaceRequestServer(t *testing.T, conditionStatus, reason, targetNames
 		w.Header().Set("Content-Type", "application/json")
 		name := filepath.Base(r.URL.Path)
 		namespace := filepath.Base(filepath.Dir(filepath.Dir(r.URL.Path)))
-		_, _ = fmt.Fprintf(w, `{"metadata":{"name":%q,"namespace":%q,"uid":"uid-1","labels":{%q:%q},"annotations":{%q:%q}},"status":{"namespaceAccess":[{"name":%q,"secretRef":"s"}],"conditions":[{"type":"Ready","status":%q,"reason":%q}]}}`, name, namespace, setup.CatalogRefLabelKey, label, setup.BindingKeyAnnotation, name, targetNamespace, conditionStatus, reason)
+		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"metadata": map[string]any{
+				"name": name, "namespace": namespace, "uid": "uid-1",
+				"labels": map[string]string{setup.CatalogRefLabelKey: label}, "annotations": map[string]string{setup.BindingKeyAnnotation: name},
+			},
+			"status": map[string]any{
+				"namespaceAccess": []map[string]string{{"name": targetNamespace, "secretRef": "s"}},
+				"conditions":      []map[string]string{{"type": "Ready", "status": conditionStatus, "reason": reason}},
+			},
+		}))
 	}))
 	t.Cleanup(server.Close)
 	return server
 }
 
-func readySpaceRequestServer(t *testing.T, nsName string) *httptest.Server { //nolint:unparam
+func readySpaceRequestServer(t *testing.T, nsName string) *httptest.Server {
 	t.Helper()
+	label, err := setup.CatalogRefLabel(goodCatalogRef())
+	require.NoError(t, err)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		label, err := setup.CatalogRefLabel(goodCatalogRef())
-		require.NoError(t, err)
 		userNamespace := filepath.Base(filepath.Dir(filepath.Dir(r.URL.Path)))
-		fmt.Fprintf(w, `{"metadata":{"name":"gitea","namespace":%q,"uid":"uid-1","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":%q,"secretRef":"s"}],"conditions":[{"type":"Ready","status":"True"}]}}`, userNamespace, setup.CatalogRefLabelKey, label, setup.BindingKeyAnnotation, nsName)
+		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"metadata": map[string]any{
+				"name": "gitea", "namespace": userNamespace, "uid": "uid-1",
+				"labels": map[string]string{setup.CatalogRefLabelKey: label}, "annotations": map[string]string{setup.BindingKeyAnnotation: "gitea"},
+			},
+			"status": map[string]any{
+				"namespaceAccess": []map[string]string{{"name": nsName, "secretRef": "s"}},
+				"conditions":      []map[string]string{{"type": "Ready", "status": "True"}},
+			},
+		}))
 	}))
 	t.Cleanup(server.Close)
 	return server

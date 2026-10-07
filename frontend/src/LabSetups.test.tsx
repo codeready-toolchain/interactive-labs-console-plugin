@@ -434,8 +434,9 @@ describe('lab setup teardown', () => {
     expect(window.sessionStorage.getItem('interactive-labs-teardown')).toContain(operationId);
     const row = container.querySelector('li')!;
     expect(row.textContent).toContain('Lab teardown in progress');
-    expect(row.querySelector('[aria-label="Tearing down lab"]')).not.toBeNull();
-    expect(row.querySelector('[aria-label="Tearing down lab"]')!.classList.contains('pf-m-inline')).toBe(true);
+    expect(button('Tear down').querySelector('[role="progressbar"]')).not.toBeNull();
+    expect(row.querySelector('[role="status"]')?.querySelector('[role="progressbar"]')).toBeNull();
+    expect(row.querySelector('[aria-label="Tearing down lab"]')).toBeNull();
     expect(row.querySelector('.pf-v6-c-alert')).toBeNull();
   });
   test('cleanupPending blocks repeated teardown while another lab stays usable', async () => {
@@ -693,10 +694,12 @@ describe('lab setup teardown', () => {
       getStatus.mockResolvedValueOnce(progress).mockResolvedValue({ ...progress, status: 'unknown' });
       await render();
       expect(button('Tear down').disabled).toBe(true);
-      expect(container.querySelector('[aria-label="Tearing down lab"]')).not.toBeNull();
+      expect(button('Tear down').querySelector('[role="progressbar"]')).not.toBeNull();
+      expect(container.querySelector('[aria-label="Tearing down lab"]')).toBeNull();
       expect(teardown).not.toHaveBeenCalled();
       await act(async () => { jest.advanceTimersByTime(3000); });
       expect(container.querySelector('[aria-label="Tearing down lab"]')).toBeNull();
+      expect(button('Tear down').querySelector('[role="progressbar"]')).toBeNull();
       expect(container.querySelector('[role="progressbar"]')).toBeNull();
       expect(container.textContent).toContain('outcome could not be verified');
       expect(container.textContent).not.toMatch(/administrator|Lease reservation|Managed lab cleanup completed/i);

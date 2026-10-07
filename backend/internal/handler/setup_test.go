@@ -59,7 +59,7 @@ func TestSetupGuardConflictHTTPContract(t *testing.T) {
 			},
 			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
 		})
-		req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
 		req.Header.Set("Authorization", "Bearer user1")
 		rw := httptest.NewRecorder()
 		router.ServeHTTP(rw, req)
@@ -85,7 +85,7 @@ func TestSetupGuardConflictHTTPContract(t *testing.T) {
 		},
 		SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
 	})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
 	req.Header.Set("Authorization", "Bearer user1")
 	rw := httptest.NewRecorder()
 	router.ServeHTTP(rw, req)
@@ -159,7 +159,7 @@ func TestSetupOwnershipPreflight(t *testing.T) {
 				},
 				SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
 			})
-			req := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
 			req.Header.Set("Authorization", "Bearer token")
 			rw := httptest.NewRecorder()
 			router.ServeHTTP(rw, req)
@@ -179,7 +179,7 @@ func TestTeardown(t *testing.T) {
 			Authenticate: func(context.Context, string, string) (string, error) { return "alice", nil },
 			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, &teardownHelm{}),
 		})
-		req := httptest.NewRequest(http.MethodGet, "/api/v1alpha1/setups", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1alpha1/setups", nil)
 		req.Header.Set("Authorization", "Bearer user-token")
 		rw := httptest.NewRecorder()
 		router.ServeHTTP(rw, req)
@@ -232,7 +232,10 @@ func TestTeardown(t *testing.T) {
 							UID string `json:"uid"`
 						} `json:"preconditions"`
 					}
-					require.NoError(t, json.NewDecoder(r.Body).Decode(&opts))
+					if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&opts)) {
+						http.Error(w, "invalid delete options JSON", http.StatusBadRequest)
+						return
+					}
 					assert.Equal(t, "uid-1", opts.Preconditions.UID)
 					steps = append(steps, "delete:gitea")
 					removed = true
@@ -264,7 +267,7 @@ func TestTeardown(t *testing.T) {
 				SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm, func(c *setup.ManagerConfig) { c.Coordinator = coord }),
 			})
 			request := func(method, url, body string, authorize bool) *httptest.ResponseRecorder {
-				req := httptest.NewRequest(method, url, strings.NewReader(body))
+				req := httptest.NewRequestWithContext(t.Context(), method, url, strings.NewReader(body))
 				if authorize {
 					req.Header.Set("Authorization", "Bearer user-token")
 				}
@@ -380,7 +383,7 @@ func TestAsyncTeardownHTTPContract(t *testing.T) {
 	manager := newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm)
 	router := handler.NewRouter(handler.Config{Authenticate: func(context.Context, string, string) (string, error) { return "alice", nil }, SetupManager: manager})
 	request := func(method, path, body string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req := httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer user-token")
 		rw := httptest.NewRecorder()
 		router.ServeHTTP(rw, req)
@@ -400,7 +403,10 @@ func TestAsyncTeardownHTTPContract(t *testing.T) {
 	require.Equal(t, http.StatusAccepted, started.Code, started.Body.String())
 	assert.Equal(t, "no-store", started.Header().Get("Cache-Control"))
 	var operation struct {
-		Kind, CatalogRef, OperationID, Status string
+		Kind        string `json:"kind"`
+		CatalogRef  string `json:"catalogRef"`
+		OperationID string `json:"operationId"`
+		Status      string `json:"status"`
 	}
 	require.NoError(t, json.Unmarshal(started.Body.Bytes(), &operation))
 	assert.Equal(t, "TeardownStatus", operation.Kind)
@@ -413,7 +419,10 @@ func TestAsyncTeardownHTTPContract(t *testing.T) {
 	}
 	active := request(http.MethodGet, endpoint+"/status", "")
 	require.Equal(t, http.StatusOK, active.Code)
-	var discovered struct{ OperationID, Status string }
+	var discovered struct {
+		OperationID string `json:"operationId"`
+		Status      string `json:"status"`
+	}
 	require.NoError(t, json.Unmarshal(active.Body.Bytes(), &discovered))
 	assert.Equal(t, operation.OperationID, discovered.OperationID)
 	assert.Equal(t, "running", discovered.Status)
@@ -424,7 +433,9 @@ func TestAsyncTeardownHTTPContract(t *testing.T) {
 		if got.Code != http.StatusOK {
 			return false
 		}
-		require.NoError(t, json.Unmarshal(got.Body.Bytes(), &operation))
+		if !assert.NoError(t, json.Unmarshal(got.Body.Bytes(), &operation)) {
+			return false
+		}
 		return operation.Status == "succeeded"
 	}, 3*time.Second, 10*time.Millisecond)
 	assert.Equal(t, "no-store", request(http.MethodGet, statusURL, "").Header().Get("Cache-Control"))

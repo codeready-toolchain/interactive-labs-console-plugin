@@ -34,7 +34,7 @@ func TestSpaceRequestTeardown(t *testing.T) {
 		{"oversized list fails closed", `{"items":[],"padding":"` + strings.Repeat("x", 5<<20) + `"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(tc.body)) }))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(tc.body)) }))
 			defer server.Close()
 			client := &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}
 			_, err := client.ListSpaceRequestsForLab(context.Background(), "token", "alice-dev", ref)
@@ -42,26 +42,66 @@ func TestSpaceRequestTeardown(t *testing.T) {
 		})
 	}
 	t.Run("fresh UID and identity checked before delete", func(t *testing.T) {
-		var deleted map[string]any
-		currentUID := "uid-1"
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method == http.MethodGet {
-				_, _ = w.Write([]byte(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"` + currentUID + `","labels":{"` + CatalogRefLabelKey + `":"` + label + `"},"annotations":{"` + BindingKeyAnnotation + `":"gitea"}}}`))
-				return
-			}
-			require.Equal(t, http.MethodDelete, r.Method)
-			require.NoError(t, json.NewDecoder(r.Body).Decode(&deleted))
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-		client := &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}
-		target := SpaceRequestResult{Name: "gitea", Namespace: "alice-dev", UID: "uid-1", Labels: map[string]string{CatalogRefLabelKey: label}, Annotations: map[string]string{BindingKeyAnnotation: "gitea"}}
-		require.NoError(t, client.DeleteVerifiedSpaceRequest(context.Background(), "user-token", "alice-dev", ref, target))
-		assert.Equal(t, "uid-1", deleted["preconditions"].(map[string]any)["uid"])
-		deleted = nil
-		currentUID = "replacement"
-		require.Error(t, client.DeleteVerifiedSpaceRequest(context.Background(), "user-token", "alice-dev", ref, target))
-		assert.Nil(t, deleted)
+		for _, tc := range []struct {
+			name      string
+			change    func(map[string]any)
+			absent    bool
+			wantError bool
+		}{
+			{name: "name differs from binding key"},
+			{name: "already absent", absent: true},
+			{name: "terminating target remains deletable", change: func(meta map[string]any) { meta["deletionTimestamp"] = "2026-10-01T00:00:00Z" }},
+			{name: "replacement UID", change: func(meta map[string]any) { meta["uid"] = "replacement" }, wantError: true},
+			{name: "missing UID", change: func(meta map[string]any) { delete(meta, "uid") }, wantError: true},
+			{name: "wrong name", change: func(meta map[string]any) { meta["name"] = "other" }, wantError: true},
+			{name: "wrong home namespace", change: func(meta map[string]any) { meta["namespace"] = "bob-dev" }, wantError: true},
+			{name: "unmarked catalog", change: func(meta map[string]any) { delete(meta, "labels") }, wantError: true},
+			{name: "raw catalog ref", change: func(meta map[string]any) { meta["labels"] = map[string]string{CatalogRefLabelKey: ref} }, wantError: true},
+			{name: "wrong binding key", change: func(meta map[string]any) { meta["annotations"] = map[string]string{BindingKeyAnnotation: "other"} }, wantError: true},
+		} {
+			t.Run("given "+tc.name+" when deleting then current identity is verified", func(t *testing.T) {
+				// Given a confirmed target whose resource name is not its binding key.
+				target := SpaceRequestResult{Name: "sr-gitea", Namespace: "alice-dev", UID: "uid-1", Labels: map[string]string{CatalogRefLabelKey: label}, Annotations: map[string]string{BindingKeyAnnotation: "namespace.gitea"}}
+				meta := map[string]any{"name": target.Name, "namespace": target.Namespace, "uid": target.UID, "labels": target.Labels, "annotations": target.Annotations}
+				if tc.change != nil {
+					tc.change(meta)
+				}
+				var deleted map[string]any
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+					assert.True(t, strings.HasSuffix(r.URL.Path, "/sr-gitea"))
+					if r.Method == http.MethodGet {
+						if tc.absent {
+							w.WriteHeader(http.StatusNotFound)
+						} else {
+							_ = json.NewEncoder(w).Encode(map[string]any{"metadata": meta})
+						}
+						return
+					}
+					assert.Equal(t, http.MethodDelete, r.Method)
+					_ = json.NewDecoder(r.Body).Decode(&deleted)
+					w.WriteHeader(http.StatusOK)
+				}))
+				defer server.Close()
+				client := &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}
+
+				// When deletion rereads the target.
+				err := client.DeleteVerifiedSpaceRequest(context.Background(), "user-token", "alice-dev", ref, target)
+
+				// Then only matching, present identity permits UID-pinned deletion.
+				if tc.wantError {
+					require.EqualError(t, err, "SpaceRequest identity changed")
+				} else {
+					require.NoError(t, err)
+				}
+				if tc.wantError || tc.absent {
+					assert.Nil(t, deleted)
+				} else {
+					require.NotNil(t, deleted)
+					assert.Equal(t, "uid-1", deleted["preconditions"].(map[string]any)["uid"])
+				}
+			})
+		}
 	})
 }
 
@@ -136,9 +176,9 @@ func TestSpaceRequestTermination(t *testing.T) {
 			assert.Equal(t, tc.ready, sr.IsReady())
 			ensureErr := client.EnsureSpaceRequestForLab(context.Background(), "token", "alice-dev", "gitea", "base1ns", ref, "gitea")
 			if tc.ready {
-				assert.NoError(t, ensureErr)
+				require.NoError(t, ensureErr)
 			} else {
-				assert.Error(t, ensureErr, "identity-matching terminating SR must not be adopted")
+				require.Error(t, ensureErr, "identity-matching terminating SR must not be adopted")
 			}
 			assert.Zero(t, mutations)
 		})
@@ -214,6 +254,7 @@ func TestEnsureSpaceRequestForLab(t *testing.T) {
 		getStatus      int
 		existingLabels map[string]string
 		existingKey    string
+		change         func(map[string]any)
 		postStatus     int
 		wantError      bool
 		wantPost       bool
@@ -223,6 +264,9 @@ func TestEnsureSpaceRequestForLab(t *testing.T) {
 		{name: "unmarked legacy request cannot be adopted", getStatus: http.StatusOK, wantError: true},
 		{name: "foreign lab request cannot be adopted", getStatus: http.StatusOK, existingLabels: map[string]string{CatalogRefLabelKey: "other"}, existingKey: "namespace.gitea", wantError: true},
 		{name: "wrong binding cannot be adopted", getStatus: http.StatusOK, existingLabels: map[string]string{CatalogRefLabelKey: label}, existingKey: "other", wantError: true},
+		{name: "wrong name cannot be adopted", getStatus: http.StatusOK, existingLabels: map[string]string{CatalogRefLabelKey: label}, existingKey: "namespace.gitea", change: func(meta map[string]any) { meta["name"] = "other" }, wantError: true},
+		{name: "wrong home namespace cannot be adopted", getStatus: http.StatusOK, existingLabels: map[string]string{CatalogRefLabelKey: label}, existingKey: "namespace.gitea", change: func(meta map[string]any) { meta["namespace"] = "other-dev" }, wantError: true},
+		{name: "missing UID cannot be adopted", getStatus: http.StatusOK, existingLabels: map[string]string{CatalogRefLabelKey: label}, existingKey: "namespace.gitea", change: func(meta map[string]any) { delete(meta, "uid") }, wantError: true},
 		{name: "GET permission failure does not permit create", getStatus: http.StatusForbidden, wantError: true},
 		{name: "create conflict does not permit reuse", getStatus: http.StatusNotFound, postStatus: http.StatusConflict, wantError: true, wantPost: true},
 	} {
@@ -234,13 +278,20 @@ func TestEnsureSpaceRequestForLab(t *testing.T) {
 				case http.MethodGet:
 					w.WriteHeader(tc.getStatus)
 					if tc.getStatus == http.StatusOK {
-						_ = json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{
+						meta := map[string]any{
 							"name": "gitea", "namespace": "user-dev", "uid": "uid-1", "labels": tc.existingLabels,
 							"annotations": map[string]string{BindingKeyAnnotation: tc.existingKey},
-						}})
+						}
+						if tc.change != nil {
+							tc.change(meta)
+						}
+						_ = json.NewEncoder(w).Encode(map[string]any{"metadata": meta})
 					}
 				case http.MethodPost:
-					require.NoError(t, json.NewDecoder(r.Body).Decode(&posted))
+					if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&posted)) {
+						http.Error(w, "invalid SpaceRequest JSON", http.StatusBadRequest)
+						return
+					}
 					w.WriteHeader(tc.postStatus)
 				}
 			}))
@@ -249,6 +300,9 @@ func TestEnsureSpaceRequestForLab(t *testing.T) {
 			err := client.EnsureSpaceRequestForLab(context.Background(), "test-token", "user-dev", "gitea", "base1ns", ref, "namespace.gitea")
 			if tc.wantError {
 				require.Error(t, err)
+				if tc.getStatus == http.StatusOK {
+					require.EqualError(t, err, "SpaceRequest identity mismatch")
+				}
 			} else {
 				require.NoError(t, err)
 			}

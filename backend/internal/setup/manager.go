@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +35,10 @@ type managerWorkerState struct {
 	catalogRef string
 	phase      string
 	message    string
+}
+
+func (w managerWorkerState) failureApplies(holder string, held bool) bool {
+	return w.phase == "failed" && (!held || w.owner == holder)
 }
 
 func NewManager(config ManagerConfig) *Manager { return &Manager{config: config} }
@@ -118,11 +123,11 @@ func (m *Manager) labRelease(ctx context.Context, namespace, token, ref string) 
 		if existing != nil {
 			return nil, managerError(ManagerConflict, "Multiple releases found for this lab. Contact an administrator.")
 		}
-		if r.Name == "" || r.Namespace != namespace || r.UID == "" {
+		if !r.hasStorageIdentity(namespace) {
 			return nil, managerError(ManagerConflict, "Unverified existing lab release. Contact an administrator before retrying.")
 		}
-		copy := *r // Adapters must not change the selected identity during reads.
-		existing = &copy
+		snapshot := *r // Adapters must not change the selected identity during reads.
+		existing = &snapshot
 	}
 	return existing, nil
 }
@@ -136,7 +141,7 @@ func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir strin
 	if subject == "" || token == "" {
 		return Status{}, false, managerError(ManagerBadRequest, "authentication required")
 	}
-	label, err := CatalogRefLabel(ref)
+	_, err := CatalogRefLabel(ref)
 	if err != nil {
 		return Status{}, false, managerError(ManagerBadRequest, "invalid catalog identity")
 	}
@@ -184,20 +189,15 @@ func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir strin
 			return Status{}, false, managerError(ManagerConflict, "Existing lab namespace bindings changed. Clean up before relaunch.")
 		}
 		for _, b := range bindings.Namespaces {
-			matched := false
-			for _, sr := range srs {
-				if sr.Annotations[BindingKeyAnnotation] == b.Key && sr.IsReady() && sr.TargetNamespace() != "" {
-					matched = true
-					break
-				}
-			}
-			if !matched {
+			if !slices.ContainsFunc(srs, func(sr SpaceRequestResult) bool {
+				return sr.Annotations[BindingKeyAnnotation] == b.Key && sr.readyNamespace() != ""
+			}) {
 				return Status{}, false, managerError(ManagerConflict, "Existing lab namespaces are not ready or bindings changed. Refresh or clean up before relaunch.")
 			}
 		}
-		current, err := m.labRelease(preflightCtx, namespace, token, ref)
-		if err != nil {
-			return Status{}, false, err
+		current, readErr := m.labRelease(preflightCtx, namespace, token, ref)
+		if readErr != nil {
+			return Status{}, false, readErr
 		}
 		if current == nil || !current.sameSummary(*existing) {
 			return Status{}, false, managerError(ManagerConflict, "Lab release changed. Teardown before reopening.")
@@ -209,27 +209,16 @@ func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir strin
 		return Status{}, false, managerError(ManagerConflict, "Unverified existing lab release. Contact an administrator before retrying.")
 	}
 
-	tier := m.config.TierName
-	if tier == "" {
-		tier = "base1ns"
-	}
 	uids := make(map[string]string, len(bindings.Namespaces))
 	for _, b := range bindings.Namespaces {
 		if preflightCtx.Err() != nil {
 			return Status{}, false, managerError(ManagerConflict, "Lab operation lost its reservation; reopen to retry.")
 		}
-		if err := m.config.SpaceRequests.EnsureSpaceRequestForLab(preflightCtx, token, namespace, b.Key, tier, ref, b.Key); err != nil {
-			if errors.Is(err, errSpaceRequestTerminating) {
-				return Status{}, false, managerError(ManagerConflict, "Lab namespaces are still terminating. Wait for cleanup before relaunch.")
-			}
-			return Status{}, false, managerError(ManagerBadGateway, "failed to create SpaceRequest")
+		uid, err := m.ensureLabBindingUID(preflightCtx, token, namespace, ref, b.Key)
+		if err != nil {
+			return Status{}, false, err
 		}
-		sr, err := m.config.SpaceRequests.GetSpaceRequest(preflightCtx, token, namespace, b.Key)
-		if err != nil || sr == nil || sr.DeletionTimestamp != "" || sr.Name != b.Key || sr.Namespace != namespace || sr.UID == "" ||
-			sr.Labels[CatalogRefLabelKey] != label || sr.Annotations[BindingKeyAnnotation] != b.Key {
-			return Status{}, false, managerError(ManagerConflict, "SpaceRequest identity changed; refresh before retrying.")
-		}
-		uids[b.Key] = sr.UID
+		uids[b.Key] = uid
 	}
 	if preflightCtx.Err() != nil {
 		return Status{}, false, managerError(ManagerConflict, "Lab operation lost its reservation; reopen to retry.")
@@ -242,6 +231,26 @@ func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir strin
 		m.runWorker(operationCtx, token, namespace, releaseName, ref, chartDir, bindings, uids, worker)
 	}()
 	return newStatus("provisioning", "pending", releaseName, nil), false, nil
+}
+
+// ensureLabBindingUID pins the final fresh read, not Ensure's earlier snapshot.
+func (m *Manager) ensureLabBindingUID(ctx context.Context, token, namespace, ref, bindingKey string) (string, error) {
+	tier := m.config.TierName
+	if tier == "" {
+		tier = "base1ns"
+	}
+	if err := m.config.SpaceRequests.EnsureSpaceRequestForLab(ctx, token, namespace, bindingKey, tier, ref, bindingKey); err != nil {
+		if errors.Is(err, errSpaceRequestTerminating) {
+			return "", managerError(ManagerConflict, "Lab namespaces are still terminating. Wait for cleanup before relaunch.")
+		}
+		return "", managerError(ManagerBadGateway, "failed to create SpaceRequest")
+	}
+	label, _ := CatalogRefLabel(ref) // Ensure already validated the catalog identity.
+	sr, err := m.config.SpaceRequests.GetSpaceRequest(ctx, token, namespace, bindingKey)
+	if err != nil || !sr.matchesLabBinding(namespace, bindingKey, label, bindingKey) || sr.DeletionTimestamp != "" {
+		return "", managerError(ManagerConflict, "SpaceRequest identity changed; refresh before retrying.")
+	}
+	return sr.UID, nil
 }
 
 const (
@@ -338,8 +347,8 @@ func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindin
 	namespaces := make(map[string]NamespaceStatus, len(bindings.Namespaces))
 	allReady, anyFailed := true, false
 	for _, b := range bindings.Namespaces {
-		sr, err := m.config.SpaceRequests.GetSpaceRequest(ctx, token, namespace, b.Key)
-		if err != nil {
+		sr, readErr := m.config.SpaceRequests.GetSpaceRequest(ctx, token, namespace, b.Key)
+		if readErr != nil {
 			return Status{}, managerError(ManagerBadGateway, "Unable to check SpaceRequests. Check permissions before retrying.")
 		}
 		if sr == nil {
@@ -347,12 +356,11 @@ func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindin
 			allReady = false
 			continue
 		}
-		if sr.Name != b.Key || sr.Namespace != namespace || sr.UID == "" ||
-			sr.Labels[CatalogRefLabelKey] != label || sr.Annotations[BindingKeyAnnotation] != b.Key {
+		if !sr.matchesLabBinding(namespace, b.Key, label, b.Key) {
 			return Status{}, managerError(ManagerConflict, "SpaceRequest identity changed; refresh before retrying.")
 		}
-		if sr.IsReady() && sr.TargetNamespace() != "" {
-			namespaces[b.Key] = NamespaceStatus{Status: "ready", Name: sr.TargetNamespace()}
+		if target := sr.readyNamespace(); target != "" {
+			namespaces[b.Key] = NamespaceStatus{Status: "ready", Name: target}
 		} else if sr.IsFailed() {
 			namespaces[b.Key] = NamespaceStatus{Status: "failed", Name: b.Key}
 			allReady, anyFailed = false, true
@@ -367,62 +375,12 @@ func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindin
 	} else if allReady {
 		srStatus = "ready"
 	}
-	releaseName := HelmReleaseName(subject, ref, bindings.Namespaces)
-	result := newStatus(srStatus, "pending", releaseName, namespaces)
-	var releaseStatus string
-	holder, held := m.config.Coordinator.currentHolder(ctx, subject, ref)
-	if m.config.Helm != nil {
-		existing, err := m.labRelease(ctx, namespace, token, ref)
-		if err != nil {
-			return Status{}, err
-		}
-		if existing != nil {
-			result.Helm.ReleaseName = existing.Name
-			releaseStatus = existing.Status
-			result.Helm.Status = HelmStatusLabel(releaseStatus)
-			if result.Helm.Status == "failed" {
-				result.Helm.Message = "Lab setup failed. Tear down this lab before launching again. If teardown is unavailable, contact an administrator."
-			}
-			if allReady && result.Helm.Status == "deployed" && len(bindings.Passwords) > 0 {
-				result.Helm.GeneratedValues = make(map[string]string, len(bindings.Passwords))
-				for _, b := range bindings.Passwords {
-					if value, ok := extractNestedValue(existing.Config, b.Path); ok {
-						result.Helm.GeneratedValues[b.Path] = value
-					}
-				}
-			}
-		} else if state, ok := m.workers.Load(namespace + "\x00" + ref); ok {
-			worker := state.(managerWorkerState)
-			switch worker.phase {
-			case "installing":
-				if held && worker.owner == holder {
-					result.Helm.Status = "installing"
-				}
-			case "failed":
-				if !held || worker.owner == holder {
-					result.Helm.Status, result.Helm.Message = "failed", worker.message
-				}
-			}
-		}
+	helm, retrySetup, err := m.observeHelmSetup(ctx, subject, token, ref, bindings, srStatus)
+	if err != nil {
+		return Status{}, err
 	}
-	// A vanished worker cannot resume without a fresh authenticated POST. A
-	// pending release must be reconciled before retry, never installed over.
-	if m.config.Helm != nil && m.config.Coordinator != nil && !held {
-		if releaseStatus == "" && result.Helm.Status == "pending" && !anyFailed {
-			tornDown, err := m.config.Coordinator.HasTeardownReceipt(ctx, subject, ref)
-			if err != nil {
-				return Status{}, managerError(ManagerUnavailable, "Unable to check lab recovery. Retry status.")
-			}
-			if tornDown {
-				result.Helm.Status, result.Helm.Message = "failed", "Lab was torn down. Close this panel and launch again to recreate it."
-			} else {
-				result.RetrySetup = true
-			}
-		} else if releaseStatus != "" && result.Helm.Status != "deployed" && result.Helm.Status != "failed" {
-			result.Helm.Status = "failed"
-			result.Helm.Message = "Helm installation was interrupted. Refresh setups and tear down this lab before relaunching; unsafe releases need administrator help."
-		}
-	}
+	result := newStatus(srStatus, helm.Status, helm.ReleaseName, namespaces)
+	result.Helm, result.RetrySetup = helm, retrySetup
 	if allReady && result.Helm.Status == "deployed" {
 		result.Attributes = make(map[string]string, len(bindings.Namespaces)+len(bindings.Passwords)+len(bindings.RootURLs))
 		for _, b := range bindings.Namespaces {
@@ -442,6 +400,63 @@ func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindin
 		}
 	}
 	return result, nil
+}
+
+// observeHelmSetup uses one verified release snapshot and advisory local state.
+func (m *Manager) observeHelmSetup(ctx context.Context, subject, token, ref string, bindings SchemaBindings, srStatus string) (HelmSetupStatus, bool, error) {
+	namespace := subjectHomeSpace(subject)
+	result := HelmSetupStatus{Status: "pending", ReleaseName: HelmReleaseName(subject, ref, bindings.Namespaces)}
+	var releaseStatus string
+	holder, held := m.config.Coordinator.currentHolder(ctx, subject, ref)
+	if m.config.Helm != nil {
+		existing, err := m.labRelease(ctx, namespace, token, ref)
+		if err != nil {
+			return HelmSetupStatus{}, false, err
+		}
+		if existing != nil {
+			result.ReleaseName = existing.Name
+			releaseStatus = existing.Status
+			result.Status = HelmStatusLabel(releaseStatus)
+			if result.Status == "failed" {
+				result.Message = "Lab setup failed. Tear down this lab before launching again. If teardown is unavailable, contact an administrator."
+			}
+			if srStatus == "ready" && result.Status == "deployed" && len(bindings.Passwords) > 0 {
+				result.GeneratedValues = make(map[string]string, len(bindings.Passwords))
+				for _, b := range bindings.Passwords {
+					if value, ok := extractNestedValue(existing.Config, b.Path); ok {
+						result.GeneratedValues[b.Path] = value
+					}
+				}
+			}
+		} else if state, ok := m.workers.Load(namespace + "\x00" + ref); ok {
+			worker := state.(managerWorkerState)
+			if worker.phase == "installing" && held && worker.owner == holder {
+				result.Status = "installing"
+			} else if worker.failureApplies(holder, held) {
+				result.Status, result.Message = "failed", worker.message
+			}
+		}
+	}
+	// A vanished worker cannot resume without a fresh authenticated POST. A
+	// pending release must be reconciled before retry, never installed over.
+	retrySetup := false
+	if m.config.Helm != nil && m.config.Coordinator != nil && !held {
+		if releaseStatus == "" && result.Status == "pending" && srStatus != "failed" {
+			tornDown, err := m.config.Coordinator.HasTeardownReceipt(ctx, subject, ref)
+			if err != nil {
+				return HelmSetupStatus{}, false, managerError(ManagerUnavailable, "Unable to check lab recovery. Retry status.")
+			}
+			if tornDown {
+				result.Status, result.Message = "failed", "Lab was torn down. Close this panel and launch again to recreate it."
+			} else {
+				retrySetup = true
+			}
+		} else if releaseStatus != "" && result.Status != "deployed" && result.Status != "failed" {
+			result.Status = "failed"
+			result.Message = "Helm installation was interrupted. Refresh setups and tear down this lab before relaunching; unsafe releases need administrator help."
+		}
+	}
+	return result, retrySetup, nil
 }
 
 // BlockedReason is a fixed, non-secret cleanup blocker code.
@@ -486,12 +501,13 @@ type LabSetup struct {
 }
 
 func (m *Manager) List(ctx context.Context, subject, token string) ([]LabSetup, error) {
-	return m.list(ctx, subject, token, "")
+	return m.readLabInventory(ctx, subject, token, "")
 }
 
-// reservedRef exempts the target lab from the operation blocker during teardown
-// confirmation. Acquisition still rejects live holders before cleanup can start.
-func (m *Manager) list(ctx context.Context, subject, token, reservedRef string) ([]LabSetup, error) {
+// readLabInventory lists the user's lab setups, including those no longer in the catalog.
+// reservedRef is treated as unheld during classification so teardown does not block
+// on its own reservation. Other cleanup blockers still apply.
+func (m *Manager) readLabInventory(ctx context.Context, subject, token, reservedRef string) ([]LabSetup, error) {
 	if !m.available() {
 		return nil, managerError(ManagerUnavailable, "lab setup unavailable")
 	}
@@ -524,27 +540,16 @@ func (m *Manager) list(ctx context.Context, subject, token, reservedRef string) 
 		item.SpaceRequests = append(item.SpaceRequests, sr.Name)
 	}
 	for _, rel := range releases {
-		if _, err := CatalogRefLabel(rel.CatalogRef); err != nil || rel.Name == "" || rel.Namespace != namespace || rel.UID == "" {
+		if _, err := CatalogRefLabel(rel.CatalogRef); err != nil || !rel.hasStorageIdentity(namespace) {
 			return nil, managerError(ManagerBadGateway, "Unable to list lab setups. Check permissions or ask an administrator for help.")
 		}
 		item := get(rel.CatalogRef)
 		if item.Release != nil {
 			return nil, managerError(ManagerBadGateway, "Unable to list lab setups. Check permissions or ask an administrator for help.")
 		}
-		copy := rel
-		copy.Config = nil // Inventory never retains or exposes Helm values.
-		item.Release = &copy
-		if rel.Status != "deployed" && rel.Status != "failed" {
-			item.BlockedReason = BlockedHelmState
-		} else if rel.CleanupBlocked {
-			switch rel.BlockedReason {
-			case BlockedHelmHook, BlockedHelmRetained, BlockedHelmManifest:
-				item.BlockedReason = rel.BlockedReason
-			default:
-				item.BlockedReason = BlockedUnknown
-			}
-		}
-		item.Blocked = item.BlockedReason != ""
+		snapshot := rel
+		snapshot.Config = nil // Inventory never retains or exposes Helm values.
+		item.Release = &snapshot
 	}
 	workers := map[string]managerWorkerState{}
 	m.workers.Range(func(_, value any) bool {
@@ -561,53 +566,69 @@ func (m *Manager) list(ctx context.Context, subject, token, reservedRef string) 
 	for _, item := range byRef {
 		holder, held := m.config.Coordinator.currentHolder(ctx, subject, item.CatalogRef)
 		held = item.CatalogRef != reservedRef && held
-		if item.Release != nil {
-			item.Status = HelmStatusLabel(item.Release.Status)
-			if item.Release.Status == "pending-install" && !held && !item.Release.CleanupBlocked {
-				// After reservation expiry, verified pending installs may be
-				// explicitly torn down; never overlap an active installer.
-				item.Status, item.BlockedReason, item.Blocked = "failed", "", false
-			} else if item.Status == "installing" {
-				item.Status = "pending"
-			}
-		} else if held {
-			item.Status = "pending"
-		}
-		// Local phases are advisory: only the cluster release and live Lease
-		// determine readiness and exclusion after restart or takeover.
-		if worker, ok := workers[item.CatalogRef]; ok && item.Release == nil && worker.phase == "failed" && (!held || worker.owner == holder) {
-			item.Status = "failed"
-		}
-		for _, sr := range item.srs {
-			if sr.DeletionTimestamp != "" {
-				item.Status, item.BlockedReason = "pending", BlockedCleanup
-				break
-			}
-			if sr.IsFailed() {
-				item.Status = "failed"
-			}
-		}
-		if held && item.BlockedReason != BlockedCleanup {
-			item.BlockedReason = BlockedOperation
-		} else if item.BlockedReason == "" && (item.Blocked || item.Status == "pending") {
-			item.BlockedReason = BlockedPending
-		}
-		item.Blocked = item.BlockedReason != ""
-		sort.Strings(item.SpaceRequests)
-		sort.Slice(item.srs, func(i, j int) bool { return item.srs[i].Name < item.srs[j].Name })
-		h := sha256.New()
-		for _, sr := range item.srs {
-			_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00", sr.Name, sr.UID, sr.Annotations[BindingKeyAnnotation])
-		}
-		if item.Release != nil {
-			rel := item.Release
-			_, _ = fmt.Fprintf(h, "%s\x00%s\x00%d\x00%s", rel.Name, rel.UID, rel.Revision, rel.Status)
-		}
-		item.Generation = fmt.Sprintf("%x", h.Sum(nil))
+		item.finalizeLabInventory(holder, held, workers[item.CatalogRef])
 		out = append(out, *item)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CatalogRef < out[j].CatalogRef })
 	return out, nil
+}
+
+func (item *LabSetup) finalizeLabInventory(holder string, held bool, worker managerWorkerState) {
+	if rel := item.Release; rel != nil {
+		if rel.Status != "deployed" && rel.Status != "failed" {
+			item.BlockedReason = BlockedHelmState
+		} else if rel.CleanupBlocked {
+			switch rel.BlockedReason {
+			case BlockedHelmHook, BlockedHelmRetained, BlockedHelmManifest:
+				item.BlockedReason = rel.BlockedReason
+			default:
+				item.BlockedReason = BlockedUnknown
+			}
+		}
+	}
+	if item.Release != nil {
+		item.Status = HelmStatusLabel(item.Release.Status)
+		if item.Release.Status == "pending-install" && !held && !item.Release.CleanupBlocked {
+			// After reservation expiry, verified pending installs may be
+			// explicitly torn down; never overlap an active installer.
+			item.Status, item.BlockedReason = "failed", ""
+		} else if item.Status == "installing" {
+			item.Status = "pending"
+		}
+	} else if held {
+		item.Status = "pending"
+	}
+	// Local phases are advisory: only the cluster release and live Lease
+	// determine readiness and exclusion after restart or takeover.
+	if item.Release == nil && worker.failureApplies(holder, held) {
+		item.Status = "failed"
+	}
+	for _, sr := range item.srs {
+		if sr.DeletionTimestamp != "" {
+			item.Status, item.BlockedReason = "pending", BlockedCleanup
+			break
+		}
+		if sr.IsFailed() {
+			item.Status = "failed"
+		}
+	}
+	if held && item.BlockedReason != BlockedCleanup {
+		item.BlockedReason = BlockedOperation
+	} else if item.BlockedReason == "" && item.Status == "pending" {
+		item.BlockedReason = BlockedPending
+	}
+	item.Blocked = item.BlockedReason != ""
+	sort.Strings(item.SpaceRequests)
+	sort.Slice(item.srs, func(i, j int) bool { return item.srs[i].Name < item.srs[j].Name })
+	h := sha256.New()
+	for _, sr := range item.srs {
+		_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00", sr.Name, sr.UID, sr.Annotations[BindingKeyAnnotation])
+	}
+	if item.Release != nil {
+		rel := item.Release
+		_, _ = fmt.Fprintf(h, "%s\x00%s\x00%d\x00%s", rel.Name, rel.UID, rel.Revision, rel.Status)
+	}
+	item.Generation = fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // BeginTeardown validates the confirmed inventory while holding the reservation,
@@ -684,7 +705,7 @@ func (m *Manager) validateTeardown(subject, token, ref, generation string) error
 }
 
 func (m *Manager) teardownTarget(ctx context.Context, subject, token, ref, generation string) (*LabSetup, error) {
-	items, err := m.list(ctx, subject, token, ref)
+	items, err := m.readLabInventory(ctx, subject, token, ref)
 	if err != nil {
 		return nil, managerTeardownFailure()
 	}
@@ -715,8 +736,7 @@ func (m *Manager) teardownReserved(ctx context.Context, subject, token, ref stri
 	}
 	for _, sr := range target.srs {
 		current, found := byName[sr.Name]
-		if !found || current.Namespace != sr.Namespace || current.UID != sr.UID ||
-			current.Labels[CatalogRefLabelKey] != sr.Labels[CatalogRefLabelKey] || current.Annotations[BindingKeyAnnotation] != sr.Annotations[BindingKeyAnnotation] {
+		if !found || !current.matchesLabBinding(sr.Namespace, sr.Name, sr.Labels[CatalogRefLabelKey], sr.Annotations[BindingKeyAnnotation]) || current.UID != sr.UID {
 			return managerTeardownFailure()
 		}
 	}
