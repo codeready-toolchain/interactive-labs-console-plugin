@@ -603,6 +603,36 @@
   position: relative;
 }
 
+.interactive-labs-content .copy-to-clipboard {
+  position: absolute;
+  top: 0.25rem;
+  right: 0.25rem;
+  background: var(--pre-background);
+  border: 1px solid var(--pre-border-color);
+  border-radius: 4px;
+  color: var(--pre-annotation-font-color);
+  cursor: pointer;
+  padding: 0.25rem;
+  line-height: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 1;
+}
+
+.interactive-labs-content .listingblock:hover .copy-to-clipboard,
+.interactive-labs-content .copy-to-clipboard:focus {
+  opacity: 1;
+}
+
+.interactive-labs-content .copy-to-clipboard:hover {
+  color: var(--code-font-color);
+}
+
+.interactive-labs-content .copy-to-clipboard.copied {
+  opacity: 1;
+  color: var(--color-evergreen-70, #28a745);
+}
+
 .interactive-labs-content .listingblock code[data-lang]::before {
   color: var(--pre-annotation-font-color);
   content: attr(data-lang);
@@ -611,7 +641,7 @@
   letter-spacing: 0.05em;
   line-height: 1;
   position: absolute;
-  right: 0.25rem;
+  right: 2rem;
   text-transform: uppercase;
   top: 0.25rem;
 }
