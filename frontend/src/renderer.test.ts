@@ -357,6 +357,45 @@ describe("renderAsciiDoc", () => {
     expect(result.html).toContain(expected);
   });
 
+  describe("default resource namespace", () => {
+    it.each<[string, string | undefined, string]>([
+      ["resource:v1/Pod[Pods]", "team-a", "/k8s/ns/team-a/core~v1~Pod"],
+      ["resource:apps/v1/Deployment[Deployments,name=api]", "team-a", "/k8s/ns/team-a/apps~v1~Deployment?name=api"],
+      ["resource:v1/Pod[Pods,name=api/&?=+#]", "team /?#", "/k8s/ns/team%20%2F%3F%23/core~v1~Pod?name=api%2F%26%3F%3D%2B%23"],
+      ["resource:v1/Pod[Pods]", undefined, "/k8s/all-namespaces/core~v1~Pod"],
+      ["resource:v1/Pod[Pods,name=api]", undefined, "/k8s/all-namespaces/core~v1~Pod?name=api"],
+      ["resource:v1/Pod[Pods]", "", "/k8s/all-namespaces/core~v1~Pod"],
+      ["resource:v1/Pod[Pods,namespace={lab_namespace}]", "team-a", "/k8s/ns/authored/core~v1~Pod"],
+      ["resource:v1/Pod[Pod,namespace={lab_namespace},name=api]", "team-a", "/k8s/ns/authored/core~v1~Pod/api"],
+      ["resource:v1/Pod[Pod,namespace=explicit,name=api]", undefined, "/k8s/ns/explicit/core~v1~Pod/api"],
+      ["resource:project.openshift.io/v1/Project[Projects,scope=cluster]", "team-a", "/k8s/cluster/project.openshift.io~v1~Project"],
+      ["resource:project.openshift.io/v1/Project[Project,scope=cluster,name=team/a]", "team-a", "/k8s/cluster/project.openshift.io~v1~Project/team%2Fa"],
+    ])("given %s and project %s, renders %s", async (source, defaultNamespace, href) => {
+      // Given a Console project separate from authored AsciiDoc attributes.
+      const input = { source, sourceURL, attributes: { lab_namespace: "authored", namespace: "not-the-default" }, defaultNamespace, loadResource: loader };
+
+      // When the resource macro renders.
+      const result = await renderAsciiDoc(input);
+
+      // Then selectors retain collection versus detail semantics and URI encoding.
+      expect(result.html).toContain(`href="${href}"`);
+      expect(result.warnings).toEqual([]);
+    });
+
+    it.each([
+      "resource:v1/Pod[Pods,scope=cluster,namespace=authored]",
+      "resource:v1/Pod[Pods,scope=cluster,namespace={lab_namespace}]",
+      "resource:v1/Pod[Pods,namespace=]",
+    ])("given a selected project, rejects invalid authored namespace in %s", async (source) => {
+      const input = { source, sourceURL, attributes: { lab_namespace: "authored" }, defaultNamespace: "team-a", loadResource: loader };
+
+      const result = await renderAsciiDoc(input);
+
+      expect(result.html).not.toContain("<a ");
+      expect(result.warnings).toContain("Guidance link is unavailable or unsafe.");
+    });
+  });
+
   it("renders substituted resource labels as AsciiDoc inside outer bold", async () => {
     const result = await renderAsciiDoc({
       source: "*resource:project.openshift.io/v1/Project[`{user}-datasphere`,scope=cluster,name={user}-datasphere]*",

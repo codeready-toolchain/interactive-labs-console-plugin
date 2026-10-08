@@ -46,6 +46,7 @@ export type RenderInput = {
   attributes: Record<string, string>;
   loadResource: ResourceLoader;
   pageURLs?: string[];
+  defaultNamespace?: string;
   signal?: AbortSignal;
 };
 
@@ -78,6 +79,7 @@ function registry(
   controller: AbortController,
   warnings: string[],
   guidanceLinks: Map<string, GuidanceLink>,
+  defaultNamespace?: string,
 ) {
   class ApprovedIncludeProcessor extends IncludeProcessor {
     handles(): boolean {
@@ -129,7 +131,7 @@ function registry(
 
     process(parent: Block, target: string, macroAttributes: MacroAttributes): Inline {
       const label = macroLabel(macroAttributes);
-      const href = label && resourceHref(target, macroAttributes);
+      const href = label && resourceHref(target, macroAttributes, defaultNamespace);
       return href
         ? this.createInline(parent, "anchor", label, { type: "link", target: href })
         : inlineWarning(this, parent, warnings);
@@ -184,7 +186,7 @@ function inlineWarning(processor: InlineMacroProcessor, parent: Block, warnings:
   });
 }
 
-function resourceHref(target: string, macroAttributes: MacroAttributes): string | undefined {
+function resourceHref(target: string, macroAttributes: MacroAttributes, defaultNamespace?: string): string | undefined {
   const parts = target.split("/");
   const [group, version, kind] = parts.length === 2 ? ["core", parts[0], parts[1]] : parts;
   if (parts.length < 2 || parts.length > 3 || !onlyMacroAttributes(macroAttributes, ["scope", "name", "namespace"])) return;
@@ -202,8 +204,9 @@ function resourceHref(target: string, macroAttributes: MacroAttributes): string 
   const reference = [group, version, kind].map((component) => encodeURIComponent(component).replace(/~/g, "%7E")).join("~");
   if (scope === "cluster") return name ? `/k8s/cluster/${reference}/${encodeURIComponent(name)}` : `/k8s/cluster/${reference}`;
   if (namespace && name) return `/k8s/ns/${encodeURIComponent(namespace)}/${reference}/${encodeURIComponent(name)}`;
-  if (namespace) return `/k8s/ns/${encodeURIComponent(namespace)}/${reference}`;
-  return name ? `/k8s/all-namespaces/${reference}?name=${encodeURIComponent(name)}` : `/k8s/all-namespaces/${reference}`;
+  const listNamespace = namespace ?? defaultNamespace;
+  const href = listNamespace ? `/k8s/ns/${encodeURIComponent(listNamespace)}/${reference}` : `/k8s/all-namespaces/${reference}`;
+  return name ? `${href}?name=${encodeURIComponent(name)}` : href;
 }
 
 function replaceGuidanceLinks(root: DocumentFragment, guidanceLinks: Map<string, GuidanceLink>): GuidanceLink[] {
@@ -291,7 +294,7 @@ function parserOptions(input: RenderInput, controller: AbortController, warnings
       ...Object.fromEntries(Object.entries(input.attributes).map(([name, value]) => [`${name}@`, value])),
       relfilesuffix: ".adoc",
     },
-    extension_registry: registry(input.sourceURL, input.loadResource, controller, warnings, guidanceLinks),
+    extension_registry: registry(input.sourceURL, input.loadResource, controller, warnings, guidanceLinks, input.defaultNamespace),
     safe: "secure" as const,
     standalone: false,
     to_file: false,
