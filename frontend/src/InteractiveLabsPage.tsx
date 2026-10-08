@@ -45,8 +45,9 @@ import type { CatalogEntry } from "./types/catalog";
 import type { LabError } from "./types/errors";
 import type { PersistedSession } from "./types/session";
 import type { LabModule, LabPage } from "./types/manifest";
-import type { SetupStatus } from "./types/setup";
+import type { LabSetup, SetupStatus } from "./types/setup";
 import { sanitizeTitle } from "./sanitizer";
+import { LabSetups } from "./LabSetups";
 
 type PageState =
   | { status: "loading" }
@@ -84,9 +85,11 @@ type GuidanceRequest = {
 type GuidanceState = GuidanceRequest | { phase: "notice"; message: string };
 
 type InteractiveLabsContextValue = {
-  launch: (catalogRef: string, labPath: string, trigger: HTMLElement, requestedPageURL?: string) => Promise<void>;
+  launch: (catalogRef: string, labPath: string, trigger: HTMLElement, requestedPageURL?: string, resumeSetup?: boolean) => Promise<void>;
+  setupsVersion: number;
   loadingCatalogRef?: string;
   launchError?: string;
+  setupError?: { catalogRef: string; message: string };
   defaultNamespace?: string;
 };
 
@@ -201,12 +204,16 @@ const SETUP_POLL_INTERVAL_MS = 3000;
 
 const pollSetupUntilReady = async (catalogRef: string, signal: AbortSignal): Promise<SetupStatus> => {
   while (!signal.aborted) {
-    const status = await getSetupStatus(catalogRef);
+    const status = await getSetupStatus(catalogRef, signal);
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
     if (status.spaceRequests.status === "failed") {
       throw new Error("Namespace provisioning failed.");
     }
     if (status.helm.status === "failed") {
       throw new Error(status.helm.message || "Lab setup failed.");
+    }
+    if (status.retrySetup && status.helm.status === "pending") {
+      await setupLab(catalogRef, signal); // Fresh user token; GET status never mutates the lab.
     }
     if (status.spaceRequests.status === "ready" && status.helm.status === "deployed") {
       return status;
@@ -237,6 +244,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const [activePanel, setActivePanel] = React.useState<ActivePanel | null>(null);
   const [loadingCatalogRef, setLoadingCatalogRef] = React.useState<string>();
   const [launchError, setLaunchError] = React.useState<string>();
+  const [setupsVersion, setSetupsVersion] = React.useState(0);
   const [setupState, setSetupState] = React.useState<SetupState>();
   const [renderState, setRenderState] = React.useState<RenderState>({ status: "loading" });
   const [renderRetry, setRenderRetry] = React.useState(0);
@@ -250,6 +258,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const guidanceControllerRef = React.useRef<AbortController>();
   const guidanceAnimationKeyRef = React.useRef(0);
   const launchAbortRef = React.useRef<AbortController>();
+  const inFlightCatalogRef = React.useRef<string>();
   const mountedRef = React.useRef(true);
   const [guidance, setGuidance] = React.useState<GuidanceState>();
   const [navigationWarning, setNavigationWarning] = React.useState<string>();
@@ -272,13 +281,26 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
     labPath: string,
     trigger: HTMLElement,
     requestedPageURL?: string,
+    resumeSetup = false,
   ): Promise<void> => {
+    if (!mountedRef.current) return;
     launchTriggerRef.current = trigger;
+    if (inFlightCatalogRef.current === catalogRef && !launchAbortRef.current?.signal.aborted) {
+      setModuleSelectOpen(false);
+      setActivePanel((current) => {
+        if (!current || current.catalogRef !== catalogRef) return current;
+        const panel = { ...current, panelMode: "open" as const };
+        saveSession(panel);
+        return panel;
+      });
+      return;
+    }
     launchAbortRef.current?.abort();
     setModuleTitles({});
     setModuleSelectOpen(false);
     const controller = new AbortController();
     launchAbortRef.current = controller;
+    inFlightCatalogRef.current = catalogRef;
     const isCurrentLaunch = (): boolean => mountedRef.current && launchAbortRef.current === controller && !controller.signal.aborted;
     let openedPanel = false;
     setActivePanel(null);
@@ -306,7 +328,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       pendingFragmentRef.current = requestedPageURL
         ? new URL(requestedPageURL, window.location.origin).hash.slice(1) || undefined
         : undefined;
-      const needsSetup = bundle.runtimeContext.helmChartAvailable;
+      const needsSetup = bundle.runtimeContext.helmChartAvailable || resumeSetup;
       const panel: ActivePanel = {
         catalogRef,
         title: bundle.manifest.metadata.title,
@@ -323,7 +345,11 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       saveSession(panel);
 
       if (needsSetup) {
-        await setupLab(catalogRef, controller.signal);
+        if (!resumeSetup) {
+          await setupLab(catalogRef, controller.signal);
+          if (!isCurrentLaunch()) return;
+          setSetupsVersion((version) => version + 1);
+        }
         const finalStatus = await pollSetupUntilReady(catalogRef, controller.signal);
         if (!isCurrentLaunch()) return;
         if (finalStatus.attributes) {
@@ -340,7 +366,11 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       if (openedPanel) setSetupState({ status: "error", message });
       else setLaunchError(message);
     } finally {
-      if (isCurrentLaunch()) setLoadingCatalogRef(undefined);
+      if (launchAbortRef.current === controller) inFlightCatalogRef.current = undefined;
+      if (isCurrentLaunch()) {
+        setLoadingCatalogRef(undefined);
+        if (openedPanel) setSetupsVersion((version) => version + 1);
+      }
     }
   }, []);
 
@@ -373,10 +403,13 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const closePanel = React.useCallback(() => {
     setModuleSelectOpen(false);
     launchAbortRef.current?.abort();
+    inFlightCatalogRef.current = undefined;
     clearGuidance();
+    setLoadingCatalogRef(undefined);
+    if (setupState) setSetupsVersion((version) => version + 1);
     setSetupState(undefined);
     setActivePanel(null);
-  }, [clearGuidance]);
+  }, [clearGuidance, setupState]);
 
   const selectPage = React.useCallback((path: string): void => {
     setNavigationWarning(undefined);
@@ -651,341 +684,367 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   }, [renderState]);
 
   const value = React.useMemo(
-    () => ({ launch, loadingCatalogRef, launchError, defaultNamespace }),
-    [launch, launchError, loadingCatalogRef, defaultNamespace],
+    () => ({
+      launch, loadingCatalogRef, launchError, setupsVersion,
+      setupError: setupState?.status === "error" && activePanel ? { catalogRef: activePanel.catalogRef, message: setupState.message } : undefined,
+      defaultNamespace,
+    }),
+    [launch, launchError, loadingCatalogRef, setupsVersion, setupState, activePanel?.catalogRef, defaultNamespace],
   );
-  const spotlightRect = guidance?.phase === "spotlight" && guidance.target
-    ? guidance.target.getBoundingClientRect()
-    : undefined;
+const spotlightRect = guidance?.phase === "spotlight" && guidance.target
+  ? guidance.target.getBoundingClientRect()
+  : undefined;
 
-  return (
-    <InteractiveLabsContext.Provider value={value}>
-      {children}
-      {activePanel && (
-        <Drawer
-          className="pfext-lab-drawer"
-          isExpanded={isOpen}
-          position="end"
-          style={{ position: "fixed", inset: 0, zIndex: 1000, pointerEvents: "none" }}
-        >
-          <DrawerContent
-            panelContent={isOpen ? (
-              <DrawerPanelContent
-                id="interactive-labs-drawer-panel"
-                isResizable
-                minSize="20rem"
-                defaultSize="40%"
-                resizeAriaLabel="Resize lab drawer"
-                style={{ pointerEvents: "auto" }}
-              >
-                <div className="pfext-lab-panel-content">
-                  <DrawerHead>
-                    <div ref={drawerFocusRef} tabIndex={-1}>
-                      <Title headingLevel="h2" style={{ marginRight: "var(--pf-t--global--spacer--md)" }}>
-                        {activePanel.title}
-                      </Title>
-                      {!setupState && (
-                        <>
-                          <div className="pfext-lab-module-title">{activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}</div>
-                          <span aria-live="polite">Page {modulePageIndex + 1} of {activeModule?.pages.length ?? 0}</span>
-                        </>
-                      )}
-                    </div>
-                    <DrawerActions>
-                      <Button variant="plain" onClick={() => setPanelMode("minimized")} aria-label="Minimize lab">
-                        <WindowMinimizeIcon />
-                      </Button>
-                      <Button variant="plain" onClick={closePanel} aria-label="Close lab">
-                        <TimesIcon />
-                      </Button>
-                    </DrawerActions>
-                  </DrawerHead>
-                </div>
-                <DrawerPanelBody className="pfext-lab-panel-content__body">
-                  <div>
-                    {setupState?.status === "pending" && (
-                      <Alert variant="info" title="Setting up your lab environment..." isInline isLiveRegion>
-                        <Spinner size="md" aria-label="Setting up lab" className="pf-v5-u-mr-xs" />
-                        Lab pages will appear when setup finishes.
-                      </Alert>
-                    )}
-                    {setupState?.status === "error" && (
-                      <Alert variant="danger" title={setupState.message} isInline isLiveRegion />
-                    )}
+return (
+  <InteractiveLabsContext.Provider value={value}>
+    {children}
+    {activePanel && (
+      <Drawer
+        className="pfext-lab-drawer"
+        isExpanded={isOpen}
+        position="end"
+        style={{ position: "fixed", inset: 0, zIndex: 1000, pointerEvents: "none" }}
+      >
+        <DrawerContent
+          panelContent={isOpen ? (
+            <DrawerPanelContent
+              id="interactive-labs-drawer-panel"
+              isResizable
+              minSize="20rem"
+              defaultSize="40%"
+              resizeAriaLabel="Resize lab drawer"
+              style={{ pointerEvents: "auto" }}
+            >
+              <div className="pfext-lab-panel-content">
+                <DrawerHead>
+                  <div ref={drawerFocusRef} tabIndex={-1}>
+                    <Title headingLevel="h2" style={{ marginRight: "var(--pf-t--global--spacer--md)" }}>
+                      {activePanel.title}
+                    </Title>
                     {!setupState && (
                       <>
-                        <Title headingLevel="h2">
-                          <span dangerouslySetInnerHTML={{
-                            __html: renderState.status === "success"
-                              ? sanitizeTitle(renderState.result.title ?? activePanel.currentPagePath)
-                              : ""
-                          }} />
-                        </Title>
-                        {navigationWarning && <Alert variant="warning" title={navigationWarning} isInline />}
-                        {renderState.status === "loading" && <Spinner aria-label="Loading lab page" />}
-                        {renderState.status === "error" && (
-                          <>
-                            <Alert variant="danger" title={renderState.message} isInline isLiveRegion />
-                            <Button variant="link" onClick={() => setRenderRetry((count) => count + 1)}>Retry</Button>
-                          </>
-                        )}
-                        {renderState.status === "success" && (
-                          <>
-                            {renderState.result.warnings.map((warning, index) => (
-                              <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
-                            ))}
-                            <div
-                              ref={renderedContentRef}
-                              className="interactive-labs-content doc"
-                              onClick={handleRenderedLink}
-                              dangerouslySetInnerHTML={{ __html: renderState.result.html }}
-                            />
-                          </>
-                        )}
+                        <div className="pfext-lab-module-title">{activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}</div>
+                        <span aria-live="polite">Page {modulePageIndex + 1} of {activeModule?.pages.length ?? 0}</span>
                       </>
                     )}
                   </div>
-                </DrawerPanelBody>
-                <div className="pfext-lab-footer">
-                  <ActionList>
-                    <ActionListGroup className="pfext-lab-footer__actions">
-                      <ActionListItem>
-                        <Button
-                          variant="primary"
-                          isDisabled={!!setupState || currentPageIndex < 0 || currentPageIndex >= pagePaths.length - 1}
-                          onClick={() => selectPage(pagePaths[currentPageIndex + 1])}
-                        >
-                          Next
-                        </Button>
-                      </ActionListItem>
-                      <ActionListItem>
-                        <Button
-                          variant="secondary"
-                          isDisabled={!!setupState || currentPageIndex <= 0}
-                          onClick={() => selectPage(pagePaths[currentPageIndex - 1])}
-                        >
-                          Back
-                        </Button>
-                      </ActionListItem>
-                      {activePanel.modules.length > 1 && (
-                        <ActionListItem className="pfext-lab-footer__module">
-                          <Select
-                            isOpen={!setupState && moduleSelectOpen}
-                            selected={setupState ? undefined : activeModule?.id}
-                            onOpenChange={setModuleSelectOpen}
-                            shouldFocusToggleOnSelect
-                            onSelect={(_event, id) => {
-                              const firstPage = activePanel.modules.find((module) => module.id === id)?.pages[0];
-                              if (firstPage) selectPage(firstPage.path);
-                              setModuleSelectOpen(false);
-                            }}
-                            toggle={(toggleRef) => (
-                              <MenuToggle
-                                ref={toggleRef}
-                                className="pfext-lab-module-toggle"
-                                aria-label={setupState ? "Module" : `Module: ${activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}`}
-                                title={setupState ? undefined : activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}
-                                aria-haspopup="listbox"
-                                isExpanded={!setupState && moduleSelectOpen}
-                                isDisabled={!!setupState}
-                                onClick={() => setModuleSelectOpen((open) => !open)}
-                              >
-                                {setupState ? "Module" : activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}
-                              </MenuToggle>
-                            )}
-                          >
-                            <SelectList>
-                              {!setupState && activePanel.modules.map((module) => (
-                                <SelectOption key={module.id} value={module.id}>
-                                  {moduleTitles[module.id] ?? module.id}
-                                </SelectOption>
-                              ))}
-                            </SelectList>
-                          </Select>
-                        </ActionListItem>
+                  <DrawerActions>
+                    <Button variant="plain" onClick={() => setPanelMode("minimized")} aria-label="Minimize lab">
+                      <WindowMinimizeIcon />
+                    </Button>
+                    <Button variant="plain" onClick={closePanel} aria-label="Close lab">
+                      <TimesIcon />
+                    </Button>
+                  </DrawerActions>
+                </DrawerHead>
+              </div>
+              <DrawerPanelBody className="pfext-lab-panel-content__body">
+                <div>
+                  {setupState?.status === "pending" && (
+                    <Alert variant="info" title="Setting up your lab environment..." isInline isLiveRegion>
+                      <Spinner size="md" aria-label="Setting up lab" className="pf-v5-u-mr-xs" />
+                      Lab pages will appear when setup finishes.
+                    </Alert>
+                  )}
+                  {setupState?.status === "error" && (
+                    <Alert variant="danger" title={setupState.message} isInline isLiveRegion />
+                  )}
+                  {!setupState && (
+                    <>
+                      <Title headingLevel="h2">
+                        <span dangerouslySetInnerHTML={{
+                          __html: renderState.status === "success"
+                            ? sanitizeTitle(renderState.result.title ?? activePanel.currentPagePath)
+                            : ""
+                        }} />
+                      </Title>
+                      {navigationWarning && <Alert variant="warning" title={navigationWarning} isInline />}
+                      {renderState.status === "loading" && <Spinner aria-label="Loading lab page" />}
+                      {renderState.status === "error" && (
+                        <>
+                          <Alert variant="danger" title={renderState.message} isInline isLiveRegion />
+                          <Button variant="link" onClick={() => setRenderRetry((count) => count + 1)}>Retry</Button>
+                        </>
                       )}
-                    </ActionListGroup>
-                  </ActionList>
+                      {renderState.status === "success" && (
+                        <>
+                          {renderState.result.warnings.map((warning, index) => (
+                            <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
+                          ))}
+                          <div
+                            ref={renderedContentRef}
+                            className="interactive-labs-content doc"
+                            onClick={handleRenderedLink}
+                            dangerouslySetInnerHTML={{ __html: renderState.result.html }}
+                          />
+                        </>
+                      )}
+                    </>
+                  )}
                 </div>
-              </DrawerPanelContent>
-            ) : null}
-          >
-            <div />
-          </DrawerContent>
-        </Drawer>
-      )}
-      {guidance?.phase === "spotlight" && guidance.target && spotlightRect && (
-        <div
-          key={guidance.animationKey}
-          aria-hidden="true"
-          className="interactive-labs-guidance-ring"
-          style={{
-            left: spotlightRect.left,
-            top: spotlightRect.top,
-            width: spotlightRect.width,
-            height: spotlightRect.height,
-          }}
-        />
-      )}
-      {guidance && (
-        <p className="interactive-labs-guidance-status" role="status">
-          {guidance.phase === "notice" ? guidance.message : GUIDANCE_HIGHLIGHTED}
-        </p>
-      )}
-      {activePanel?.panelMode === "minimized" && (
-        <Button
-          ref={restoreFocusRef}
-          onClick={() => setPanelMode("open")}
-          aria-label="Restore lab"
-          style={{
-            position: "fixed",
-            insetInlineEnd: 0,
-            top: "50%",
-            zIndex: 1000,
-            width: "1.5rem",
-            minWidth: 0,
-            height: "5rem",
-            padding: 0,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            borderRadius: "5rem 0 0 5rem",
-            transform: "translateY(-50%)",
-          }}
+              </DrawerPanelBody>
+              <div className="pfext-lab-footer">
+                <ActionList>
+                  <ActionListGroup className="pfext-lab-footer__actions">
+                    <ActionListItem>
+                      <Button
+                        variant="primary"
+                        isDisabled={!!setupState || currentPageIndex < 0 || currentPageIndex >= pagePaths.length - 1}
+                        onClick={() => selectPage(pagePaths[currentPageIndex + 1])}
+                      >
+                        Next
+                      </Button>
+                    </ActionListItem>
+                    <ActionListItem>
+                      <Button
+                        variant="secondary"
+                        isDisabled={!!setupState || currentPageIndex <= 0}
+                        onClick={() => selectPage(pagePaths[currentPageIndex - 1])}
+                      >
+                        Back
+                      </Button>
+                    </ActionListItem>
+                    {activePanel.modules.length > 1 && (
+                      <ActionListItem className="pfext-lab-footer__module">
+                        <Select
+                          isOpen={!setupState && moduleSelectOpen}
+                          selected={setupState ? undefined : activeModule?.id}
+                          onOpenChange={setModuleSelectOpen}
+                          shouldFocusToggleOnSelect
+                          onSelect={(_event, id) => {
+                            const firstPage = activePanel.modules.find((module) => module.id === id)?.pages[0];
+                            if (firstPage) selectPage(firstPage.path);
+                            setModuleSelectOpen(false);
+                          }}
+                          toggle={(toggleRef) => (
+                            <MenuToggle
+                              ref={toggleRef}
+                              className="pfext-lab-module-toggle"
+                              aria-label={setupState ? "Module" : `Module: ${activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}`}
+                              title={setupState ? undefined : activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}
+                              aria-haspopup="listbox"
+                              isExpanded={!setupState && moduleSelectOpen}
+                              isDisabled={!!setupState}
+                              onClick={() => setModuleSelectOpen((open) => !open)}
+                            >
+                              {setupState ? "Module" : activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}
+                            </MenuToggle>
+                          )}
+                        >
+                          <SelectList>
+                            {!setupState && activePanel.modules.map((module) => (
+                              <SelectOption key={module.id} value={module.id}>
+                                {moduleTitles[module.id] ?? module.id}
+                              </SelectOption>
+                            ))}
+                          </SelectList>
+                        </Select>
+                      </ActionListItem>
+                    )}
+                  </ActionListGroup>
+                </ActionList>
+              </div>
+            </DrawerPanelContent>
+          ) : null}
         >
-          <svg aria-hidden="true" fill="currentColor" viewBox="0 0 384 512" width="1em" height="1em">
-            <path d="M336 0H48C21.49 0 0 21.49 0 48v464l192-112 192 112V48c0-26.51-21.49-48-48-48zm0 428.43l-144-84-144 84V54a6 6 0 0 1 6-6h276c3.314 0 6 2.683 6 5.996V428.43z" />
-          </svg>
-        </Button>
-      )}
-    </InteractiveLabsContext.Provider>
-  );
+          <div />
+        </DrawerContent>
+      </Drawer>
+    )}
+    {guidance?.phase === "spotlight" && guidance.target && spotlightRect && (
+      <div
+        key={guidance.animationKey}
+        aria-hidden="true"
+        className="interactive-labs-guidance-ring"
+        style={{
+          left: spotlightRect.left,
+          top: spotlightRect.top,
+          width: spotlightRect.width,
+          height: spotlightRect.height,
+        }}
+      />
+    )}
+    {guidance && (
+      <p className="interactive-labs-guidance-status" role="status">
+        {guidance.phase === "notice" ? guidance.message : GUIDANCE_HIGHLIGHTED}
+      </p>
+    )}
+    {activePanel?.panelMode === "minimized" && (
+      <Button
+        ref={restoreFocusRef}
+        onClick={() => setPanelMode("open")}
+        aria-label="Restore lab"
+        style={{
+          position: "fixed",
+          insetInlineEnd: 0,
+          top: "50%",
+          zIndex: 1000,
+          width: "1.5rem",
+          minWidth: 0,
+          height: "5rem",
+          padding: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          borderRadius: "5rem 0 0 5rem",
+          transform: "translateY(-50%)",
+        }}
+      >
+        <svg aria-hidden="true" fill="currentColor" viewBox="0 0 384 512" width="1em" height="1em">
+          <path d="M336 0H48C21.49 0 0 21.49 0 48v464l192-112 192 112V48c0-26.51-21.49-48-48-48zm0 428.43l-144-84-144 84V54a6 6 0 0 1 6-6h276c3.314 0 6 2.683 6 5.996V428.43z" />
+        </svg>
+      </Button>
+    )}
+  </InteractiveLabsContext.Provider>
+);
 };
 
 const useInteractiveLabs = (): InteractiveLabsContextValue | undefined =>
   React.useContext(InteractiveLabsContext);
 
-const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
+const LabItem: React.FC<{
+  catalogRef: string;
+  item?: CatalogEntry;
+  setup?: LabSetup;
+  disabled: boolean;
+  teardown?: React.ReactNode;
+}> = ({ catalogRef, item, setup, disabled, teardown }) => {
   const [state, setState] = React.useState<RenderState>({ status: "loading" });
   const [isExpanded, setIsExpanded] = React.useState(false);
   const [linkWarning, setLinkWarning] = React.useState<string>();
   const interactiveLabs = useInteractiveLabs();
+  const title = item?.title ?? setup?.release?.name ?? catalogRef;
   const defaultNamespace = interactiveLabs?.defaultNamespace;
-  const resourceRoot = `${PROXY_BASE}/api/v1alpha1/labs/${item.catalogRef}/resources/${item.labPath === "." ? "" : `${item.labPath.split("/").map(encodeURIComponent).join("/")}/`}`;
-  const sourceURL = `${resourceRoot}lab.yaml`;
-  const itemId = `lab-${item.catalogRef}`;
-  const descriptionId = `${itemId}-description`;
+  const resourceRoot = item ? `${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/resources/${item.labPath === "." ? "" : `${item.labPath.split("/").map(encodeURIComponent).join("/")}/`}` : "";
+const sourceURL = `${resourceRoot}lab.yaml`;
+const itemId = `lab-${catalogRef}`;
+const descriptionId = `${itemId}-description`;
+const setupPending = setup?.status === "pending" && !disabled;
+const actionDisabled = !interactiveLabs || disabled || (!setup && interactiveLabs?.loadingCatalogRef === catalogRef);
 
-  const handleLink = React.useCallback((event: React.MouseEvent<HTMLDivElement>): void => {
-    if (event.defaultPrevented || event.button !== 0) return;
-    const link = (event.target as Element).closest("a[href]") as HTMLAnchorElement | null;
-    const href = link?.getAttribute("href");
-    if (!link || !href) return;
-    let target: URL;
-    try {
-      target = new URL(href, new URL(sourceURL, window.location.origin));
-    } catch {
-      event.preventDefault();
-      setLinkWarning(LINK_WARNING);
-      return;
-    }
-    const pageRoot = `${resourceRoot}modules/`;
-    if (target.origin === window.location.origin && target.pathname.startsWith(pageRoot)) {
-      event.preventDefault();
-      void interactiveLabs?.launch(item.catalogRef, item.labPath, link, target.href);
-      return;
-    }
-    if ((target.protocol === "http:" || target.protocol === "https:") && target.origin !== window.location.origin) {
-      event.preventDefault();
-      window.open(target.href, "_blank", "noopener,noreferrer");
-      return;
-    }
-    if (target.origin === window.location.origin && !target.pathname.startsWith(PROXY_BASE)) return;
+const handleLink = React.useCallback((event: React.MouseEvent<HTMLDivElement>): void => {
+  if (event.defaultPrevented || event.button !== 0 || !item) return;
+  const link = (event.target as Element).closest("a[href]") as HTMLAnchorElement | null;
+  const href = link?.getAttribute("href");
+  if (!link || !href) return;
+  let target: URL;
+  try {
+    target = new URL(href, new URL(sourceURL, window.location.origin));
+  } catch {
     event.preventDefault();
     setLinkWarning(LINK_WARNING);
-  }, [interactiveLabs, item.catalogRef, item.labPath, resourceRoot, sourceURL]);
-
-  React.useEffect(() => {
-    if (!item.description) return undefined;
-    const controller = new AbortController();
-    void renderAsciiDoc({
-      source: item.description,
-      sourceURL,
-      defaultNamespace,
-      attributes: {},
-      loadResource: fetchResourceText,
-      signal: controller.signal,
-    }).then(
-      (result) => {
-        if (!controller.signal.aborted) setState({ status: "success", result });
-      },
-      (error: unknown) => {
-        if (!controller.signal.aborted) {
-          setState({ status: "error", message: (error as Error).message || "Unable to render description." });
-        }
-      },
-    );
-    return () => controller.abort();
-  }, [item, defaultNamespace]);
-
-  const template = document.createElement("template");
-  if (state.status === "success") template.innerHTML = state.result.html;
-  const paragraph = template.content.querySelector("div.paragraph > p, p");
-  const preview = paragraph?.parentElement?.matches("div.paragraph") ? paragraph.parentElement : paragraph;
-  const previewHTML = preview?.outerHTML;
-  let parent = preview?.parentElement;
-  preview?.remove();
-  while (parent && !parent.innerHTML.trim()) {
-    const next = parent.parentElement;
-    parent.remove();
-    parent = next;
+    return;
   }
-  const remainingHTML = template.innerHTML.trim();
+  const pageRoot = `${resourceRoot}modules/`;
+  if (target.origin === window.location.origin && target.pathname.startsWith(pageRoot)) {
+    event.preventDefault();
+    if (actionDisabled) {
+      setLinkWarning("Lab cannot be opened until its setup is available.");
+      return;
+    }
+    void interactiveLabs?.launch(catalogRef, item.labPath, link, target.href, !!setup);
+    return;
+  }
+  if ((target.protocol === "http:" || target.protocol === "https:") && target.origin !== window.location.origin) {
+    event.preventDefault();
+    window.open(target.href, "_blank", "noopener,noreferrer");
+    return;
+  }
+  if (target.origin === window.location.origin && !target.pathname.startsWith(PROXY_BASE)) return;
+  event.preventDefault();
+  setLinkWarning(LINK_WARNING);
+}, [actionDisabled, interactiveLabs, catalogRef, item, resourceRoot, setup, sourceURL]);
 
-  return (
-    <DataListItem aria-labelledby={itemId} isExpanded={isExpanded}>
-      <DataListItemRow style={{ paddingBlockStart: "var(--pf-t--global--spacer--md)" }}>
-        <DataListItemCells dataListCells={[
-          <DataListCell key="name" width={5}>
-            <Title headingLevel="h2" size="lg" id={itemId}>{item.title}</Title>
-            {linkWarning && <Alert variant="warning" title={linkWarning} isInline />}
-            {item.description && state.status === "loading" && <Spinner aria-label={`Loading description for ${item.title}`} />}
-            {state.status === "error" && <Alert variant="warning" title={state.message} isInline />}
-            {state.status === "success" && state.result.warnings.map((warning, index) => (
-              <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
-            ))}
-            {previewHTML && (
-              <div className="interactive-labs-content doc catalog-description" onClick={handleLink} dangerouslySetInnerHTML={{ __html: previewHTML }} />
-            )}
-            {remainingHTML && (
-              <Button
-                variant="link"
-                aria-controls={descriptionId}
-                aria-expanded={isExpanded}
-                onClick={() => setIsExpanded((expanded) => !expanded)}
-              >
-                {isExpanded ? "Show less" : "Show more…"}
-              </Button>
-            )}
-          </DataListCell>,
-        ]} />
-        <DataListAction id={`${itemId}-actions`} aria-labelledby={itemId} aria-label={`Actions for ${item.title}`}>
-          <Button
-            isLoading={interactiveLabs?.loadingCatalogRef === item.catalogRef}
-            isDisabled={!interactiveLabs}
-            onClick={(event) => void interactiveLabs?.launch(item.catalogRef, item.labPath, event.currentTarget)}
-          >
-            Launch
-          </Button>
-        </DataListAction>
-      </DataListItemRow>
-      {remainingHTML && (
-        <DataListContent id={descriptionId} aria-label={`Description for ${item.title}`} isHidden={!isExpanded}>
-          <div className="interactive-labs-content doc catalog-description" onClick={handleLink} dangerouslySetInnerHTML={{ __html: remainingHTML }} />
-        </DataListContent>
-      )}
-    </DataListItem>
+React.useEffect(() => {
+  if (!item?.description) return undefined;
+  const controller = new AbortController();
+  void renderAsciiDoc({
+    source: item.description,
+    sourceURL,
+    defaultNamespace,
+    attributes: {},
+    loadResource: fetchResourceText,
+    signal: controller.signal,
+  }).then(
+    (result) => {
+      if (!controller.signal.aborted) setState({ status: "success", result });
+    },
+    (error: unknown) => {
+      if (!controller.signal.aborted) {
+        setState({ status: "error", message: (error as Error).message || "Unable to render description." });
+      }
+    },
   );
+  return () => controller.abort();
+}, [item, defaultNamespace]);
+
+const template = document.createElement("template");
+if (item?.description && state.status === "success") template.innerHTML = state.result.html;
+const paragraph = template.content.querySelector("div.paragraph > p, p");
+const preview = paragraph?.parentElement?.matches("div.paragraph") ? paragraph.parentElement : paragraph;
+const previewHTML = preview?.outerHTML;
+let parent = preview?.parentElement;
+preview?.remove();
+while (parent && !parent.innerHTML.trim()) {
+  const next = parent.parentElement;
+  parent.remove();
+  parent = next;
+}
+const remainingHTML = template.innerHTML.trim();
+
+return (
+  <DataListItem aria-labelledby={itemId} isExpanded={isExpanded}>
+    <DataListItemRow style={{ paddingBlockStart: "var(--pf-t--global--spacer--md)" }}>
+      <DataListItemCells dataListCells={[
+        <DataListCell key="name" width={5}>
+          <Title headingLevel="h2" size="lg" id={itemId}>{title}</Title>
+          {!item && setup && <>
+            {setup.release && <p>Helm release: {setup.release.name}</p>}
+            <p>SpaceRequests: {setup.spaceRequests.join(', ') || 'none'}</p>
+          </>}
+          {item && linkWarning && <Alert variant="warning" title={linkWarning} isInline />}
+          {item?.description && state.status === "loading" && <Spinner aria-label={`Loading description for ${title}`} />}
+          {item?.description && state.status === "error" && <Alert variant="warning" title={state.message} isInline />}
+          {item?.description && state.status === "success" && state.result.warnings.map((warning, index) => (
+            <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
+          ))}
+          {previewHTML && (
+            <div className="interactive-labs-content doc catalog-description" onClick={handleLink} dangerouslySetInnerHTML={{ __html: previewHTML }} />
+          )}
+          {remainingHTML && (
+            <Button
+              variant="link"
+              aria-controls={descriptionId}
+              aria-expanded={isExpanded}
+              onClick={() => setIsExpanded((expanded) => !expanded)}
+            >
+              {isExpanded ? "Show less" : "Show more…"}
+            </Button>
+          )}
+        </DataListCell>,
+      ]} />
+      <DataListAction id={`${itemId}-actions`} aria-labelledby={itemId} aria-label={`Actions for ${title}`}>
+        <div className="pfext-lab-catalog-actions" style={{ display: "flex", flexDirection: "column", gap: "var(--pf-t--global--spacer--sm)" }}>
+          {item && <Button
+            isLoading={!disabled && (setupPending || interactiveLabs?.loadingCatalogRef === catalogRef)}
+            isDisabled={actionDisabled}
+            spinnerAriaLabel={setupPending ? "Lab setup pending" : "Loading lab"}
+            onClick={(event) => void interactiveLabs?.launch(catalogRef, item.labPath, event.currentTarget, undefined, !!setup)}
+          >
+            {setup ? "Open" : "Launch"}
+          </Button>}
+          {teardown}
+          {interactiveLabs?.setupError?.catalogRef === catalogRef && <p role="alert">{interactiveLabs.setupError.message}</p>}
+        </div>
+      </DataListAction>
+    </DataListItemRow>
+    {remainingHTML && (
+      <DataListContent id={descriptionId} aria-label={`Description for ${title}`} isHidden={!isExpanded}>
+        <div className="interactive-labs-content doc catalog-description" onClick={handleLink} dangerouslySetInnerHTML={{ __html: remainingHTML }} />
+      </DataListContent>
+    )}
+  </DataListItem>
+);
 };
 
 const InteractiveLabsPage: React.FC = () => {
@@ -996,10 +1055,10 @@ const InteractiveLabsPage: React.FC = () => {
   const filteredItems =
     state.status === "success"
       ? state.items.filter((item) =>
-          `${item.title} ${item.description ?? ""}`
-            .toLowerCase()
-            .includes(filter.toLowerCase()),
-        )
+        `${item.title} ${item.description ?? ""}`
+          .toLowerCase()
+          .includes(filter.toLowerCase()),
+      )
       : [];
 
   React.useEffect(() => {
@@ -1025,49 +1084,74 @@ const InteractiveLabsPage: React.FC = () => {
   return (
     <PageSection>
       <Title headingLevel="h1">Interactive Labs</Title>
-
-      {state.status === "loading" && <Spinner aria-label="Loading labs" />}
-
-      {state.status === "error" && (
-        <>
-          <Alert variant="danger" title={state.message} isInline isLiveRegion />
-          <Button variant="link" onClick={() => setRetry((count) => count + 1)}>
-            Retry
-          </Button>
-        </>
-      )}
-
-      {interactiveLabs?.launchError && (
-        <Alert variant="danger" title={interactiveLabs.launchError} isInline isLiveRegion />
-      )}
-      {state.status === "success" && state.items.length === 0 && (
-        <EmptyState titleText="No labs available">
-          <EmptyStateBody>No labs are currently configured.</EmptyStateBody>
-        </EmptyState>
-      )}
-
-      {state.status === "success" && state.items.length > 0 && (
-        <>
-          <div style={{ marginBlockStart: "var(--pf-t--global--spacer--lg)", marginBottom: "var(--pf-t--global--spacer--md)" }}>
-            <TextInput
-              aria-label="Filter labs"
-              type="search"
-              value={filter}
-              onChange={(_event, value) => setFilter(value)}
-              placeholder="Filter by name or description"
-            />
-          </div>
-          {filteredItems.length === 0 ? (
-            <EmptyState titleText="No labs match your filter.">
-              <EmptyStateBody>Try a different name or description.</EmptyStateBody>
-            </EmptyState>
-          ) : (
-            <DataList aria-label="Available labs" isCompact isPlain>
-              {filteredItems.map((item) => <CatalogItem key={item.catalogRef} item={item} />)}
-            </DataList>
-          )}
-        </>
-      )}
+      <LabSetups
+        catalog={state.status === "loading" ? undefined : state.status === "success" ? state.items : []}
+        refreshVersion={interactiveLabs?.setupsVersion}
+      >
+        {({ items, existingCatalogRefs, disabledFor, teardown }) => {
+          const catalog = state.status === "success" ? state.items : [];
+          const existing = new Set(existingCatalogRefs);
+          const orphans = existingCatalogRefs.filter((catalogRef) => !catalog.some((item) => item.catalogRef === catalogRef));
+          const visibleRefs = [
+            ...filteredItems.filter((item) => existing.has(item.catalogRef)).map((item) => item.catalogRef),
+            ...orphans,
+            ...filteredItems.filter((item) => !existing.has(item.catalogRef)).map((item) => item.catalogRef),
+          ];
+          return (
+            <>
+              {state.status === "loading" && <Spinner aria-label="Loading labs" />}
+              {state.status === "error" && (
+                <>
+                  <Alert variant="danger" title={state.message} isInline isLiveRegion />
+                  <Button variant="link" onClick={() => setRetry((count) => count + 1)}>
+                    Retry
+                  </Button>
+                </>
+              )}
+              {interactiveLabs?.launchError && (
+                <Alert variant="danger" title={interactiveLabs.launchError} isInline isLiveRegion />
+              )}
+              {state.status === "success" && state.items.length === 0 && visibleRefs.length === 0 && (
+                <EmptyState titleText="No labs available">
+                  <EmptyStateBody>No labs are currently configured.</EmptyStateBody>
+                </EmptyState>
+              )}
+              {state.status === "success" && state.items.length > 0 && (
+                <>
+                  <div style={{ marginBlockStart: "var(--pf-t--global--spacer--lg)", marginBottom: "var(--pf-t--global--spacer--md)" }}>
+                    <TextInput
+                      aria-label="Filter labs"
+                      type="search"
+                      value={filter}
+                      onChange={(_event, value) => setFilter(value)}
+                      placeholder="Filter by name or description"
+                    />
+                  </div>
+                  {visibleRefs.length === 0 && (
+                    <EmptyState titleText="No labs match your filter.">
+                      <EmptyStateBody>Try a different name or description.</EmptyStateBody>
+                    </EmptyState>
+                  )}
+                </>
+              )}
+              {visibleRefs.length > 0 && (
+                <DataList aria-label="Available labs" isCompact isPlain>
+                  {visibleRefs.map((catalogRef) => (
+                    <LabItem
+                      key={catalogRef}
+                      catalogRef={catalogRef}
+                      item={catalog.find((item) => item.catalogRef === catalogRef)}
+                      setup={items.find((item) => item.catalogRef === catalogRef)}
+                      disabled={disabledFor(catalogRef)}
+                      teardown={teardown(catalogRef)}
+                    />
+                  ))}
+                </DataList>
+              )}
+            </>
+          );
+        }}
+      </LabSetups>
     </PageSection>
   );
 };

@@ -60,18 +60,21 @@ func main() {
 	catalogEvents := inClusterCatalogEventPoster(log, serverConfig.Namespace)
 
 	cfg := handler.Config{
-		CatalogSource:        catalogSource,
-		BundleLoader:         cache.LoadBundle,
-		ResourceLoader:       cache.ReadResource,
-		CatalogLabOmitted:    catalogEvents,
-		Logger:               log,
-		Authenticate:         inClusterIdentityResolver(),
-		RuntimeAttributes:    inClusterRuntimeAttributes(log),
-		SetupClient:          inClusterSetupClient(log),
-		SpaceRequestTierName: "base1ns",
-		HelmManager:          inClusterHelmClient(log),
-		HelmTimeout:          helmTimeout(),
-		ClusterIngressDomain: inClusterIngressDomain(log),
+		CatalogSource:     catalogSource,
+		BundleLoader:      cache.LoadBundle,
+		ResourceLoader:    cache.ReadResource,
+		CatalogLabOmitted: catalogEvents,
+		Logger:            log,
+		Authenticate:      inClusterIdentityResolver(),
+		RuntimeAttributes: inClusterRuntimeAttributes(log),
+		SetupManager: setup.NewManager(setup.ManagerConfig{
+			SpaceRequests:        inClusterSetupClient(log),
+			TierName:             "base1ns",
+			Helm:                 inClusterHelmClient(log),
+			Coordinator:          inClusterOperationCoordinator(log, serverConfig.Namespace),
+			HelmTimeout:          helmTimeout(),
+			ClusterIngressDomain: inClusterIngressDomain(log),
+		}),
 	}
 
 	backend := &http.Server{
@@ -292,6 +295,20 @@ func newClusterCatalogSource(client kubernetes.Interface, namespace string) func
 	}
 }
 
+func inClusterOperationCoordinator(log *slog.Logger, namespace string) *setup.OperationCoordinator {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Warn("setup coordinator unavailable", "err", err)
+		return nil
+	}
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Warn("setup coordinator unavailable", "err", err)
+		return nil
+	}
+	return setup.NewOperationCoordinator(client, namespace)
+}
+
 func inClusterSetupClient(log *slog.Logger) *setup.SpaceRequestClient {
 	caPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	apiHost := fmt.Sprintf("https://%s", os.Getenv("KUBERNETES_SERVICE_HOST")+":"+os.Getenv("KUBERNETES_SERVICE_PORT"))
@@ -328,12 +345,7 @@ func inClusterHelmClient(log *slog.Logger) setup.HelmManager {
 		log.Warn("helm client unavailable: KUBERNETES_SERVICE_HOST not set")
 		return nil
 	}
-	client, err := tlsClientWithCA(caPath)
-	if err != nil {
-		log.Warn("helm client unavailable", "err", err)
-		return nil
-	}
-	return &setup.HelmClient{APIHost: apiHost, CAFile: caPath, HTTPClient: client, Logger: log}
+	return &setup.HelmClient{APIHost: apiHost, CAFile: caPath, Logger: log}
 }
 
 func helmTimeout() time.Duration {

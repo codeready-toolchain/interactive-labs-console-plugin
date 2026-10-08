@@ -17,7 +17,7 @@ Evidence: `proposal.md`, `stories.md`, repository source and tests, and OpenShif
 - **Content is data, not code.** Lab content comes only from catalog-approved Red Hat branches. STORY-10 service-account refresh replaces validated snapshots on an administrator-configured cadence with default concurrency four and a ten-minute per-source deadline; ticks skip while prior sweep remains active. `go-git` checkout always uses private staging, so deadline cancellation cannot corrupt published content; backend never invokes or packages a Git executable for any Git-related operation. It does not notify, reconcile, or migrate active content. Rendering navigates only `labPath/content` pages and loads same-repository supporting resources through backend-approved URLs. The current `type: manual` checkpoint proposal is provisional pending evidence and checkpoint rules.
 - **Explicit user intent.** Current chart setup provisions namespaces through SpaceRequests; existing-namespace selection remains a provisional proposal, not current UI. Selection/lifecycle policy remains open. Navigation must not claim progress completion.
 - **Small MVP.** One lab path and one optional repository-root prerequisite chart. Current chart setup creates SpaceRequests and runs a bounded asynchronous Helm worker; no user cancellation, automatic cleanup, or automated solving. Browser-local manual progress remains a provisional candidate, not a settled completion model.
-- **Recoverable failures.** Every lab-content, setup, render, route, and verification failure gives user an actionable manual next step.  Setup worker retries transient readiness checks, but no automatic Helm recovery, cleanup, or user cancellation exists.
+- **Recoverable failures.** Every lab-content, setup, render, route, and verification failure gives user an actionable next step. Setup worker retries transient readiness checks; an expired Lease allows verified no-release setup to restart using a fresh user token. Unsafe Helm states still need administrator intervention; no automatic cleanup or user cancellation exists.
 - **Accessible overlay.** Keyboard operation, focus management, semantic controls, and non-pointer spotlight dismissal are baseline requirements.
 
 ## Architecture / How It Works
@@ -46,9 +46,10 @@ Backend exposes catalog, bundle, resource, setup, and setup-status operations th
 | **List catalog** | None | Read admin-configured approved sources; derive `catalogRef`; return validated `lab.yaml` `metadata.title`, optional `description`, and normalized `labPath`. Unavailable, missing-manifest, or invalid labs are omitted; unsafe configuration is typed `configuration_error`. | Ordered valid catalog entries or typed error. |
 | **Load lab bundle** | Selected `catalogRef` | Resolve approved snapshot, validate `v1alpha1` manifest and modules; return `manifest`, `runtimeContext`, and ordered `modules: [{id, pages: [{path, url}]}]` with module-qualified paths and approved backend-relative URLs. No flat `pages` or checkpoint payload. | Validated bundle or typed error. |
 | **Read resource** | Selected `catalogRef` and repository-relative path | Authorize and constrain to approved repository snapshot, including module pages and same-repository includes/images. | Resource bytes with private cache headers or typed error. |
-| **Start/check setup** | Selected `catalogRef` | Create/reuse current-user SpaceRequests, start async Helm worker on POST, reconstruct status on GET. | `SetupStatus` (`POST /setup`, `GET /setup/status`) or typed error. |
+| **Start/check setup** | Selected `catalogRef` | Create/reuse verified dedicated current-user SpaceRequests, start async Helm worker on POST, reconstruct status on GET. | `SetupStatus` (`POST /setup`, `GET /setup/status`) or typed error. |
+| **List/tear down setup** | Selected server-listed `catalogRef` and confirmation generation | Discover current-user identity-marked SRs/releases without current catalog; serialize against setup, uninstall Helm, UID-conditionally delete dedicated SRs. | `SetupList` / `TeardownResult` or typed error. |
 
-Backend derives catalog repository, branch, lab path, Helm release identity, and authorization identity; client cannot override them. Forwarded user tokens must not be persisted or logged; current setup worker retains token in memory while running. No automatic Helm recovery, cleanup, user cancellation, durable lab-session state, automated completion verification, or section-solving API. A terminal Helm failure can leave resources behind and require manual intervention.
+Backend derives catalog repository, branch, lab path, Helm release identity, and authorization identity; client cannot override them. Forwarded user tokens must not be persisted or logged; current setup worker retains token in memory while running. No silent Helm reinstall/cleanup, user cancellation, durable lab-session state, automated completion verification, or section-solving API. A terminal Helm failure can leave resources behind and require manual intervention when verified cleanup is unsafe.
 
 ### Launch and setup flow
 
@@ -58,7 +59,7 @@ Backend derives catalog repository, branch, lab path, Helm release identity, and
 4. Backend derives stable Helm release identity from authenticated user, `catalogRef`, and namespace bindings. Client never supplies release identity.
 5. Labs without charts open first page of first module. Chart-backed launches POST setup, poll status, then open content when provisioned/deployed. Module title requests start in background after setup; selector shows literal IDs until plain-text first-page titles are available.
 
-**Current setup flow:** chart-backed launch POSTs setup without namespace bindings, then polls setup status while SpaceRequests provision and worker installs Helm. UI shows progress and opens content only when ready/deployed; failures surface to user. Closing panel does not cancel worker. Worker may be lost on process restart; re-launch explicitly starts setup again. [Lab setup design](../../docs/lab-setup-design.md) documents this flow.
+**Current setup flow:** chart-backed launch POSTs setup without namespace bindings, then polls setup status while SpaceRequests provision and worker installs Helm. UI shows progress and opens content only when ready/deployed; failures surface to user. Closing panel does not cancel worker. Worker may be lost on process restart; its renewable reservation becomes eligible for best-effort takeover 200 seconds after last renewal. With no Helm release, a new authenticated POST resumes setup from verified SRs; a safe interrupted pending install needs explicitly confirmed teardown before relaunch. [Lab setup design](../../docs/lab-setup-design.md) documents this flow.
 
 ### Content, routes, and spotlight flow
 
@@ -138,7 +139,7 @@ Local storage key must include lab identity and configured branch. On manifest i
 
 ### Current asynchronous setup limits
 
-Current setup already uses a background worker and status polling; it retains forwarded token in memory for worker lifetime, not in persisted storage. Helm release and SpaceRequest state support status reconstruction; a process restart loses worker and requires explicit re-launch. In-memory worker guard is not cross-replica coordination. Durable/cross-replica locking and explicit recovery remain future work; see [lab setup design](../../docs/lab-setup-design.md).
+Current setup uses a background worker and status polling; forwarded token stays only in memory for worker lifetime. Setup and explicit teardown share a cluster-visible Lease reservation per user and `catalogRef`; different labs remain independent. Holders renew every 20 seconds; a 200-second lapse permits atomic best-effort takeover with resource rechecks, not guaranteed fencing of in-flight Helm work. Interrupted teardown reports unknown after expiry and requires fresh confirmation for any remaining verified resources. No durable execution journal exists. Teardown inventory is catalog-independent; chart files may be shared, installed releases and SRs never are. See [lab setup design](../../docs/lab-setup-design.md).
 
 ## Implementation Plan
 
@@ -176,7 +177,7 @@ Current setup already uses a background worker and status polling; it retains fo
 
 - **Lab author validation tool.** Validate lab content, manifest, chart `values.schema.json` namespace annotations, and Helm chart before publication.
 - **Verification and solver model.** Decide evidence, checkpoint, automated-verification, and section-solver rules before adding non-manual checkpoint types.
-- **Durable setup recovery.** Cross-replica coordination, durable operation/recovery semantics, and cleanup remain future work; async setup and status polling already exist.
+- **Full setup recovery.** Best-effort reservation takeover and explicitly confirmed safe cleanup exist; unattended rollback of unsafe Helm state and durable execution/recovery journals remain deferred.
 - **Upstream-content lifecycle.** Add revision visibility, update notification, migration/reconciliation, and rollback behavior for branch-delivered lab content.
 - **Offline/change-controlled delivery.** Add digest-published lab content for disconnected or tightly governed clusters.
 
@@ -198,13 +199,13 @@ _Considered and rejected: Option B (adds privileged identity and impersonation r
 
 A timed-out or failed Helm operation can leave resources behind. A client retry or cleanup request cannot be treated as harmless without a chart-specific recovery contract.
 
-### Option C: No automatic retry in MVP
-- **Pro:** Avoids accidental duplicate setup, hidden cleanup, and unsafe recovery assumptions.
-- **Con:** Every terminal setup error needs user or administrator intervention before a new request.
+### Original Option C: No automatic retry in MVP (superseded for no-release crash recovery)
+- **Pro:** Avoided accidental duplicate setup, hidden cleanup, and unsafe recovery assumptions.
+- **Con:** Backend restart left users waiting forever even when no Helm release existed.
 
-**Decision:** Option C — MVP never retries, cleans up, or recovers Helm automatically. User or administrator diagnoses and remediates the error; any later explicit setup request uses a fresh token and backend release-state checks.
+**Updated decision:** Best-effort Lease renewal/takeover replaces indefinite blocking after restart. Browser retries setup with fresh token only when no Helm release exists; an interrupted safe `pending-install` release can be explicitly torn down after live identity/cleanup checks, then relaunched. No silent uninstall, blind Helm reinstall, or guaranteed fencing; unsafe states still require administrator recovery.
 
-_Considered and rejected: Option A (would imply productized recovery policy before chart lifecycle is defined), Option B (can compound partial installs and hides cleanup responsibility.)_
+_Original rejection of unconditional automatic Helm retry and hidden cleanup still applies; bounded no-release resume and confirmed safe cleanup now cover ordinary restarts._
 
 ## ✔ Q3: Rendered-content trust and sanitization
 

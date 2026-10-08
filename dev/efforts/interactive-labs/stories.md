@@ -181,6 +181,21 @@ Administrators should not wait for the periodic refresh after creating, updating
 
 **Dependencies:** STORY-10.
 
+## ☑ STORY-13: Add the ability to tear down the lab
+
+Users need to clean up lab setups so they can try other labs without exhausting namespace quota.
+
+**Goal:** Let users explicitly tear down their own lab setup, independently of the current catalog.
+
+**Acceptance criteria:**
+- User can find and explicitly tear down their own lab setup, even after its catalog entry is removed.
+- Teardown uninstalls that lab's Helm release and deletes its dedicated SpaceRequests. Other labs stay intact, even when they use chart files from the same repository.
+- Backend identifies targets and uses the current user's permissions; browser cannot supply arbitrary resource names or namespaces.
+- Closing or resetting the drawer never triggers teardown. Failure gives the user a clear error and recovery path.
+- Setup/teardown reservations renew every 20 seconds and admit best-effort takeover after 200 seconds without renewal; a lost setup with no release resumes only with a fresh authenticated request, and an interrupted safe `pending-install` release requires confirmed plugin teardown before relaunch. An expired teardown receipt reports unknown, not success. Lease expiry cannot fence in-flight Helm work.
+
+**Implementation dependency:** SR naming is handled separately and must provide dedicated SR sets. Unmarked or foreign SRs are never adopted; rollout must wait for dedicated naming and stop old uncoordinated workers.
+
 ## ☑ STORY-14: Organize lab pages into modules
 
 Long labs need meaningful module boundaries without treating page visits as evidence of completion.
