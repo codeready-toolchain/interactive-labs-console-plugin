@@ -11,7 +11,7 @@ import (
 // catalogRef already encodes repository, branch, lab path, and attribute
 // overrides, so including it prevents collisions across distinct repositories.
 // The result is "il-" followed by a truncated hex SHA-256 digest.
-func HelmReleaseName(subject, catalogRef string, bindings []NamespaceBinding) string {
+func HelmReleaseName(subject, catalogRef string, bindings []SchemaBinding) string {
 	keys := make([]string, len(bindings))
 	for i, b := range bindings {
 		keys[i] = b.Key

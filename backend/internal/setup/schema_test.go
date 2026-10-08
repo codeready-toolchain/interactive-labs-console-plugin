@@ -39,17 +39,19 @@ func TestParseSchemaBindings(t *testing.T) {
 
 		bindings, err := ParseSchemaBindings(schema)
 		require.NoError(t, err)
-		require.Len(t, bindings.Namespaces, 1)
-		assert.Equal(t, "gitea", bindings.Namespaces[0].Key)
-		assert.Equal(t, "namespaces.gitea", bindings.Namespaces[0].Path)
+		nsBindings := BindingsByKind(bindings, KindNamespaceName)
+		require.Len(t, nsBindings, 1)
+		assert.Equal(t, "gitea", nsBindings[0].Key)
+		assert.Equal(t, "namespaces.gitea", nsBindings[0].Path)
 
-		require.Len(t, bindings.Passwords, 2)
-		sort.Slice(bindings.Passwords, func(i, j int) bool { return bindings.Passwords[i].Key < bindings.Passwords[j].Key })
-		assert.Equal(t, "giteaAdmin", bindings.Passwords[0].Key)
-		assert.Equal(t, "passwords.giteaAdmin", bindings.Passwords[0].Path)
-		assert.Equal(t, KindGeneratedPassword, bindings.Passwords[0].Kind)
-		assert.Equal(t, "postgres", bindings.Passwords[1].Key)
-		assert.Equal(t, "passwords.postgres", bindings.Passwords[1].Path)
+		pwBindings := BindingsByKind(bindings, KindGeneratedPassword)
+		require.Len(t, pwBindings, 2)
+		sort.Slice(pwBindings, func(i, j int) bool { return pwBindings[i].Key < pwBindings[j].Key })
+		assert.Equal(t, "giteaAdmin", pwBindings[0].Key)
+		assert.Equal(t, "passwords.giteaAdmin", pwBindings[0].Path)
+		assert.Equal(t, KindGeneratedPassword, pwBindings[0].Kind)
+		assert.Equal(t, "postgres", pwBindings[1].Key)
+		assert.Equal(t, "passwords.postgres", pwBindings[1].Path)
 	})
 
 	t.Run("with root URL", func(t *testing.T) {
@@ -78,12 +80,14 @@ func TestParseSchemaBindings(t *testing.T) {
 
 		bindings, err := ParseSchemaBindings(schema)
 		require.NoError(t, err)
-		require.Len(t, bindings.Namespaces, 1)
-		require.Len(t, bindings.RootURLs, 1)
-		assert.Equal(t, "rootUrl", bindings.RootURLs[0].Key)
-		assert.Equal(t, "gitea.rootUrl", bindings.RootURLs[0].Path)
-		assert.Equal(t, "gitea", bindings.RootURLs[0].RouteName)
-		assert.Equal(t, "gitea", bindings.RootURLs[0].NamespaceRef)
+		nsBindings := BindingsByKind(bindings, KindNamespaceName)
+		require.Len(t, nsBindings, 1)
+		urlBindings := BindingsByKind(bindings, KindRootURL)
+		require.Len(t, urlBindings, 1)
+		assert.Equal(t, "rootUrl", urlBindings[0].Key)
+		assert.Equal(t, "gitea.rootUrl", urlBindings[0].Path)
+		assert.Equal(t, "gitea", urlBindings[0].RouteName)
+		assert.Equal(t, "gitea", urlBindings[0].NamespaceRef)
 	})
 
 	t.Run("strips .namespace suffix from namespaceRef", func(t *testing.T) {
@@ -107,12 +111,14 @@ func TestParseSchemaBindings(t *testing.T) {
 
 		bindings, err := ParseSchemaBindings(schema)
 		require.NoError(t, err)
-		require.Len(t, bindings.Namespaces, 1)
-		assert.Equal(t, "datasphere", bindings.Namespaces[0].Key)
-		assert.Equal(t, "datasphere.namespace", bindings.Namespaces[0].Path)
-		require.Len(t, bindings.RootURLs, 1)
-		assert.Equal(t, "datasphere.rootUrl", bindings.RootURLs[0].Path)
-		assert.Equal(t, "datasphere", bindings.RootURLs[0].NamespaceRef)
+		nsBindings := BindingsByKind(bindings, KindNamespaceName)
+		require.Len(t, nsBindings, 1)
+		assert.Equal(t, "datasphere", nsBindings[0].Key)
+		assert.Equal(t, "datasphere.namespace", nsBindings[0].Path)
+		urlBindings := BindingsByKind(bindings, KindRootURL)
+		require.Len(t, urlBindings, 1)
+		assert.Equal(t, "datasphere.rootUrl", urlBindings[0].Path)
+		assert.Equal(t, "datasphere", urlBindings[0].NamespaceRef)
 	})
 
 	t.Run("strips .namespace suffix from key", func(t *testing.T) {
@@ -141,12 +147,13 @@ func TestParseSchemaBindings(t *testing.T) {
 
 		bindings, err := ParseSchemaBindings(schema)
 		require.NoError(t, err)
-		require.Len(t, bindings.Namespaces, 2)
-		sort.Slice(bindings.Namespaces, func(i, j int) bool { return bindings.Namespaces[i].Key < bindings.Namespaces[j].Key })
-		assert.Equal(t, "datasphere", bindings.Namespaces[0].Key)
-		assert.Equal(t, "datasphere.namespace", bindings.Namespaces[0].Path)
-		assert.Equal(t, "gitea", bindings.Namespaces[1].Key)
-		assert.Equal(t, "gitea.namespace", bindings.Namespaces[1].Path)
+		nsBindings := BindingsByKind(bindings, KindNamespaceName)
+		require.Len(t, nsBindings, 2)
+		sort.Slice(nsBindings, func(i, j int) bool { return nsBindings[i].Key < nsBindings[j].Key })
+		assert.Equal(t, "datasphere", nsBindings[0].Key)
+		assert.Equal(t, "datasphere.namespace", nsBindings[0].Path)
+		assert.Equal(t, "gitea", nsBindings[1].Key)
+		assert.Equal(t, "gitea.namespace", nsBindings[1].Path)
 	})
 
 	t.Run("no passwords", func(t *testing.T) {
@@ -161,17 +168,18 @@ func TestParseSchemaBindings(t *testing.T) {
 
 		bindings, err := ParseSchemaBindings(schema)
 		require.NoError(t, err)
-		require.Len(t, bindings.Namespaces, 1)
-		assert.Empty(t, bindings.Passwords)
+		nsBindings := BindingsByKind(bindings, KindNamespaceName)
+		require.Len(t, nsBindings, 1)
+		assert.Empty(t, BindingsByKind(bindings, KindGeneratedPassword))
 	})
 }
 
-func TestNamespaceBindingPath(t *testing.T) {
-	bindings := []NamespaceBinding{
-		{Key: "gitea", Path: "namespaces.gitea"},
-		{Key: "lab", Path: "namespaces.lab"},
+func TestBindingPath(t *testing.T) {
+	bindings := []SchemaBinding{
+		{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName},
+		{Key: "lab", Path: "namespaces.lab", Kind: KindNamespaceName},
 	}
-	assert.Equal(t, "namespaces.gitea", NamespaceBindingPath(bindings, "gitea"))
-	assert.Equal(t, "namespaces.lab", NamespaceBindingPath(bindings, "lab"))
-	assert.Empty(t, NamespaceBindingPath(bindings, "missing"))
+	assert.Equal(t, "namespaces.gitea", BindingPath(bindings, "gitea"))
+	assert.Equal(t, "namespaces.lab", BindingPath(bindings, "lab"))
+	assert.Empty(t, BindingPath(bindings, "missing"))
 }

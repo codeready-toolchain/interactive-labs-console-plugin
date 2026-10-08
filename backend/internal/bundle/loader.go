@@ -57,6 +57,7 @@ type Result struct {
 	HelmChartAvailable bool
 	HelmChartDir       string // absolute path to setup/helm/ if available, empty otherwise
 	ValuesSchema       []byte // raw contents of setup/helm/values.schema.json, nil if absent
+	Revision           string // git commit SHA of the source snapshot
 }
 
 // ValidateCloneArgs validates an approved repository URL and branch.
