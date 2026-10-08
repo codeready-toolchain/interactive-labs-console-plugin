@@ -1,0 +1,20 @@
+= {lab-title}
+:local-note: This attribute is defined in the page header.
+
+Welcome, {user}. This lab demonstrates content features; no commands run automatically.
+
+include::_partials/note.adoc[]
+
+image::images/flow.png[Two blue pages connected by a green arrow,width=192]
+
+[[try-links]]
+== Try navigation
+
+Open xref:020-resources.adoc[] to explore Console links.
+The empty label uses the target page's document title.
+
+Use <<try-links,Return to this section>> for a same-page fragment xref.
+
+{local-note}
+The page title uses a manifest attribute; your username comes from the backend.
+Your Console URL is `{openshift_console_url}`.
