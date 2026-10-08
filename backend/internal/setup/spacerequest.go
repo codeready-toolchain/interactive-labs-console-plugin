@@ -141,7 +141,7 @@ func (c *SpaceRequestClient) EnsureSpaceRequestForLab(ctx context.Context, token
 	}
 	if existing != nil {
 		if !existing.matchesLabBinding(namespace, name, label, bindingKey) {
-			return errors.New("SpaceRequest identity mismatch")
+			return fmt.Errorf("SpaceRequest %s already exists for a different lab", existing.Name)
 		}
 		if existing.DeletionTimestamp != "" {
 			return errSpaceRequestTerminating

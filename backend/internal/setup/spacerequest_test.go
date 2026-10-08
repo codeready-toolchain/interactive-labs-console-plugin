@@ -272,6 +272,7 @@ func TestEnsureSpaceRequestForLab(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var posted map[string]any
+			existingName := "gitea"
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
 				switch r.Method {
@@ -285,6 +286,7 @@ func TestEnsureSpaceRequestForLab(t *testing.T) {
 						if tc.change != nil {
 							tc.change(meta)
 						}
+						existingName = meta["name"].(string)
 						_ = json.NewEncoder(w).Encode(map[string]any{"metadata": meta})
 					}
 				case http.MethodPost:
@@ -301,7 +303,7 @@ func TestEnsureSpaceRequestForLab(t *testing.T) {
 			if tc.wantError {
 				require.Error(t, err)
 				if tc.getStatus == http.StatusOK {
-					require.EqualError(t, err, "SpaceRequest identity mismatch")
+					require.EqualError(t, err, "SpaceRequest "+existingName+" already exists for a different lab")
 				}
 			} else {
 				require.NoError(t, err)
