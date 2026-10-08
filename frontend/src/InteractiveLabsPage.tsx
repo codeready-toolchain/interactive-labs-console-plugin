@@ -901,7 +901,6 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
 
   const handleLink = React.useCallback((event: React.MouseEvent<HTMLDivElement>): void => {
     if (event.defaultPrevented || event.button !== 0) return;
-    if (handleCopyButton(event)) return;
     const link = (event.target as Element).closest("a[href]") as HTMLAnchorElement | null;
     const href = link?.getAttribute("href");
     if (!link || !href) return;
@@ -953,7 +952,10 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
   }, [item, defaultNamespace]);
 
   const template = document.createElement("template");
-  if (state.status === "success") template.innerHTML = state.result.html;
+  if (state.status === "success") {
+    template.innerHTML = state.result.html;
+    template.content.querySelectorAll("button.copy-to-clipboard").forEach((button) => button.remove());
+  }
   const paragraph = template.content.querySelector("div.paragraph > p, p");
   const preview = paragraph?.parentElement?.matches("div.paragraph") ? paragraph.parentElement : paragraph;
   const previewHTML = preview?.outerHTML;
