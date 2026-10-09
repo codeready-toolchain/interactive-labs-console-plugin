@@ -6,7 +6,7 @@ NAMESPACE ?= interactive-labs-console-plugin
 REGISTRY ?= $(shell $(OC) get route default-route -n openshift-image-registry --template='{{ .spec.host }}' 2>/dev/null)
 DEV_IMAGE ?= $(REGISTRY)/$(NAMESPACE)/interactive-labs-console-plugin:latest
 PLATFORM ?= linux/amd64
-CONTAINER_BUILD_NO_CACHE ?= --no-cache
+DEV_CONTAINER_BUILD_NO_CACHE ?=
 COMMIT ?= $(shell c=$$(git rev-parse --short HEAD 2>/dev/null) && { git diff --quiet HEAD 2>/dev/null || c="$$c-dirty"; } && echo "$$c" || echo unknown)
 BUILDTIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -53,7 +53,7 @@ validate-frontend-bundle: ## Validate exposed page module initialization
 	@! grep -Fq 'reexport safe' frontend/dist/exposed-main.js
 
 image: ## Build container image
-	$(CONTAINER_TOOL) build $(CONTAINER_BUILD_NO_CACHE) --platform=${PLATFORM} \
+	$(CONTAINER_TOOL) build --no-cache --platform=${PLATFORM} \
 	  --build-arg COMMIT=$(COMMIT) \
       --build-arg BUILDTIME=$(BUILDTIME) \
 	  -f Containerfile -t $(IMAGE) .
@@ -89,7 +89,7 @@ create-namespace: ## Create plugin namespace
 	$(OC) apply -f deploy/base/namespace.yaml
 
 dev-image: create-namespace ## Build development image
-	$(CONTAINER_TOOL) build $(CONTAINER_BUILD_NO_CACHE) --platform=${PLATFORM} \
+	$(CONTAINER_TOOL) build $(DEV_CONTAINER_BUILD_NO_CACHE) --platform=${PLATFORM} \
 	  --build-arg COMMIT=$(COMMIT) \
       --build-arg BUILDTIME=$(BUILDTIME) \
       -f Containerfile -t $(DEV_IMAGE) .
