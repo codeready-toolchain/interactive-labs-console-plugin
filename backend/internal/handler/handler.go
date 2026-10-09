@@ -39,6 +39,9 @@ type Config struct {
 	CatalogSource func(context.Context) (*corev1.ConfigMap, error)
 	// BundleLoader loads a bundle from the configured repo; nil means bundles are unavailable.
 	BundleLoader func(context.Context, string, string, string) (*bundle.Result, error)
+	// SetupPreparer prepares filesystem-only provisioning data from the approved source.
+	// The final two arguments are the authenticated subject and catalog ref.
+	SetupPreparer func(context.Context, string, string, string, string, string) (*setup.Plan, error)
 	// ResourceLoader reads an approved resource from the configured source snapshot.
 	ResourceLoader func(context.Context, string, string, string) (*bundle.Resource, error)
 	// CatalogLabOmitted receives validated catalog entry omission notifications.
@@ -157,11 +160,9 @@ func catalogEntryByCatalogRef(ctx context.Context, cfg Config, catalogRef string
 }
 
 type setupContext struct {
-	token    string
-	subject  string
-	entry    *catalog.Entry
-	result   *bundle.Result
-	bindings setup.SchemaBindings
+	token   string
+	subject string
+	plan    *setup.Plan
 }
 
 func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*setupContext, bool) {
@@ -183,55 +184,36 @@ func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*s
 		return nil, false
 	}
 
-	loader := cfg.BundleLoader
-	if loader == nil {
+	prepare := cfg.SetupPreparer
+	if prepare == nil {
 		writeError(w, http.StatusServiceUnavailable,
-			laberr.New(laberr.TypeRepositoryError, "bundle loader not configured", nil))
+			laberr.New(laberr.TypeRepositoryError, "setup preparer not configured", nil))
 		return nil, false
 	}
-	result, err := loader(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
-	if err != nil {
-		writeError(w, http.StatusBadGateway,
-			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
-		return nil, false
-	}
-
-	if result.ValuesSchema == nil {
+	plan, err := prepare(r.Context(), entry.Repository, entry.Branch, entry.LabPath, subject, entry.CatalogRef)
+	if errors.Is(err, setup.ErrChartNotFound) {
 		writeError(w, http.StatusUnprocessableEntity,
 			laberr.New(laberr.TypeChartNotFound, "lab has no values schema", nil))
 		return nil, false
 	}
-
+	if (err != nil && !errors.Is(err, setup.ErrNamespaceBindingsMissing)) || (err == nil && plan == nil) {
+		writeError(w, http.StatusBadGateway,
+			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
+		return nil, false
+	}
 	if cfg.SetupClient == nil {
 		writeError(w, http.StatusServiceUnavailable,
 			laberr.New(laberr.TypeConfigurationError, "setup client not configured", nil))
 		return nil, false
 	}
-
-	bindings, err := setup.ParseSchemaBindings(result.ValuesSchema)
-	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeConfigurationError, "invalid values schema", nil))
-		return nil, false
-	}
-	if bindings == nil {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeConfigurationError, "failed to parse values schema", nil))
-		return nil, false
-	}
-	if len(bindings.Namespaces) == 0 {
+	if errors.Is(err, setup.ErrNamespaceBindingsMissing) {
 		writeError(w, http.StatusUnprocessableEntity,
 			laberr.New(laberr.TypeConfigurationError, "values schema declares no namespace bindings", nil))
 		return nil, false
+
 	}
 
-	return &setupContext{
-		token:    token,
-		subject:  subject,
-		entry:    entry,
-		result:   result,
-		bindings: *bindings,
-	}, true
+	return &setupContext{token: token, subject: subject, plan: plan}, true
 }
 
 // --- handler functions ---
@@ -481,7 +463,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		tierName = "base1ns"
 	}
 
-	for _, b := range sctx.bindings.Namespaces {
+	for _, b := range sctx.plan.Bindings.Namespaces {
 		if err := cfg.SetupClient.EnsureSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key, tierName); err != nil {
 			cfg.Logger.Error("create SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
 			writeError(w, http.StatusBadGateway,
@@ -490,7 +472,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		}
 	}
 
-	releaseName := setup.HelmReleaseName(sctx.subject, sctx.entry.CatalogRef, sctx.bindings.Namespaces)
+	releaseName := sctx.plan.ReleaseName
 
 	// If Helm is available, check if already deployed (re-launch no-op).
 	if cfg.HelmManager != nil {
@@ -519,7 +501,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 			startWorker = true
 		}
 		if startWorker {
-			go runSetupWorker(cfg, sctx.token, userNamespace, releaseName, sctx.result.HelmChartDir, sctx.bindings, helmTimeout) //nolint:gosec
+			go runSetupWorker(cfg, sctx.token, userNamespace, *sctx.plan, helmTimeout) //nolint:gosec
 		}
 	}
 
@@ -534,7 +516,8 @@ const (
 	setupWorkerPollTimeout  = 30 * time.Minute
 )
 
-func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, bindings setup.SchemaBindings, helmTimeout time.Duration) {
+func runSetupWorker(cfg Config, token, namespace string, plan setup.Plan, helmTimeout time.Duration) {
+	releaseName, bindings := plan.ReleaseName, plan.Bindings
 	setState := func(phase, errMsg string) {
 		activeSetups.Store(releaseName, &workerState{phase: phase, err: errMsg})
 	}
@@ -622,7 +605,7 @@ func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, 
 	defer installCancel()
 
 	if err := cfg.HelmManager.Install(installCtx, setup.HelmInstallOpts{
-		ChartDir:    chartDir,
+		ChartDir:    plan.ChartDir,
 		ReleaseName: releaseName,
 		Namespace:   namespace,
 		Token:       token,
@@ -666,11 +649,12 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 		Status string `json:"status"`
 		Name   string `json:"name"`
 	}
-	namespaces := make(map[string]namespaceStatus, len(sctx.bindings.Namespaces))
+	bindings := sctx.plan.Bindings
+	namespaces := make(map[string]namespaceStatus, len(bindings.Namespaces))
 	allReady := true
 	anyFailed := false
 
-	for _, b := range sctx.bindings.Namespaces {
+	for _, b := range bindings.Namespaces {
 		sr, err := cfg.SetupClient.GetSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key)
 		if err != nil {
 			cfg.Logger.Warn("get SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
@@ -703,7 +687,7 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 		srStatus = "ready"
 	}
 
-	releaseName := setup.HelmReleaseName(sctx.subject, sctx.entry.CatalogRef, sctx.bindings.Namespaces)
+	releaseName := sctx.plan.ReleaseName
 	helmStatus := "pending"
 	helmMessage := ""
 	var generatedValues map[string]string
@@ -712,9 +696,9 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 		releaseStatus, err := cfg.HelmManager.ReleaseStatus(r.Context(), releaseName, userNamespace, sctx.token)
 		if err == nil && releaseStatus != "" {
 			helmStatus = setup.HelmStatusLabel(releaseStatus)
-			if helmStatus == "deployed" && len(sctx.bindings.Passwords) > 0 {
-				paths := make([]string, len(sctx.bindings.Passwords))
-				for i, b := range sctx.bindings.Passwords {
+			if helmStatus == "deployed" && len(bindings.Passwords) > 0 {
+				paths := make([]string, len(bindings.Passwords))
+				for i, b := range bindings.Passwords {
 					paths[i] = b.Path
 				}
 				generatedValues, _ = cfg.HelmManager.ReleaseValues(r.Context(), releaseName, userNamespace, sctx.token, paths)
@@ -735,16 +719,16 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 
 	var attributes map[string]string
 	if allReady && helmStatus == "deployed" {
-		attributes = make(map[string]string, len(sctx.bindings.Namespaces)+len(sctx.bindings.Passwords)+len(sctx.bindings.RootURLs))
-		for _, b := range sctx.bindings.Namespaces {
+		attributes = make(map[string]string, len(bindings.Namespaces)+len(bindings.Passwords)+len(bindings.RootURLs))
+		for _, b := range bindings.Namespaces {
 			attributes[strings.ReplaceAll(b.Path, ".", "-")] = namespaces[b.Key].Name
 		}
-		for _, b := range sctx.bindings.Passwords {
+		for _, b := range bindings.Passwords {
 			if v, ok := generatedValues[b.Path]; ok {
 				attributes[strings.ReplaceAll(b.Path, ".", "-")] = v
 			}
 		}
-		for _, b := range sctx.bindings.RootURLs {
+		for _, b := range bindings.RootURLs {
 			if cfg.ClusterIngressDomain == "" {
 				continue
 			}

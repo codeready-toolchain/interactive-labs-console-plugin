@@ -20,7 +20,7 @@ See [catalog ConfigMap contract](../efforts/interactive-labs/contract/catalog-co
 
 ## Implemented bundle format
 
-Backend expects this layout (`setup/helm/` belongs to repository root and is shared by its labs):
+Backend expects this layout (chart directories are optional):
 
 ```text
 <labPath>/
@@ -34,7 +34,9 @@ Backend expects this layout (`setup/helm/` belongs to repository root and is sha
     020-apply/
       content/
         010-apply.adoc
-<repository-root>/setup/helm/Chart.yaml  # optional chart
+  setup/helm/Chart.yaml           # optional lab-local default chart
+  setup/helm/values.schema.json   # optional schema beside chart
+<repository-root>/setup/helm/Chart.yaml  # optional fallback chart
 ```
 
 `lab.yaml` is strict YAML; only these fields are supported:
@@ -47,6 +49,7 @@ metadata:
   description: Optional catalog description
 spec:                              # optional
   attributes: {}                   # optional map of strings
+  setupDir: ../../shared/chart     # optional direct chart-directory override
 ```
 
 `metadata.title` must be nonempty. Unknown or old fields (including `metadata.name`, `metadata.displayName`, and root `spec.checkpoints`) are rejected, not ignored. The optional description is displayed in catalog, not as module/drawer metadata.
@@ -66,6 +69,22 @@ checkpoints:
 Each checkpoint needs nonempty string `id`, `type: manual`, `pagePath`, and `label`. Backend normalizes `pagePath` relative to **that module's** `content/` (`010-start.adoc` or `pages/010-start.adoc`); it must match a navigable page, never an include-only, missing, traversing, or other-module page. IDs must be unique per module; they may repeat in different modules. Checkpoints are validated authoring data only: no checkpoint UI, attestation, completion, persistence, or checkpoint field in bundle response. Evidence and manual-checkpoint semantics remain open.
 
 `GET /api/v1alpha1/labs/{catalogRef}/bundle` returns `apiVersion: v1alpha1`, `kind: LabBundle`, validated `manifest` (with effective attributes), `runtimeContext`, and **only** `modules: [{id, pages: [{path, url}]}]`, never flat `pages`. Each path is lab-relative, e.g. `modules/010-intro/content/010-start.adoc`; its backend-relative URL targets `.../resources/<labPath>/modules/010-intro/content/010-start.adoc` (omit `<labPath>/` when `labPath: .`). Backend does not extract page titles or process AsciiDoc includes. Browser validates modules, paths, and exact approved proxy URLs before launch.
+
+## Prerequisite chart selection
+
+`spec.setupDir` is an optional string naming the **chart directory itself**, relative to the lab directory, not a parent containing `helm/`. For `labPath: labs/intro`, `setupDir: ../../shared/chart` selects `<repository-root>/shared/chart`; `setupDir: setup/helm` selects the lab-local chart. An omitted or empty string uses defaults:
+
+1. Nonempty `spec.setupDir` is authoritative. A missing or invalid target invalidates the lab; no fallback occurs.
+2. Otherwise select `<labPath>/setup/helm` when that directory exists.
+3. Only when the lab-local directory is absent, try `<repository-root>/setup/helm`.
+
+Neither implicit directory present means a content-only lab. A present but invalid selected directory/chart is never treated as content-only and never triggers fallback. Backend validates the selected chart with its installed Helm loader; invalid chart configuration invalidates bundle loading and uses existing catalog omission/Warning Event handling.
+
+Parent traversal is allowed only inside the approved repository snapshot. Absolute paths, URLs, backslashes, control characters, encoded-looking `%xx` text, repository escapes, and symlinks are rejected. Checks include every path segment before normalization and the entire selected chart tree, including chart metadata, schema, templates, subchart directories, dangling links, and files excluded by `.helmignore`. Browser content/resource path rules do not change.
+
+Chart and `values.schema.json` always come from the same selected directory. Shared `chart` owns selection, safe path/tree validation, Helm-loader validation, and optional schema decoding. Schema is optional for bundle loading; when present it must be a readable JSON object with correctly typed supported property-tree and annotation fields (for example, `x-interactive-labs.kind: 42` is rejected). This validates structure, not full JSON Schema semantics. Unknown fields/kinds remain allowed. Bundle validates this contract early without importing provisioning code; an absent schema or `{}` is valid bundle content. `setup` interprets decoded annotations and separately requires a schema declaring at least one `namespace-name` binding, preserving existing setup error mapping and namespace/reference policy.
+
+Helm release identity includes normalized repository-relative **effective chart path**, authenticated user, unchanged `catalogRef`, and sorted namespace binding keys. Equivalent relative spellings, absolute snapshot locations, revisions, and chart contents do not affect identity. Labs may share chart files but keep separate installed releases per user/catalog identity. This pre-release change adds no old-release migration or cleanup.
 
 ## Attributes
 

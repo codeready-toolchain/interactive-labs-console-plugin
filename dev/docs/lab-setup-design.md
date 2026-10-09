@@ -18,7 +18,9 @@ The backend determines how many namespaces a lab needs by inspecting the values 
 
 ### Schema scanning
 
-- Read `setup/helm/values.schema.json` from the cached lab content snapshot (at the repository root, shared by all labs).
+- Read `values.schema.json` beside the selected Helm chart in the cached approved repository snapshot. Selection follows [`spec.setupDir` and lab-local/root defaults](lab-content-contract.md#prerequisite-chart-selection); chart and schema never come from different directories.
+- Shared `chart` decodes the optional schema and validates supported field/annotation structure during chart validation. A present schema must be a JSON object; malformed or mistyped supported fields invalidate bundle/catalog loading. An absent schema or `{}` remains valid bundle content.
+- `setup` interprets that decoded property tree and requires a schema and at least one `namespace-name` binding. Unknown annotation kinds remain ignored; this adds neither full JSON Schema semantic validation nor new namespace/reference policy.
 - Walk the JSON Schema property tree at any depth.
 - Collect every property whose `x-interactive-labs.kind` field equals `namespace-name`.
 - Record the dot-separated JSON path for each (e.g. `namespaces.gitea`).
@@ -88,7 +90,7 @@ This produces two SpaceRequests (one per `namespace-name` property) and two gene
 
 ## Helm Chart Deployment
 
-Once all SpaceRequests are provisioned, the backend deploys the Helm chart from `setup/helm/` in the lab content repository with the provisioned namespace names as values.
+Once all SpaceRequests are provisioned, the backend deploys the selected, validated Helm chart with the provisioned namespace names as values. A nonempty lab-relative `spec.setupDir` overrides defaults; otherwise lab-local `setup/helm/` wins, with repository-root `setup/helm/` used only when the local directory is absent. A selected missing/invalid explicit chart, malformed implicit chart, or unsafe path invalidates the bundle/catalog lab rather than falling back. No implicit chart directories means content-only.
 
 ### Sequencing
 
@@ -117,13 +119,15 @@ All values are merged into a single values map and passed to `helm install`.
 
 ### Release identity
 
-- **Release name**: `il-` + first 12 hex characters of SHA-256(`subject`, `catalogRef`, `branch`). Deterministic and user-specific.
+- **Release name**: `il-` + first 12 hex characters of SHA-256 over `subject`, unchanged `catalogRef`, normalized repository-relative effective chart-directory path, and sorted namespace binding keys. Each field is encoded as `<byte-length>:<value>` before hashing, preserving boundaries even when a value contains `|` or `:`. Deterministic and user/lab-specific. `catalogRef` already includes repository, branch, lab path, and catalog overrides.
+- Sharing chart files does not share installed releases. Equivalent override spellings and different absolute snapshot paths retain identity; chart contents/revisions are not hashed. No migration or cleanup of old releases is provided for this pre-release change.
 - **Release namespace**: the user's home namespace (`<username>-dev`), the same namespace where SpaceRequests are created.
 
 ### Execution
 
 - The backend uses the **Helm Go SDK** (`helm.sh/helm/v3`) to install the chart programmatically via `action.Install`.
-- The chart directory is resolved from the cached lab content snapshot (`setup/helm/` at the repository root).
+- Browser/catalog bundle loading and filesystem-only setup preparation are separate operations on the same approved snapshot cache. Shared `chart` owns chart selection, safe path resolution, Helm-loader validation, and optional schema decoding. `bundle` owns content loading and early chart-contract validation, with no dependency on provisioning. `setup.Prepare` composes `bundle.LoadContentFromSnapshot` with that shared chart operation, then owns setup requirements, binding interpretation, and release identity. Server runs preparation inside `Cache.WithSnapshot`, holding the existing source read lock. Preparation returns `setup.Plan` containing the absolute chart directory, already-derived release name, and parsed schema bindings; the normalized repository-relative chart path is a private identity intermediate, discarded after derivation. POST and status use the prepared name unchanged, and the worker consumes the plan rather than a browser bundle. No extra acquisition/cache layer or cluster operations are part of preparation.
+- Safe parent traversal supports shared charts; path segments and the entire selected chart tree reject symlinks before Helm's loader can follow them.
 - The Helm install uses the **user's bearer token** for cluster authentication.
 - The Helm install timeout is **configurable** (env var), default **300 seconds**.
 
@@ -224,7 +228,7 @@ This supports page refresh and re-launch without losing state.
 
 | # | Decision | Rationale |
 |---|----------|-----------|
-| 1 | Labs in a repository share the same setup | Simplicity; one values schema per content repo |
+| 1 | Labs select independent or shared chart files, always with separate installed releases | Lab-local defaults and authoritative `spec.setupDir` support both layouts without sharing user/lab release identity |
 | 2 | Backend creates SpaceRequests directly | No separate operator needed; keeps the system self-contained |
 | 3 | User's token for all K8s operations | Respects existing RBAC; no privileged SA required |
 | 4 | Kick-and-poll (not long-poll or WebSocket) | Simple, tolerant of disconnects, easy to implement |
@@ -237,7 +241,7 @@ This supports page refresh and re-launch without losing state.
 | 11 | Helm Go SDK for chart deployment | Programmatic control, Wait support, bounded timeout |
 | 12 | Single POST triggers full setup (SpaceRequests + Helm) | Simple frontend: one kick, then poll |
 | 13 | Background goroutine watches SpaceRequests and triggers Helm | Async flow; Helm can't start until all namespaces are provisioned |
-| 14 | Release name is deterministic (SHA-256 of subject + catalogRef + branch) | Enables idempotent re-launch and state reconstruction |
+| 14 | Release name hashes subject, catalogRef, effective chart path, and sorted namespace binding keys | Enables consistent setup/status identity and isolated installed releases |
 | 15 | GET reconstructs both SpaceRequest and Helm state | Stateless; no in-memory tracking needed |
 | 16 | Goroutine retries transient errors with backoff | Bounded by timeout; resilient to transient failures |
 | 17 | Configurable Helm timeout (default 300s) | Operational flexibility; keeps setup bounded |

@@ -7,11 +7,12 @@ import (
 )
 
 // HelmReleaseName derives a stable, deterministic Helm release name from the
-// authenticated user subject, catalog ref, and namespace bindings.
+// authenticated user subject, catalog ref, normalized repository-relative chart
+// directory, and namespace bindings, encoded as byte-length-prefixed fields.
 // catalogRef already encodes repository, branch, lab path, and attribute
 // overrides, so including it prevents collisions across distinct repositories.
 // The result is "il-" followed by a truncated hex SHA-256 digest.
-func HelmReleaseName(subject, catalogRef string, bindings []NamespaceBinding) string {
+func HelmReleaseName(subject, catalogRef, chartPath string, bindings []NamespaceBinding) string {
 	keys := make([]string, len(bindings))
 	for i, b := range bindings {
 		keys[i] = b.Key
@@ -19,12 +20,8 @@ func HelmReleaseName(subject, catalogRef string, bindings []NamespaceBinding) st
 	sort.Strings(keys)
 
 	h := sha256.New()
-	h.Write([]byte(subject))
-	h.Write([]byte("|"))
-	h.Write([]byte(catalogRef))
-	for _, k := range keys {
-		h.Write([]byte("|"))
-		h.Write([]byte(k))
+	for _, field := range append([]string{subject, catalogRef, chartPath}, keys...) {
+		fmt.Fprintf(h, "%d:%s", len(field), field)
 	}
 	var sum [sha256.Size]byte
 	h.Sum(sum[:0])

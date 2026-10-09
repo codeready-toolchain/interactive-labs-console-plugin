@@ -162,7 +162,8 @@ export function validateManifest(raw: unknown): LabManifest {
 
   const spec = raw["spec"];
   if (spec !== undefined && (!isRecord(spec) ||
-    Object.keys(spec).some((key) => key !== "attributes") ||
+    Object.keys(spec).some((key) => !["attributes", "setupDir"].includes(key)) ||
+    (spec["setupDir"] !== undefined && typeof spec["setupDir"] !== "string") ||
     (spec["attributes"] !== undefined && (!isRecord(spec["attributes"]) ||
       Object.values(spec["attributes"]).some((value) => typeof value !== "string"))))) {
     throw new Error("manifest_invalid: invalid spec");

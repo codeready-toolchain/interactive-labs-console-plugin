@@ -145,6 +145,94 @@ func refresh(cache *Cache, repository, branch string) error {
 }
 
 func TestCache(t *testing.T) {
+	t.Run("snapshot callback reuses bundle snapshot without acquisition", func(t *testing.T) {
+		// Given an existing approved snapshot with a selected chart.
+		root := t.TempDir()
+		destination := filepath.Join(root, snapshotID(testRepository, testBranch), "content")
+		require.NoError(t, writeSnapshotLab(destination, "lab", "= Test"))
+		chartDir := filepath.Join(destination, "lab/setup/helm")
+		require.NoError(t, os.MkdirAll(chartDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(chartDir, "Chart.yaml"), []byte("apiVersion: v2\nname: test\nversion: 1.0.0\n"), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(chartDir, "values.schema.json"), []byte(`{"properties":{"lab":{"x-interactive-labs":{"kind":"namespace-name"}}}}`), 0o600))
+		client := newFakeGit()
+		client.heads[destination] = oldRevision
+		cache := newCache(root, client)
+
+		// When browser and setup consumers independently use the same cache.
+		result, err := cache.LoadBundle(context.Background(), testRepository, testBranch, "lab")
+		require.NoError(t, err)
+		err = cache.WithSnapshot(testRepository, testBranch, func(snapshotRoot string) error {
+			assert.Equal(t, destination, snapshotRoot)
+			content, readErr := os.ReadFile(filepath.Join(snapshotRoot, "lab/setup/helm/values.schema.json"))
+			if assert.NoError(t, readErr) {
+				assert.JSONEq(t, `{"properties":{"lab":{"x-interactive-labs":{"kind":"namespace-name"}}}}`, string(content))
+			}
+			return readErr
+		})
+
+		// Then each consumer performs only its own filesystem/data work.
+		require.NoError(t, err)
+		assert.True(t, result.HelmChartAvailable)
+		assert.Zero(t, client.cloneCount(testRepository, testBranch))
+		assert.Equal(t, 1, client.headCount())
+	})
+	t.Run("snapshot callback preserves source admission guards", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, repository, branch string
+		}{
+			{name: "unsafe source", repository: "file:///untrusted", branch: testBranch},
+			{name: "unsafe branch", repository: testRepository, branch: "-untrusted"},
+			{name: "unavailable snapshot", repository: testRepository, branch: testBranch},
+			{name: "closed cache", repository: testRepository, branch: testBranch},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				client := newFakeGit()
+				cache := newCache(t.TempDir(), client)
+				if tc.name == "closed cache" {
+					require.NoError(t, cache.Close())
+				}
+				err := cache.WithSnapshot(tc.repository, tc.branch, func(string) error {
+					assert.Fail(t, "unavailable snapshot must not reach consumer")
+					return nil
+				})
+				require.ErrorIs(t, err, ErrRepositoryUnavailable)
+				assert.Zero(t, client.cloneCount(tc.repository, tc.branch))
+				if tc.name != "unavailable snapshot" {
+					assert.Empty(t, cache.entries)
+				}
+			})
+		}
+	})
+	t.Run("snapshot callback holds generation until return and propagates consumer errors", func(t *testing.T) {
+		// Given a published snapshot and a consumer reading that generation.
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key] = oldRevision, "= Old"
+		cache := newCache(t.TempDir(), client)
+		require.NoError(t, refresh(cache, testRepository, testBranch))
+		consumerErr := errors.New("consumer failed")
+		refreshDone := make(chan error, 1)
+		err := cache.WithSnapshot(testRepository, testBranch, func(root string) error {
+			// When refresh stages a replacement during the callback.
+			client.cloneFinished = make(chan struct{})
+			client.refs[key], client.contents[key] = newRevision, "= New"
+			go func() { refreshDone <- refresh(cache, testRepository, testBranch) }()
+			<-client.cloneFinished
+			// Then publishing waits and the callback still sees the old generation.
+			assert.Never(t, func() bool { return len(refreshDone) != 0 }, 20*time.Millisecond, time.Millisecond)
+			resource, err := ReadResource(root, "lab/modules/010-intro/content/intro.adoc")
+			if assert.NoError(t, err) {
+				assert.Equal(t, []byte("= Old"), resource.Bytes)
+			}
+			return consumerErr
+		})
+		require.ErrorIs(t, err, consumerErr)
+		require.NoError(t, <-refreshDone)
+		resource, err := cache.ReadResource(context.Background(), testRepository, testBranch, "lab/modules/010-intro/content/intro.adoc")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("= New"), resource.Bytes)
+		assert.Equal(t, newRevision, resource.Revision)
+	})
 	t.Run("reuses successful snapshot by repository and branch", func(t *testing.T) {
 		client := newFakeGit()
 		key := sourceKey{testRepository, testBranch}

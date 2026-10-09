@@ -72,7 +72,8 @@ Status: decisions below describe target MVP unless explicitly marked **implement
 
 - `catalogRef` is opaque SHA-256 over repository, branch, lab path, and catalog attribute overrides. Display fields and runtime attributes do not affect identity.
 - Attribute precedence is manifest, then catalog overrides, then backend runtime attributes. Runtime attributes do not affect catalog identity or Helm release name.
-- Helm release identity is backend-derived, deterministic, and user-specific: static content identity, static effective attributes, and namespace bindings contribute; runtime attributes do not.
+- Helm release identity is backend-derived from authenticated user, unchanged `catalogRef`, normalized repository-relative effective chart path, and sorted namespace binding keys. Runtime attributes, absolute cache locations, revisions, chart contents, and raw override spelling do not contribute. Shared chart files retain separate installed user/lab releases; no pre-release migration/cleanup is added.
+- Chart content mechanics and typed schema decoding belong to shared `chart`; `bundle` loads content and validates that contract early, never provisioning policy. `setup` owns preparation requirements, decoded binding interpretation, release identity, and `Plan`. Server composes these operations against one existing approved snapshot cache; no second cache or provisioning operation lives in `bundle`.
 - Use one unified frontend/backend image and one HTTPS Service.
 - Use typed Kubernetes and OpenShift clients for all cluster API access.
 

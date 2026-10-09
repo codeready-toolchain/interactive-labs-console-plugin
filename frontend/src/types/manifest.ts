@@ -7,6 +7,7 @@ export interface LabManifest {
   };
   spec?: {
     attributes?: Record<string, string>;
+    setupDir?: string;
   };
 }
 

@@ -3,9 +3,9 @@
 package setup
 
 import (
-	"encoding/json"
-	"fmt"
 	"strings"
+
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/chart"
 )
 
 const (
@@ -46,15 +46,11 @@ type SchemaBindings struct {
 	RootURLs   []RootURLBinding
 }
 
-// ParseSchemaBindings reads a JSON Schema and returns all x-interactive-labs
-// bindings grouped by kind.
-func ParseSchemaBindings(raw []byte) (*SchemaBindings, error) {
-	var schema jsonSchemaNode
-	if err := json.Unmarshal(raw, &schema); err != nil {
-		return nil, fmt.Errorf("parse values schema: %w", err)
-	}
+// ParseSchemaBindings interprets a decoded chart schema and groups
+// supported bindings by kind. Unknown kinds are ignored; references remain unresolved.
+func ParseSchemaBindings(schema *chart.Schema) *SchemaBindings {
 	var all []ValueBinding
-	walkAllProperties(&schema, "", &all)
+	walkAllProperties(schema, "", &all)
 
 	result := &SchemaBindings{}
 	for _, b := range all {
@@ -76,7 +72,7 @@ func ParseSchemaBindings(raw []byte) (*SchemaBindings, error) {
 			})
 		}
 	}
-	return result, nil
+	return result
 }
 
 // NamespaceBindingPath returns the Helm values path for the namespace binding
@@ -90,19 +86,7 @@ func NamespaceBindingPath(bindings []NamespaceBinding, key string) string {
 	return ""
 }
 
-type interactiveLabsExt struct {
-	Kind         string `json:"kind"`
-	RouteName    string `json:"routeName,omitempty"`
-	NamespaceRef string `json:"namespaceRef,omitempty"`
-}
-
-type jsonSchemaNode struct {
-	Type            string                    `json:"type"`
-	Properties      map[string]jsonSchemaNode `json:"properties"`
-	InteractiveLabs *interactiveLabsExt       `json:"x-interactive-labs"`
-}
-
-func walkAllProperties(node *jsonSchemaNode, prefix string, out *[]ValueBinding) {
+func walkAllProperties(node *chart.Schema, prefix string, out *[]ValueBinding) {
 	for key, child := range node.Properties {
 		path := key
 		if prefix != "" {
