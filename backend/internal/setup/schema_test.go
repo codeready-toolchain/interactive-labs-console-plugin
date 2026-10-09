@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/chart"
 )
 
 func TestParseSchemaBindings(t *testing.T) {
@@ -37,8 +39,7 @@ func TestParseSchemaBindings(t *testing.T) {
 			}
 		}`)
 
-		bindings, err := ParseSchemaBindings(schema)
-		require.NoError(t, err)
+		bindings := decodeBindings(t, schema)
 		require.Len(t, bindings.Namespaces, 1)
 		assert.Equal(t, "gitea", bindings.Namespaces[0].Key)
 		assert.Equal(t, "namespaces.gitea", bindings.Namespaces[0].Path)
@@ -76,8 +77,7 @@ func TestParseSchemaBindings(t *testing.T) {
 			}
 		}`)
 
-		bindings, err := ParseSchemaBindings(schema)
-		require.NoError(t, err)
+		bindings := decodeBindings(t, schema)
 		require.Len(t, bindings.Namespaces, 1)
 		require.Len(t, bindings.RootURLs, 1)
 		assert.Equal(t, "rootUrl", bindings.RootURLs[0].Key)
@@ -105,8 +105,7 @@ func TestParseSchemaBindings(t *testing.T) {
 			}
 		}`)
 
-		bindings, err := ParseSchemaBindings(schema)
-		require.NoError(t, err)
+		bindings := decodeBindings(t, schema)
 		require.Len(t, bindings.Namespaces, 1)
 		assert.Equal(t, "datasphere", bindings.Namespaces[0].Key)
 		assert.Equal(t, "datasphere.namespace", bindings.Namespaces[0].Path)
@@ -139,8 +138,7 @@ func TestParseSchemaBindings(t *testing.T) {
 			}
 		}`)
 
-		bindings, err := ParseSchemaBindings(schema)
-		require.NoError(t, err)
+		bindings := decodeBindings(t, schema)
 		require.Len(t, bindings.Namespaces, 2)
 		sort.Slice(bindings.Namespaces, func(i, j int) bool { return bindings.Namespaces[i].Key < bindings.Namespaces[j].Key })
 		assert.Equal(t, "datasphere", bindings.Namespaces[0].Key)
@@ -159,11 +157,25 @@ func TestParseSchemaBindings(t *testing.T) {
 			}
 		}`)
 
-		bindings, err := ParseSchemaBindings(schema)
-		require.NoError(t, err)
+		bindings := decodeBindings(t, schema)
 		require.Len(t, bindings.Namespaces, 1)
 		assert.Empty(t, bindings.Passwords)
 	})
+	t.Run("ignores unknown kinds and preserves unresolved references", func(t *testing.T) {
+		// Given decoded, correctly typed annotations, not a namespace/reference policy.
+		bindings := decodeBindings(t, []byte(`{"properties":{"future":{"x-interactive-labs":{"kind":"future-kind"}},"url":{"x-interactive-labs":{"kind":"root-url","namespaceRef":"missing.namespace"}}}}`))
+		// Then unknown kinds are ignored and resolution remains provisioning's job.
+		assert.Empty(t, bindings.Namespaces)
+		assert.Empty(t, bindings.Passwords)
+		assert.Equal(t, []RootURLBinding{{Key: "url", Path: "url", NamespaceRef: "missing"}}, bindings.RootURLs)
+	})
+}
+
+func decodeBindings(t *testing.T, raw []byte) *SchemaBindings {
+	t.Helper()
+	schema, err := chart.DecodeSchema(raw)
+	require.NoError(t, err)
+	return ParseSchemaBindings(schema)
 }
 
 func TestNamespaceBindingPath(t *testing.T) {

@@ -29,6 +29,7 @@ type Metadata struct {
 
 type Spec struct {
 	Attributes map[string]string `yaml:"attributes,omitempty" json:"attributes,omitempty"`
+	SetupDir   string            `yaml:"setupDir,omitempty" json:"setupDir,omitempty"`
 }
 
 type ModuleManifest struct {
@@ -51,6 +52,7 @@ func ValidateManifest(raw []byte) (*LabManifest, *laberr.LabError) {
 		(field(root, "spec") != nil && !isMapping(field(root, "spec"))) ||
 		(field(field(root, "spec"), "attributes") != nil && !isMapping(field(field(root, "spec"), "attributes"))) ||
 		!stringFields(field(root, "metadata"), "title", "description") ||
+		!stringFields(field(root, "spec"), "setupDir") ||
 		!stringValues(field(field(root, "spec"), "attributes")) {
 		return nil, laberr.New(laberr.TypeContentError, "manifest is not valid YAML", nil)
 	}

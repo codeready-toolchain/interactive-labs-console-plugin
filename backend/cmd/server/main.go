@@ -60,8 +60,17 @@ func main() {
 	catalogEvents := inClusterCatalogEventPoster(log, serverConfig.Namespace)
 
 	cfg := handler.Config{
-		CatalogSource:        catalogSource,
-		BundleLoader:         cache.LoadBundle,
+		CatalogSource: catalogSource,
+		BundleLoader:  cache.LoadBundle,
+		SetupPreparer: func(_ context.Context, repository, branch, labPath, subject, catalogRef string) (*setup.Plan, error) {
+			var plan *setup.Plan
+			err := cache.WithSnapshot(repository, branch, func(root string) error {
+				var err error
+				plan, err = setup.Prepare(root, labPath, subject, catalogRef)
+				return err
+			})
+			return plan, err
+		},
 		ResourceLoader:       cache.ReadResource,
 		CatalogLabOmitted:    catalogEvents,
 		Logger:               log,

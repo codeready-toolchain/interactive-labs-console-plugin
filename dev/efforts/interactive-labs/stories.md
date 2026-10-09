@@ -67,10 +67,10 @@ Labs with prerequisites need namespace provisioning via SpaceRequests before the
 
 **Goal:** Automatically provision namespaces via CodeReady Toolchain SpaceRequests based on the lab's `values.schema.json` namespace declarations.
 
-**Planning status:** Design agreed and documented in [lab-setup-design.md](../docs/lab-setup-design.md). Namespace provisioning via SpaceRequests and async setup flow (kick-and-poll) are implemented.
+**Planning status:** Design agreed and documented in [lab-setup-design.md](../../docs/lab-setup-design.md). Namespace provisioning via SpaceRequests and async setup flow (kick-and-poll) are implemented.
 
 **Implemented:**
-- Backend scans `setup/helm/values.schema.json` for `x-interactive-labs.kind: namespace-name` properties.
+- Backend scans the selected chart's `values.schema.json` for `x-interactive-labs.kind: namespace-name` properties.
 - Creates SpaceRequests (one per namespace property) in the user's home namespace (`<username>-dev`) using the user's token.
 - `POST /setup` initiates provisioning and returns 202; `GET /setup/status` returns per-namespace and overall status.
 - Frontend calls `setupLab`, polls `getSetupStatus` with a spinner, and opens the lab once all namespaces are provisioned.
@@ -196,3 +196,21 @@ Long labs need meaningful module boundaries without treating page visits as evid
 - Description remains catalog-only; setup remains lab-wide; same-repository resources and cross-module known-page links remain safe. No source-revision lifecycle or checkpoint policy change.
 
 **Dependencies:** STORY-4 (including STORY-3 and STORY-9); STORY-7 completion rules remain independent.
+
+## ☑ STORY-15: Select independent or shared Helm charts (SANDBOX-2063)
+
+Multiple labs in one repository need independent chart sources or shared chart files without sharing installed releases.
+
+**Goal:** Select and validate one optional prerequisite chart per lab while keeping setup/status release identity isolated.
+
+**Acceptance criteria:**
+- Optional string `spec.setupDir` directly selects a lab-relative chart directory; safe parent traversal remains inside the approved snapshot, with unsafe paths and symlinks rejected.
+- Explicit selection is authoritative. Without it, lab-local `setup/helm` wins; repository-root `setup/helm` is fallback only when local directory is absent. Neither implicit directory means content-only.
+- Helm loader validates selected chart; optional present schema is validated and read from that same directory. Invalid selection invalidates bundle/catalog lab, never falls back. Existing setup namespace-binding requirements remain.
+- Symlink checks cover raw path segments and chart-internal entries, including ignored and dangling links, before Helm follows them.
+- Normalized repository-relative effective chart path contributes to release identity in all setup/status paths; `catalogRef` stays unchanged. Shared files keep separate installed user/catalog releases; absolute cache paths, equivalent override spelling, revisions, and chart contents do not affect identity.
+- No old-release migration or cleanup; project remains pre-release.
+
+**Dependencies:** STORY-5, STORY-9.
+
+Author contract: [chart selection](../../docs/lab-content-contract.md#prerequisite-chart-selection).

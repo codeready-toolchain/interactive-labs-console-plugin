@@ -2,6 +2,8 @@ package bundle_test
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/bundle"
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/setup"
 )
 
 func writeFile(t *testing.T, file, contents string) {
@@ -217,4 +220,287 @@ func TestReadResource_LoadsArbitrarySizeAndBytes(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, content, resource.Bytes)
+}
+
+const validChart = "apiVersion: v2\nname: test\nversion: 1.0.0\n"
+
+func chartOverride(t *testing.T, lab, override string) {
+	t.Helper()
+	writeFile(t, filepath.Join(lab, "lab.yaml"), fmt.Sprintf("apiVersion: v1alpha1\nkind: Lab\nmetadata:\n  title: Test\nspec:\n  setupDir: %q\n", override))
+}
+
+func TestPrepareSetup(t *testing.T) {
+	t.Run("content loading excludes chart and setup policy", func(t *testing.T) {
+		// Given valid lab content with an invalid selected chart.
+		root, lab := moduleLab(t)
+		writeFile(t, filepath.Join(lab, "setup/helm/Chart.yaml"), "name: broken\nversion: invalid\n")
+		// When the provisioning consumer loads content through its minimal seam.
+		m, modules, err := bundle.LoadContentFromSnapshot(root, "lab")
+		// Then content loading stays independent; browser loading enforces chart contract.
+		require.NoError(t, err)
+		assert.Equal(t, "Test", m.Metadata.Title)
+		require.Len(t, modules, 2)
+		_, err = bundle.LoadFromSnapshot(root, "lab")
+		require.ErrorIs(t, err, bundle.ErrLabInvalid)
+		_, err = setup.Prepare(root, "lab", "user1", "ref1")
+		require.ErrorIs(t, err, bundle.ErrLabInvalid)
+	})
+	t.Run("prepares selected chart bindings and final identity without cluster work", func(t *testing.T) {
+		root, lab := moduleLab(t)
+		chartOverride(t, lab, "../shared/chart")
+		writeFile(t, filepath.Join(root, "shared/chart/Chart.yaml"), validChart)
+		writeFile(t, filepath.Join(root, "shared/chart/values.schema.json"), `{"properties":{"lab":{"x-interactive-labs":{"kind":"namespace-name"}},"password":{"x-interactive-labs":{"kind":"generated-password"}},"url":{"x-interactive-labs":{"kind":"root-url","routeName":"app","namespaceRef":"lab"}}}}`)
+
+		plan, err := setup.Prepare(root, "lab", "user1", "ref1")
+
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(root, "shared/chart"), plan.ChartDir)
+		assert.True(t, filepath.IsAbs(plan.ChartDir))
+		assert.Equal(t, []setup.NamespaceBinding{{Key: "lab", Path: "lab"}}, plan.Bindings.Namespaces)
+		assert.Equal(t, []setup.ValueBinding{{Key: "password", Path: "password", Kind: setup.KindGeneratedPassword}}, plan.Bindings.Passwords)
+		assert.Equal(t, []setup.RootURLBinding{{Key: "url", Path: "url", RouteName: "app", NamespaceRef: "lab"}}, plan.Bindings.RootURLs)
+		assert.Equal(t, setup.HelmReleaseName("user1", "ref1", "shared/chart", plan.Bindings.Namespaces), plan.ReleaseName)
+		cwd, err := os.Getwd()
+		require.NoError(t, err)
+		relativeRoot, err := filepath.Rel(cwd, root)
+		require.NoError(t, err)
+		relativePlan, err := setup.Prepare(relativeRoot, "lab", "user1", "ref1")
+		require.NoError(t, err)
+		assert.Equal(t, plan, relativePlan, "snapshot spelling must not change absolute chart directory or identity")
+	})
+	for _, tc := range []struct {
+		name, chart, schema string
+		wantErr             error
+	}{
+		{name: "content only", wantErr: setup.ErrChartNotFound},
+		{name: "optional bundle schema required for setup", chart: "setup/helm", wantErr: setup.ErrChartNotFound},
+		{name: "namespace binding required", chart: "setup/helm", schema: "{}", wantErr: setup.ErrNamespaceBindingsMissing},
+		{name: "invalid schema", chart: "setup/helm", schema: "{", wantErr: bundle.ErrLabInvalid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, _ := moduleLab(t)
+			if tc.chart != "" {
+				writeFile(t, filepath.Join(root, tc.chart, "Chart.yaml"), validChart)
+			}
+			if tc.schema != "" {
+				writeFile(t, filepath.Join(root, tc.chart, "values.schema.json"), tc.schema)
+			}
+			if !errors.Is(tc.wantErr, bundle.ErrLabInvalid) {
+				result, err := bundle.LoadFromSnapshot(root, "lab")
+				require.NoError(t, err, "setup requirements must not invalidate bundle content")
+				assert.Equal(t, tc.chart != "", result.HelmChartAvailable)
+			}
+			plan, err := setup.Prepare(root, "lab", "user1", "ref1")
+			require.ErrorIs(t, err, tc.wantErr)
+			assert.Nil(t, plan)
+		})
+	}
+	for _, tc := range []struct {
+		name, labPath string
+		change        func(*testing.T, string, string)
+		wantErr       error
+	}{
+		{name: "snapshot missing", labPath: "lab", change: func(t *testing.T, root, _ string) { require.NoError(t, os.RemoveAll(root)) }, wantErr: bundle.ErrRepositoryUnavailable},
+		{name: "lab missing", labPath: "missing", wantErr: bundle.ErrManifestMissing},
+		{name: "traversing lab", labPath: "../lab", wantErr: bundle.ErrLabInvalid},
+		{name: "symlink lab", labPath: "alias", change: func(t *testing.T, root, lab string) {
+			require.NoError(t, os.Symlink(lab, filepath.Join(root, "alias")))
+		}, wantErr: bundle.ErrLabInvalid},
+		{name: "invalid content", labPath: "lab", change: func(t *testing.T, _, lab string) { require.NoError(t, os.RemoveAll(filepath.Join(lab, "modules"))) }, wantErr: bundle.ErrLabInvalid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, lab := moduleLab(t)
+			if tc.change != nil {
+				tc.change(t, root, lab)
+			}
+			plan, err := setup.Prepare(root, tc.labPath, "user1", "ref1")
+			require.ErrorIs(t, err, tc.wantErr)
+			assert.Nil(t, plan)
+		})
+	}
+}
+
+func TestChartSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name, override, selected string
+		charts                   []string
+	}{
+		{name: "content only"},
+		{name: "root fallback", charts: []string{"setup/helm"}, selected: "setup/helm"},
+		{name: "lab local wins", charts: []string{"setup/helm", "lab/setup/helm"}, selected: "lab/setup/helm"},
+		{name: "explicit wins", override: "custom", charts: []string{"setup/helm", "lab/setup/helm", "lab/custom"}, selected: "lab/custom"},
+		{name: "safe parent traversal", override: "../shared/chart", charts: []string{"shared/chart"}, selected: "shared/chart"},
+		{name: "equivalent spelling", override: "./../shared/./chart/", charts: []string{"shared/chart"}, selected: "shared/chart"},
+		{name: "empty override uses defaults", override: "", charts: []string{"lab/setup/helm"}, selected: "lab/setup/helm"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given valid module content and distinct chart/schema pairs.
+			root, lab := moduleLab(t)
+			chartOverride(t, lab, tc.override)
+			for _, chart := range tc.charts {
+				writeFile(t, filepath.Join(root, chart, "Chart.yaml"), validChart)
+				writeFile(t, filepath.Join(root, chart, "values.schema.json"), fmt.Sprintf(`{"properties":{%q:{"x-interactive-labs":{"kind":"namespace-name"}}}}`, chart))
+			}
+			// When loading through the shared snapshot boundary.
+			result, err := bundle.LoadFromSnapshot(root, "lab")
+			// Then browser gets availability, while setup gets only its prepared data.
+			require.NoError(t, err)
+			assert.Equal(t, tc.selected != "", result.HelmChartAvailable)
+			plan, err := setup.Prepare(root, "lab", "user1", "ref1")
+			if tc.selected == "" {
+				require.ErrorIs(t, err, setup.ErrChartNotFound)
+				assert.Nil(t, plan)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, filepath.Join(root, tc.selected), plan.ChartDir)
+				assert.Equal(t, []setup.NamespaceBinding{{Key: tc.selected, Path: tc.selected}}, plan.Bindings.Namespaces)
+				assert.Equal(t, setup.HelmReleaseName("user1", "ref1", tc.selected, plan.Bindings.Namespaces), plan.ReleaseName)
+			}
+		})
+	}
+	t.Run("lab at repository root", func(t *testing.T) {
+		_, root := moduleLab(t)
+		writeFile(t, filepath.Join(root, "setup/helm/Chart.yaml"), validChart)
+		writeFile(t, filepath.Join(root, "setup/helm/values.schema.json"), `{"properties":{"lab":{"x-interactive-labs":{"kind":"namespace-name"}}}}`)
+		result, err := bundle.LoadFromSnapshot(root, ".")
+		require.NoError(t, err)
+		assert.True(t, result.HelmChartAvailable)
+		plan, err := setup.Prepare(root, ".", "user1", "ref1")
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(root, "setup/helm"), plan.ChartDir)
+		assert.Equal(t, setup.HelmReleaseName("user1", "ref1", "setup/helm", plan.Bindings.Namespaces), plan.ReleaseName)
+	})
+	t.Run("schema is optional", func(t *testing.T) {
+		root, _ := moduleLab(t)
+		writeFile(t, filepath.Join(root, "setup/helm/Chart.yaml"), validChart)
+		result, err := bundle.LoadFromSnapshot(root, "lab")
+		require.NoError(t, err)
+		assert.True(t, result.HelmChartAvailable)
+		plan, err := setup.Prepare(root, "lab", "user1", "ref1")
+		require.ErrorIs(t, err, setup.ErrChartNotFound)
+		assert.Nil(t, plan)
+	})
+	for _, tc := range []struct {
+		name, override string
+		change         func(*testing.T, string, string)
+	}{
+		{name: "explicit missing", override: "missing"},
+		{name: "explicit points directly at chart not setup parent", override: "setup", change: func(t *testing.T, _, lab string) {
+			writeFile(t, filepath.Join(lab, "setup/helm/Chart.yaml"), validChart)
+		}},
+		{name: "invalid explicit does not use either default", override: "custom", change: func(t *testing.T, _, lab string) {
+			writeFile(t, filepath.Join(lab, "setup/helm/Chart.yaml"), validChart)
+			writeFile(t, filepath.Join(lab, "custom/Chart.yaml"), "name: test\nversion: bad\n")
+		}},
+		{name: "missing explicit does not use local default", override: "missing", change: func(t *testing.T, _, lab string) {
+			writeFile(t, filepath.Join(lab, "setup/helm/Chart.yaml"), validChart)
+		}},
+		{name: "repository escape", override: "../../outside"},
+		{name: "absolute", override: "/tmp/chart"},
+		{name: "URL", override: "https://example.test/chart"},
+		{name: "backslash", override: `..\shared`},
+		{name: "encoded traversal", override: "../%2e%2e/chart"},
+		{name: "control", override: "bad\npath"},
+		{name: "selected local directory empty", change: func(t *testing.T, _, lab string) {
+			require.NoError(t, os.MkdirAll(filepath.Join(lab, "setup/helm"), 0o755))
+		}},
+		{name: "selected local is file", change: func(t *testing.T, _, lab string) {
+			writeFile(t, filepath.Join(lab, "setup/helm"), "not a directory")
+		}},
+		{name: "selected local parent is file", change: func(t *testing.T, _, lab string) {
+			writeFile(t, filepath.Join(lab, "setup"), "not a directory")
+		}},
+		{name: "selected local malformed chart", change: func(t *testing.T, _, lab string) {
+			writeFile(t, filepath.Join(lab, "setup/helm/Chart.yaml"), "name: test\nversion: not-semver\n")
+		}},
+		{name: "selected local malformed values", change: func(t *testing.T, _, lab string) {
+			writeFile(t, filepath.Join(lab, "setup/helm/Chart.yaml"), validChart)
+			writeFile(t, filepath.Join(lab, "setup/helm/values.yaml"), "[")
+		}},
+		{name: "malformed schema", change: func(t *testing.T, root, _ string) {
+			writeFile(t, filepath.Join(root, "setup/helm/values.schema.json"), "{")
+		}},
+		{name: "nonobject schema", change: func(t *testing.T, root, _ string) {
+			writeFile(t, filepath.Join(root, "setup/helm/values.schema.json"), "null")
+		}},
+		{name: "invalid binding schema", change: func(t *testing.T, root, _ string) {
+			writeFile(t, filepath.Join(root, "setup/helm/values.schema.json"), `{"properties":[]}`)
+		}},
+		{name: "mistyped annotation", change: func(t *testing.T, root, _ string) {
+			writeFile(t, filepath.Join(root, "setup/helm/values.schema.json"), `{"properties":{"lab":{"x-interactive-labs":{"kind":42}}}}`)
+		}},
+		{name: "nested mistyped route name", change: func(t *testing.T, root, _ string) {
+			writeFile(t, filepath.Join(root, "setup/helm/values.schema.json"), `{"properties":{"app":{"properties":{"url":{"x-interactive-labs":{"kind":"root-url","routeName":42}}}}}}`)
+		}},
+		{name: "schema directory", change: func(t *testing.T, root, _ string) {
+			require.NoError(t, os.Mkdir(filepath.Join(root, "setup/helm/values.schema.json"), 0o755))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given a valid fallback, invalid selected configuration must not use it.
+			root, lab := moduleLab(t)
+			writeFile(t, filepath.Join(root, "setup/helm/Chart.yaml"), validChart)
+			chartOverride(t, lab, tc.override)
+			if tc.change != nil {
+				tc.change(t, root, lab)
+			}
+			_, err := bundle.LoadFromSnapshot(root, "lab")
+			require.ErrorIs(t, err, bundle.ErrLabInvalid)
+			_, err = setup.Prepare(root, "lab", "user1", "ref1")
+			require.ErrorIs(t, err, bundle.ErrLabInvalid)
+		})
+	}
+	t.Run("invalid root chart is not content only", func(t *testing.T) {
+		root, _ := moduleLab(t)
+		writeFile(t, filepath.Join(root, "setup/helm/Chart.yaml"), "name: test\nversion: bad\n")
+		_, err := bundle.LoadFromSnapshot(root, "lab")
+		require.ErrorIs(t, err, bundle.ErrLabInvalid)
+		_, err = setup.Prepare(root, "lab", "user1", "ref1")
+		require.ErrorIs(t, err, bundle.ErrLabInvalid)
+	})
+}
+
+func TestChartSymlinks(t *testing.T) {
+	for _, tc := range []struct {
+		name, link, target, override string
+	}{
+		{name: "implicit root directory", link: "setup/helm", target: "shared/chart"},
+		{name: "implicit local directory", link: "lab/setup/helm", target: "shared/chart"},
+		{name: "explicit directory", link: "lab/custom", target: "shared/chart", override: "custom"},
+		{name: "explicit parent", link: "alias", target: "shared", override: "../alias/chart"},
+		{name: "canceled symlink segment", link: "alias", target: "shared", override: "../alias/../shared/chart"},
+		{name: "chart metadata", link: "shared/chart/Chart.yaml", target: "metadata.yaml", override: "../shared/chart"},
+		{name: "schema", link: "shared/chart/values.schema.json", target: "schema.json", override: "../shared/chart"},
+		{name: "template file", link: "shared/chart/templates/link.yaml", target: "metadata.yaml", override: "../shared/chart"},
+		{name: "template directory", link: "shared/chart/templates", target: "shared/templates", override: "../shared/chart"},
+		{name: "subchart directory", link: "shared/chart/charts/dependency", target: "shared/templates", override: "../shared/chart"},
+		{name: "ignored link", link: "shared/chart/ignored", target: "metadata.yaml", override: "../shared/chart"},
+		{name: "dangling link", link: "shared/chart/dangling", target: "missing", override: "../shared/chart"},
+		{name: "outside repository", link: "shared/chart/outside", override: "../shared/chart"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, lab := moduleLab(t)
+			writeFile(t, filepath.Join(root, "shared/chart/Chart.yaml"), validChart)
+			writeFile(t, filepath.Join(root, "shared/chart/.helmignore"), "ignored\n")
+			writeFile(t, filepath.Join(root, "shared/templates/file.yaml"), "kind: ConfigMap\n")
+			writeFile(t, filepath.Join(root, "metadata.yaml"), validChart)
+			writeFile(t, filepath.Join(root, "schema.json"), "{}")
+			chartOverride(t, lab, tc.override)
+			link := filepath.Join(root, tc.link)
+			require.NoError(t, os.MkdirAll(filepath.Dir(link), 0o755))
+			if tc.link == "shared/chart/Chart.yaml" {
+				require.NoError(t, os.Remove(link))
+			}
+			target := filepath.Join(root, tc.target)
+			if tc.target == "" {
+				target = filepath.Join(t.TempDir(), "secret")
+				writeFile(t, target, "outside data")
+			}
+			require.NoError(t, os.Symlink(target, link))
+			_, err := bundle.LoadFromSnapshot(root, "lab")
+			require.ErrorIs(t, err, bundle.ErrLabInvalid)
+			_, err = setup.Prepare(root, "lab", "user1", "ref1")
+			require.ErrorIs(t, err, bundle.ErrLabInvalid)
+		})
+	}
 }
