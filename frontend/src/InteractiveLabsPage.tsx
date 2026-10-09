@@ -123,6 +123,26 @@ const consoleGuidanceRegistry: Record<string, { route?: string }> = {
   "qs-masthead-help": {},
 };
 
+const handleCopyButton = (event: { target: EventTarget | null; preventDefault: () => void }): boolean => {
+  const copyButton = (event.target as Element).closest("button.copy-to-clipboard") as HTMLButtonElement | null;
+  if (!copyButton) return false;
+  event.preventDefault();
+  const code = copyButton.closest("pre")?.querySelector("code");
+  if (code) {
+    const savedHTML = copyButton.innerHTML;
+    navigator.clipboard.writeText(code.textContent ?? "").then(() => {
+      copyButton.classList.add("copied");
+      copyButton.innerHTML =
+        '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+      setTimeout(() => {
+        copyButton.classList.remove("copied");
+        copyButton.innerHTML = savedHTML;
+      }, 1500);
+    }).catch(() => {});
+  }
+  return true;
+};
+
 const routeMatches = (
   location: { pathname: string; search: string },
   expected: { pathname: string; search: string },
@@ -442,6 +462,9 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
 
   const handleRenderedLink = React.useCallback((event: React.MouseEvent<HTMLDivElement> | MouseEvent): void => {
     if (event.defaultPrevented || event.button !== 0 || !activePanel) return;
+
+    if (handleCopyButton(event)) return;
+
     const link = (event.target as Element).closest("a[href]") as HTMLAnchorElement | null;
     const href = link?.getAttribute("href");
     const guidanceID = link?.dataset.interactiveLabsGuidanceId;
@@ -929,7 +952,10 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
   }, [item, defaultNamespace]);
 
   const template = document.createElement("template");
-  if (state.status === "success") template.innerHTML = state.result.html;
+  if (state.status === "success") {
+    template.innerHTML = state.result.html;
+    template.content.querySelectorAll("button.copy-to-clipboard").forEach((button) => button.remove());
+  }
   const paragraph = template.content.querySelector("div.paragraph > p, p");
   const preview = paragraph?.parentElement?.matches("div.paragraph") ? paragraph.parentElement : paragraph;
   const previewHTML = preview?.outerHTML;
