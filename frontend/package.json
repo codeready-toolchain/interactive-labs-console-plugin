@@ -56,7 +56,7 @@
   },
   "dependencies": {
     "@asciidoctor/core": "4.0.11",
-    "@openshift-console/dynamic-plugin-sdk": "4.21.0",
+    "@openshift-console/dynamic-plugin-sdk": "4.23.0-prerelease.5",
     "@patternfly/react-core": "6.6.1",
     "dompurify": "3.4.14",
     "highlight.js": "11.12.0",
