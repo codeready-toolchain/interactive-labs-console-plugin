@@ -13,7 +13,6 @@ env:
   GOPATH: /tmp/go
   IMAGE_REGISTRY: quay.io
   REGISTRY_USER: "codeready-toolchain+push"
-  REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
 
 jobs:
   binary:
@@ -21,11 +20,15 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v6
       with:
         fetch-depth: 0
+        persist-credentials: false
 
     - name: Set short SHA
       id: short-sha
@@ -42,6 +45,8 @@ jobs:
 
     - name: Log into quay.io
       uses: redhat-actions/podman-login@v1
+      env:
+        REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
       with:
         registry: ${{ env.IMAGE_REGISTRY }}
         username: ${{ env.REGISTRY_USER }}
