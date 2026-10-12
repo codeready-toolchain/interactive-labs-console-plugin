@@ -1,0 +1,56 @@
+name: Build & Push Image
+on:
+  push:
+    branches:
+    - master
+    tags-ignore:
+    - '*.*'
+    paths-ignore:
+    - 'deploy/**'
+    - 'tools/**'
+    - 'README.md'
+env:
+  GOPATH: /tmp/go
+  IMAGE_REGISTRY: quay.io
+  REGISTRY_USER: "codeready-toolchain+push"
+  REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+
+jobs:
+  binary:
+    name: Build and Push Image
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Set short SHA
+      id: short-sha
+      run: echo "COMMIT_SHORT_SHA=$(git rev-parse --short ${GITHUB_SHA})" >> ${GITHUB_ENV}
+
+    - name: Buildah Action
+      id: build-image
+      uses: redhat-actions/buildah-build@v3
+      with:
+        image: codeready-toolchain/interactive-labs-console-plugin
+        tags: latest ${{ env.COMMIT_SHORT_SHA }}
+        containerfiles: Containerfile
+        platforms: linux/amd64
+
+    - name: Log into quay.io
+      uses: redhat-actions/podman-login@v1
+      with:
+        registry: ${{ env.IMAGE_REGISTRY }}
+        username: ${{ env.REGISTRY_USER }}
+        password: ${{ env.REGISTRY_PASSWORD }}
+
+    - name: Push to quay.io
+      id: push-to-quay
+      uses: redhat-actions/push-to-registry@v2
+      with:
+        image: ${{ steps.build-image.outputs.image }}
+        tags: ${{ steps.build-image.outputs.tags }}
+        registry: quay.io
