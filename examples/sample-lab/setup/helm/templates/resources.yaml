@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sample-info
+  namespace: {{ .Values.namespaces.demo | quote }}
+data:
+  root-url: {{ .Values.demo.rootUrl | quote }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sample-credentials
+  namespace: {{ .Values.namespaces.demo | quote }}
+type: Opaque
+stringData:
+  password: {{ .Values.demo.password | quote }}

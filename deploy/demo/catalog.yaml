@@ -4,6 +4,9 @@ metadata:
   name: interactive-labs-catalog
 data:
   catalog.yaml: |
+    - repository: https://github.com/codeready-toolchain/interactive-labs-console-plugin.git
+      branch: master
+      labPath: examples/sample-lab
     - repository: https://github.com/metlos/devsandbox-ocp-getting-started-lab.git
       branch: master
       labPath: lab

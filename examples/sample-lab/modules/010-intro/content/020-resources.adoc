@@ -1,0 +1,26 @@
+= Explore resources
+
+Open console:qs-nav-topology[Topology] for fixed Console guidance.
+Open resource:v1/Pod[Pods] in the active Console project (or All Projects).
+Open resource:project.openshift.io/v1/Project[Projects,scope=cluster] for a cluster-scoped list.
+These links navigate Console, not execute commands or create resources.
+
+ifdef::namespaces-demo[]
+== Inspect optional setup
+
+Setup provisioned namespace `{namespaces-demo}`.
+Open resource:v1/ConfigMap[Sample ConfigMap,scope=namespaced,namespace={namespaces-demo},name=sample-info]
+or resource:v1/Secret[Sample Secret,scope=namespaced,namespace={namespaces-demo},name=sample-credentials].
+
+The generated demo password is `{demo-password}`. It is illustrative, not an application login.
+Treat rendered credentials as secrets; do not copy them into published content.
+
+The computed hostname is `{demo-rootUrl}` (no scheme).
+This minimal chart stores it in the ConfigMap; it does not deploy a server or Route.
+endif::[]
+
+ifndef::namespaces-demo[]
+NOTE: Setup is inactive in this repository layout. See the sample README to publish this lab at a standalone repository root and activate its illustrative chart.
+endif::[]
+
+Return to xref:010-start.adoc[the introduction], or use the drawer's Previous button.
