@@ -161,7 +161,7 @@ type setupContext struct {
 	subject  string
 	entry    *catalog.Entry
 	result   *bundle.Result
-	bindings setup.SchemaBindings
+	bindings []setup.SchemaBinding
 }
 
 func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*setupContext, bool) {
@@ -214,12 +214,7 @@ func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*s
 			laberr.New(laberr.TypeConfigurationError, "invalid values schema", nil))
 		return nil, false
 	}
-	if bindings == nil {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeConfigurationError, "failed to parse values schema", nil))
-		return nil, false
-	}
-	if len(bindings.Namespaces) == 0 {
+	if len(setup.BindingsByKind(bindings, setup.KindNamespaceName)) == 0 {
 		writeError(w, http.StatusUnprocessableEntity,
 			laberr.New(laberr.TypeConfigurationError, "values schema declares no namespace bindings", nil))
 		return nil, false
@@ -230,7 +225,7 @@ func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*s
 		subject:  subject,
 		entry:    entry,
 		result:   result,
-		bindings: *bindings,
+		bindings: bindings,
 	}, true
 }
 
@@ -327,6 +322,7 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
 		return
 	}
+	cfg.Logger.Info("bundle loaded", "repository", entry.Repository, "branch", entry.Branch, "commit", result.Revision)
 
 	type page struct {
 		Path string `json:"path"`
@@ -481,7 +477,8 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		tierName = "base1ns"
 	}
 
-	for _, b := range sctx.bindings.Namespaces {
+	nsBindings := setup.BindingsByKind(sctx.bindings, setup.KindNamespaceName)
+	for _, b := range nsBindings {
 		if err := cfg.SetupClient.EnsureSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key, tierName); err != nil {
 			cfg.Logger.Error("create SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
 			writeError(w, http.StatusBadGateway,
@@ -490,7 +487,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		}
 	}
 
-	releaseName := setup.HelmReleaseName(sctx.subject, sctx.entry.CatalogRef, sctx.bindings.Namespaces)
+	releaseName := setup.HelmReleaseName(sctx.subject, sctx.entry.CatalogRef, nsBindings)
 
 	// If Helm is available, check if already deployed (re-launch no-op).
 	if cfg.HelmManager != nil {
@@ -498,7 +495,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 		if err == nil && status == "deployed" {
 			writeJSON(w, http.StatusOK, buildSetupStatusResponse(
 				"ready", nil, // SpaceRequests assumed ready if Helm is deployed
-				"deployed", releaseName, "", nil, nil,
+				"deployed", releaseName, "", nil,
 			))
 			return
 		}
@@ -525,7 +522,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 
 	writeJSON(w, http.StatusAccepted, buildSetupStatusResponse(
 		"provisioning", nil,
-		"pending", releaseName, "", nil, nil,
+		"pending", releaseName, "", nil,
 	))
 }
 
@@ -534,10 +531,14 @@ const (
 	setupWorkerPollTimeout  = 30 * time.Minute
 )
 
-func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, bindings setup.SchemaBindings, helmTimeout time.Duration) {
+func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, bindings []setup.SchemaBinding, helmTimeout time.Duration) {
 	setState := func(phase, errMsg string) {
 		activeSetups.Store(releaseName, &workerState{phase: phase, err: errMsg})
 	}
+
+	nsBindings := setup.BindingsByKind(bindings, setup.KindNamespaceName)
+	pwBindings := setup.BindingsByKind(bindings, setup.KindGeneratedPassword)
+	urlBindings := setup.BindingsByKind(bindings, setup.KindRootURL)
 
 	// Phase 1: wait for all SpaceRequests to become ready.
 	pollCtx, pollCancel := context.WithTimeout(context.Background(), setupWorkerPollTimeout)
@@ -546,7 +547,7 @@ func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, 
 	var nsValues map[string]string
 	for {
 		var err error
-		nsValues, err = setup.MapBindingsToValues(pollCtx, cfg.SetupClient, token, namespace, bindings.Namespaces)
+		nsValues, err = setup.MapBindingsToValues(pollCtx, cfg.SetupClient, token, namespace, nsBindings)
 		if err == nil {
 			for path, nsName := range nsValues {
 				cfg.Logger.Info("namespace ready", "release", releaseName, "binding", path, "namespace", nsName)
@@ -570,13 +571,13 @@ func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, 
 	for k, v := range nsValues {
 		values[k] = v
 	}
-	if len(bindings.Passwords) > 0 {
-		pwPaths := make([]string, len(bindings.Passwords))
-		for i, b := range bindings.Passwords {
+	if len(pwBindings) > 0 {
+		pwPaths := make([]string, len(pwBindings))
+		for i, b := range pwBindings {
 			pwPaths[i] = b.Path
 		}
 		cfg.Logger.Info("generating passwords", "release", releaseName, "paths", pwPaths)
-		pwValues, err := setup.GeneratePasswordValues(bindings.Passwords)
+		pwValues, err := setup.GeneratePasswordValues(pwBindings)
 		if err != nil {
 			cfg.Logger.Error("password generation failed", "release", releaseName, "err", err)
 			setState("failed", "password generation failed")
@@ -588,17 +589,17 @@ func runSetupWorker(cfg Config, token, namespace, releaseName, chartDir string, 
 		cfg.Logger.Info("passwords generated", "release", releaseName, "count", len(pwValues))
 	}
 
-	for _, b := range bindings.RootURLs {
+	for _, b := range urlBindings {
 		if cfg.ClusterIngressDomain == "" {
 			cfg.Logger.Error("cluster ingress domain not configured but required by schema", "release", releaseName, "path", b.Path)
 			setState("failed", "cluster ingress domain not configured")
 			return
 		}
-		nsPath := setup.NamespaceBindingPath(bindings.Namespaces, b.NamespaceRef)
+		nsPath := setup.BindingPath(nsBindings, b.NamespaceRef)
 		nsName := nsValues[nsPath]
 		if nsName == "" {
-			availableKeys := make([]string, len(bindings.Namespaces))
-			for i, nb := range bindings.Namespaces {
+			availableKeys := make([]string, len(nsBindings))
+			for i, nb := range nsBindings {
 				availableKeys[i] = nb.Key
 			}
 			cfg.Logger.Error("root-url references unknown namespace binding", "release", releaseName, "namespaceRef", b.NamespaceRef, "nsPath", nsPath, "availableKeys", availableKeys, "nsValues", nsValues)
@@ -661,16 +662,17 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 
 	userNamespace := sctx.subject + "-dev"
+	nsBindings := setup.BindingsByKind(sctx.bindings, setup.KindNamespaceName)
 
 	type namespaceStatus struct {
 		Status string `json:"status"`
 		Name   string `json:"name"`
 	}
-	namespaces := make(map[string]namespaceStatus, len(sctx.bindings.Namespaces))
+	namespaces := make(map[string]namespaceStatus, len(nsBindings))
 	allReady := true
 	anyFailed := false
 
-	for _, b := range sctx.bindings.Namespaces {
+	for _, b := range nsBindings {
 		sr, err := cfg.SetupClient.GetSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key)
 		if err != nil {
 			cfg.Logger.Warn("get SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
@@ -703,21 +705,28 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 		srStatus = "ready"
 	}
 
-	releaseName := setup.HelmReleaseName(sctx.subject, sctx.entry.CatalogRef, sctx.bindings.Namespaces)
+	releaseName := setup.HelmReleaseName(sctx.subject, sctx.entry.CatalogRef, nsBindings)
 	helmStatus := "pending"
 	helmMessage := ""
-	var generatedValues map[string]string
+	var releaseValues map[string]string
 
 	if cfg.HelmManager != nil {
 		releaseStatus, err := cfg.HelmManager.ReleaseStatus(r.Context(), releaseName, userNamespace, sctx.token)
 		if err == nil && releaseStatus != "" {
 			helmStatus = setup.HelmStatusLabel(releaseStatus)
-			if helmStatus == "deployed" && len(sctx.bindings.Passwords) > 0 {
-				paths := make([]string, len(sctx.bindings.Passwords))
-				for i, b := range sctx.bindings.Passwords {
-					paths[i] = b.Path
+			if helmStatus == "deployed" {
+				var valuePaths []string
+				for _, b := range sctx.bindings {
+					// Namespace and root-URL bindings are resolved from SpaceRequest/cluster
+					// config, not from Helm values — skip them here.
+					if b.Kind == setup.KindNamespaceName || b.Kind == setup.KindRootURL {
+						continue
+					}
+					valuePaths = append(valuePaths, b.Path)
 				}
-				generatedValues, _ = cfg.HelmManager.ReleaseValues(r.Context(), releaseName, userNamespace, sctx.token, paths)
+				if len(valuePaths) > 0 {
+					releaseValues, _ = cfg.HelmManager.ReleaseValues(r.Context(), releaseName, userNamespace, sctx.token, valuePaths)
+				}
 			}
 		} else if val, loaded := activeSetups.Load(releaseName); loaded {
 			state := val.(*workerState)
@@ -735,43 +744,42 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 
 	var attributes map[string]string
 	if allReady && helmStatus == "deployed" {
-		attributes = make(map[string]string, len(sctx.bindings.Namespaces)+len(sctx.bindings.Passwords)+len(sctx.bindings.RootURLs))
-		for _, b := range sctx.bindings.Namespaces {
-			attributes[strings.ReplaceAll(b.Path, ".", "-")] = namespaces[b.Key].Name
-		}
-		for _, b := range sctx.bindings.Passwords {
-			if v, ok := generatedValues[b.Path]; ok {
-				attributes[strings.ReplaceAll(b.Path, ".", "-")] = v
+		attributes = make(map[string]string, len(sctx.bindings))
+		for _, b := range sctx.bindings {
+			key := strings.ReplaceAll(b.Path, ".", "-")
+			switch b.Kind {
+			case setup.KindNamespaceName:
+				attributes[key] = namespaces[b.Key].Name
+			case setup.KindRootURL:
+				if cfg.ClusterIngressDomain == "" {
+					continue
+				}
+				ns, ok := namespaces[b.NamespaceRef]
+				if !ok {
+					continue
+				}
+				attributes[key] = fmt.Sprintf("%s-%s.%s", b.RouteName, ns.Name, cfg.ClusterIngressDomain)
+			default:
+				if v, ok := releaseValues[b.Path]; ok {
+					attributes[key] = v
+				}
 			}
-		}
-		for _, b := range sctx.bindings.RootURLs {
-			if cfg.ClusterIngressDomain == "" {
-				continue
-			}
-			ns, ok := namespaces[b.NamespaceRef]
-			if !ok {
-				continue
-			}
-			attributes[strings.ReplaceAll(b.Path, ".", "-")] = fmt.Sprintf("%s-%s.%s", b.RouteName, ns.Name, cfg.ClusterIngressDomain)
 		}
 	}
 
 	if len(attributes) > 0 {
 		cfg.Logger.Info("setup status attributes", "keys", slices.Sorted(maps.Keys(attributes)))
 	}
-	writeJSON(w, http.StatusOK, buildSetupStatusResponse(srStatus, namespaces, helmStatus, releaseName, helmMessage, generatedValues, attributes))
+	writeJSON(w, http.StatusOK, buildSetupStatusResponse(srStatus, namespaces, helmStatus, releaseName, helmMessage, attributes))
 }
 
-func buildSetupStatusResponse(srStatus string, namespaces any, helmStatus, releaseName, helmMessage string, generatedValues, attributes map[string]string) map[string]any {
+func buildSetupStatusResponse(srStatus string, namespaces any, helmStatus, releaseName, helmMessage string, attributes map[string]string) map[string]any {
 	helm := map[string]any{
 		"status":      helmStatus,
 		"releaseName": releaseName,
 	}
 	if helmMessage != "" {
 		helm["message"] = helmMessage
-	}
-	if len(generatedValues) > 0 {
-		helm["generatedValues"] = generatedValues
 	}
 	resp := map[string]any{
 		"apiVersion": "v1alpha1",

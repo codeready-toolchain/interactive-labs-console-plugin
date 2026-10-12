@@ -25,7 +25,7 @@ func GeneratePassword() (string, error) {
 
 // GeneratePasswordValues creates a random password for each generated-password
 // binding and returns them as a Helm values map.
-func GeneratePasswordValues(bindings []ValueBinding) (map[string]string, error) {
+func GeneratePasswordValues(bindings []SchemaBinding) (map[string]string, error) {
 	values := make(map[string]string, len(bindings))
 	for _, b := range bindings {
 		pw, err := GeneratePassword()
