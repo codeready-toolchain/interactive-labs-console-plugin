@@ -130,15 +130,24 @@ const handleCopyButton = (event: { target: EventTarget | null; preventDefault: (
   const code = copyButton.closest("pre")?.querySelector("code");
   if (code) {
     const savedHTML = copyButton.innerHTML;
-    navigator.clipboard.writeText(code.textContent ?? "").then(() => {
-      copyButton.classList.add("copied");
-      copyButton.innerHTML =
-        '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
-      setTimeout(() => {
-        copyButton.classList.remove("copied");
-        copyButton.innerHTML = savedHTML;
-      }, 1500);
-    }).catch(() => {});
+    const hadAriaLabel = copyButton.hasAttribute("aria-label");
+    const savedAriaLabel = copyButton.getAttribute("aria-label");
+    navigator.clipboard?.writeText(code.textContent ?? "").catch(() => {});
+    copyButton.classList.add("copied");
+    copyButton.setAttribute("aria-label", "Copied to clipboard");
+    copyButton.innerHTML =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+    const tooltip = document.createElement("span");
+    tooltip.className = "copy-tooltip";
+    tooltip.textContent = "Copied!";
+    copyButton.appendChild(tooltip);
+    setTimeout(() => {
+      copyButton.classList.remove("copied");
+      tooltip.remove();
+      copyButton.innerHTML = savedHTML;
+      if (hadAriaLabel) copyButton.setAttribute("aria-label", savedAriaLabel!);
+      else copyButton.removeAttribute("aria-label");
+    }, 1500);
   }
   return true;
 };

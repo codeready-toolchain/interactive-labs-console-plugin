@@ -599,7 +599,7 @@
   padding: 0.75rem;
 }
 
-.interactive-labs-content pre.highlight {
+.interactive-labs-content .listingblock .content > pre {
   position: relative;
 }
 
@@ -631,6 +631,21 @@
 .interactive-labs-content .copy-to-clipboard.copied {
   opacity: 1;
   color: var(--color-evergreen-70, #28a745);
+}
+
+.interactive-labs-content .copy-to-clipboard .copy-tooltip {
+  position: absolute;
+  right: calc(100% + 0.4rem);
+  top: 50%;
+  transform: translateY(-50%);
+  background: #151515;
+  color: #fff;
+  font-size: 0.8125rem;
+  line-height: 1;
+  padding: 0.3rem 0.5rem;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 .interactive-labs-content .listingblock code[data-lang]::before {
