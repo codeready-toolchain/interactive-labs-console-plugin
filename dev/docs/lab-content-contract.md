@@ -1,6 +1,6 @@
 # Lab content contract
 
-This document describes current lab authoring and bundle behavior. See [lab setup design](lab-setup-design.md) for chart-backed setup.
+This document describes current lab authoring and bundle behavior. Start with the [lab author guide and runnable sample](../../examples/sample-lab/README.md); see [lab setup design](lab-setup-design.md) for chart-backed setup.
 
 ## Catalog entry
 
@@ -72,8 +72,21 @@ Each checkpoint needs nonempty string `id`, `type: manual`, `pagePath`, and `lab
 Effective attributes merge in this order; later layer wins:
 
 ```text
-manifest spec.attributes -> catalog attributeOverrides -> backend runtime attributes
+lab.yaml spec.attributes -> catalog entry attributeOverrides -> backend runtime attributes
 ```
+
+Authors define string values in the lab's `lab.yaml` `spec.attributes` map. Administrators set optional string-valued overrides under `attributeOverrides` on each catalog entry inside the ConfigMap's `data.catalog.yaml` sequence—not as top-level ConfigMap data. See the [administrator guide](administrator-guide.md#configure-catalog) for a catalog entry example.
+
+For example, `lab.yaml` can contain:
+
+```yaml
+spec:
+  attributes:
+    lab-title: "Sample lab"
+    greeting: "Hello"
+```
+
+An AsciiDoc page can use `{greeting}, welcome to {lab-title}.`; a same-named catalog override replaces the manifest value. These attributes affect rendered content only: overriding `lab-title` does not change `metadata.title` or the catalog display title.
 
 Runtime attributes are backend-only, request-scoped, excluded from `CatalogList`, `catalogRef`, and Helm release-name derivation. Bundle responses are all-or-nothing: backend returns `503 runtime_attributes_unavailable` rather than exposing a bundle if any required value is unavailable or empty.
 
@@ -91,24 +104,24 @@ Backend reads cluster configuration with its service account on each bundle requ
 - Bundle groups navigable pages by module with module-qualified lab-relative paths and backend-relative approved resource paths. Client resolves each only through Console proxy. Backend serves `GET /api/v1alpha1/labs/{catalogRef}/resources/{repositoryRelativePath...}` from cached snapshot, permitting same-repository includes/images outside `labPath`. A quoted snapshot Git `HEAD` SHA is shared resource `ETag`, with `Cache-Control: private, no-cache`; resource-size caps are not yet enforced. Refresh is atomic; `catalogRef` stays stable and browser receives neither update notification nor revision pin.
 - First page of first sorted module is entry page. A native module dropdown appears only for multiple modules, listing modules (not pages). Initially it shows literal directory IDs; after setup, first navigable page title for each module is fetched in background, parsed with effective attributes, sanitized to plain text, and replaces ID when available. Failed/empty titles keep ID. Selection opens that module's first page; Previous/Next cross module boundaries while `Page j of n` counts pages in active module. Only `{currentPagePath, panelMode}` is saved per `catalogRef`; explicit relaunch restores a still-valid page or starts at entry, never auto-opens.
 - Navigable pages sort lexically; first is entry page; `_` paths remain include-only. Relative links resolve from active source and navigate drawer only when result matches known page descriptor; same-page fragments remain anchors. Absolute external HTTP(S) links open safe new tab. Same-origin non-plugin-proxy links use Console navigation while drawer stays open. Plugin backend resource URLs and unknown relative links warn. A validated description link to `modules/<id>/content/...` explicitly launches target after bundle validation and chart setup.
-- Render documented restricted AsciiDoc subset with exact pinned dependencies. Backend-final attributes are hard-set in Asciidoctor. DOMPurify's final AsciiDoc pass uses its default allowlist (HTML, SVG, SVG filters, and MathML) and forbids `style`/`form` elements and `style` attributes; it runs before Mermaid insertion. No custom allowlist or hook is configured. Highlight source from text content; Mermaid runs strict with no auto-start or click/callback binding and native SVG labels (`htmlLabels: false`). Its separate DOMPurify SVG/SVG-filter-profile pass forbids `form` and retains allowed `style` elements, `style` attributes, and SVG filter elements. Renderer enforces include depth 64; it adds no include-count or aggregate-content limit.
+- Render documented restricted AsciiDoc subset with exact pinned dependencies. Bundle attributes, overlaid by successful setup attributes, are supplied as Asciidoctor soft settings (`name@`); document header declarations can override them. DOMPurify's final AsciiDoc pass uses its default allowlist (HTML, SVG, SVG filters, and MathML) and forbids `style`/`form` elements and `style` attributes; it runs before Mermaid insertion. No custom allowlist or hook is configured. Highlight source from text content; Mermaid runs strict with no auto-start or click/callback binding and native SVG labels (`htmlLabels: false`). Its separate DOMPurify SVG/SVG-filter-profile pass forbids `form` and retains allowed `style` elements, `style` attributes, and SVG filter elements. Renderer enforces include depth 64; it adds no include-count or aggregate-content limit.
 - Recoverable rejected content/resources and Mermaid/highlighter failures render explicit inline warnings. Page fetch, conversion, or sanitizer failures render safe actionable page error. Remote includes, arbitrary executable extensions, arbitrary filesystem access, unsupported raw HTML or author-supplied SVG, and arbitrary DOM selectors never execute.
 - `console:<quickstart-data-id>[label]` accepts only fixed 25-ID Console registry entries; authors supply no route or selector. Route-backed IDs navigate once, then wait up to 10 seconds for their exact visible `data-quickstart-id`; visible-only IDs never navigate. Found targets receive non-modal, dismissible spotlight; route-backed misses remain at fixed route and visible-only misses announce unavailable.
 - `resource:<apiVersion>/<Kind>[label,scope=namespaced|cluster,name=...,namespace=...]` requires two or three GVK components (`version/kind` or `group/version/kind`) and enforces scope and the attribute schema, with the label as the first list item and optional named fields following it. `name` and `namespace` accept processor-supplied selector values, for example `resource:project.openshift.io/v1/Project[View *{user}* project,scope=cluster,name={user}-datasphere]`. Cluster scope rejects `namespace`. Every GVK component and nonempty supplied value, including unresolved or malformed attribute text, is URI-encoded; empty supplied selector values are rejected. For namespaced resources, omitted namespace defaults to the active Console project; All Projects or an empty selection keeps the all-namespaces route, while authored namespace takes precedence. A name without authored namespace remains a `?name=`-filtered kind list, scoped to the active project when selected, not a detail page; authored namespace plus name opens namespaced details. Cluster scope is unaffected by project selection. Active-project changes rerender resource links in both drawer content and catalog descriptions. Console resolves resource existence. The label uses supported restricted AsciiDoc inline formatting and runtime attribute substitution. No author-controlled plural, route, selector, scope path, filter syntax, or URL is accepted; interpolation or passthrough never applies to author-controlled URLs. Resource links use normal same-origin navigation and retain drawer.
 - Module-local `type: manual` checkpoints are inert authoring data. Browser-local attestation remains a provisional idea; no checkpoint UI or completion claim exists. Evidence/checkpoint rules and section-solver behavior remain open.
 
-## Provisional chart namespace direction
+## Current chart bindings and provisional namespace direction
 
-Namespace selection and lifecycle remain open. Current candidate uses explicit existing release-namespace selection and additional `values.schema.json` fields marked:
+Namespace selection and lifecycle policy remain open. Current setup already uses `values.schema.json` fields marked:
 
 ```yaml
 x-interactive-labs:
   kind: namespace-name
 ```
 
-- JSON property path would be binding key. Standard JSON Schema `title`, `description`, and `required` would drive selector UI.
-- Current candidate may preselect accessible current namespace and permit shared bindings; this is not final selection/lifecycle policy.
-- This existing-namespace selection proposal is not current setup behavior. Chart-backed setup currently creates SpaceRequests and starts an asynchronous Helm worker; see [lab setup design](lab-setup-design.md). No automatic cleanup or cancellation.
+- Dot-separated JSON property path is the Helm values path. The namespace binding key is its leaf property name, except a path ending `.namespace` uses the path with that suffix removed.
+- Current setup creates/reuses a SpaceRequest for each binding key; there is no namespace selector driven by `title`, `description`, or `required`. Explicit existing-namespace selection remains a proposal, not current behavior.
+- Chart-backed setup starts an asynchronous Helm worker; successful status exposes namespace, generated-password, and root-url attributes with path dots replaced by hyphens. See [lab setup design](lab-setup-design.md). No automatic cleanup or cancellation.
 
 ## Not supported or deferred
 

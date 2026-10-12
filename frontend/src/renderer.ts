@@ -265,6 +265,18 @@ function highlight(root: DocumentFragment, warnings: string[]): void {
   });
 }
 
+function injectCopyButtons(root: DocumentFragment): void {
+  root.querySelectorAll(".listingblock .content > pre").forEach((pre) => {
+    const button = document.createElement("button");
+    button.className = "copy-to-clipboard";
+    button.type = "button";
+    button.title = "Copy to clipboard";
+    button.innerHTML =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+    pre.appendChild(button);
+  });
+}
+
 async function renderMermaid(root: DocumentFragment, warnings: string[], prefix: string): Promise<void> {
   const blocks = Array.from(root.querySelectorAll("pre > code")).filter((code) =>
     Array.from(code.classList).some((name) => name === "language-mermaid" || name === "mermaid"),
@@ -375,6 +387,7 @@ export async function renderAsciiDoc(input: RenderInput): Promise<RenderResult> 
     rewriteImages(template.content, input.sourceURL);
     highlight(template.content, warnings);
     template.innerHTML = sanitizeAsciiDocHtml(template.innerHTML);
+    injectCopyButtons(template.content);
     const renderedGuidanceLinks = replaceGuidanceLinks(template.content, guidanceLinks);
     namespaceIds(template.content, prefix);
     await renderMermaid(template.content, warnings, prefix);

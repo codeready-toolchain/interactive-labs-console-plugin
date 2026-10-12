@@ -1,6 +1,6 @@
 # Lab Setup Design
 
-Status: in progress (STORY-5 and STORY-11).
+Current chart-backed setup behavior. Namespace selection/lifecycle policy remains open. For a runnable authoring example, see the [sample guide](../../examples/sample-lab/README.md#optional-helm-setup).
 
 ## Overview
 
@@ -75,13 +75,13 @@ The backend determines how many namespaces a lab needs by inspecting the values 
 
 This produces two SpaceRequests (one per `namespace-name` property) and two generated passwords (one per `generated-password` property).
 
-**Important**: the `x-interactive-labs` annotation must be placed at the exact path the Helm chart expects in its `values.yaml`. The dot-separated path derived from the schema property tree is used directly as the `--set` key. Do not wrap annotated properties under artificial grouping nodes (e.g. `passwords`) that don't exist in the chart's values structure.
+**Important**: the `x-interactive-labs` annotation must be placed at the exact path the Helm chart expects in its `values.yaml`. The dot-separated path derived from the schema property tree is used as the Helm values key. Do not wrap annotated properties under artificial grouping nodes (e.g. `passwords`) that don't exist in the chart's values structure.
 
 ### SpaceRequest creation
 
 - For each namespace property, create a **SpaceRequest** Custom Resource (from the [host-operator](https://github.com/codeready-toolchain/host-operator)).
 - Created in the **user's home namespace** (`<username>-dev`), derived from the authenticated username.
-- Named after the schema property key (e.g. `gitea`, `datasphere`).
+- Named after the leaf schema property key (e.g. `gitea`, `datasphere`), except paths ending `.namespace` use the full path with that suffix removed (e.g. `datasphere.namespace` → `datasphere`). Use unique binding keys. `root-url.namespaceRef` refers to this key; its optional `.namespace` suffix is also stripped.
 - Spec: `tierName: base1ns`.
 - Created using the **user's bearer token** (the user already has permission to create SpaceRequests in their namespace).
 - **Idempotent only for verified identity**: existing SR must have matching catalog label, binding annotation, namespace and UID. Unmarked/foreign SRs are never adopted. Dedicated per-lab naming is separate work; teardown rollout assumes it is established.
@@ -103,7 +103,7 @@ Helm values are built from three sources, all driven by `x-interactive-labs.kind
 - Value: the provisioned namespace name from the SpaceRequest's `status.namespaceAccess[0].name` (e.g. `user1-abc123`)
 
 **Generated passwords** (`kind: generated-password`):
-- Key: the dot-separated JSON path from the schema (e.g. `passwords.postgres`)
+- Key: the dot-separated JSON path from the schema (e.g. `postgresql.auth.password`)
 - Value: a 24-character cryptographically secure random password (alphanumeric, generated via `crypto/rand`)
 
 **Root URLs** (`kind: root-url`):
@@ -113,11 +113,13 @@ Helm values are built from three sources, all driven by `x-interactive-labs.kind
   - `namespace` is resolved from the namespace binding referenced by `x-interactive-labs.namespaceRef` (e.g. `gitea`)
   - `clusterIngressDomain` is the cluster's ingress domain, fetched at backend startup from `ingresses.config.openshift.io/cluster`
 
+The computed `root-url` value is a hostname **without a scheme**. The annotation does not create or verify a Route; a chart deploying an application must provide its own Route with the matching name and namespace.
+
 All values are merged into a single values map and passed to `helm install`.
 
 ### Release identity
 
-- **Release name**: `il-` + first 12 hex characters of SHA-256 over authenticated subject, `catalogRef`, and sorted namespace binding keys. Catalog-label discovery prevents installing a second release for the same lab when schema keys change.
+- **Release name**: `il-` + first 12 hex characters of SHA-256 over the authenticated subject, `catalogRef`, and sorted namespace binding keys, separated by `|`. Deterministic and user-specific; `catalogRef` already incorporates the repository, branch, lab path, and catalog attribute overrides. Catalog-label discovery prevents installing a second release for the same lab when schema keys change.
 - **Release namespace**: the user's home namespace (`<username>-dev`), the same namespace where SpaceRequests are created.
 
 ### Execution
@@ -151,7 +153,7 @@ Properties annotated with `x-interactive-labs.kind: "generated-password"` receiv
 2. Starts a **background goroutine** that watches SpaceRequests and triggers Helm when all are ready.
 3. Returns **202 Accepted** immediately.
 
-The goroutine captures the user's bearer token from the POST request. It polls SpaceRequests with retry and backoff, bounded by the Helm timeout. When all SpaceRequests are Ready, it collects the provisioned namespace names, builds the Helm values, and runs the Helm install.
+The goroutine captures the user's bearer token from the POST request. It polls SpaceRequests for up to 30 minutes; the separate configurable Helm timeout bounds the install phase. When all SpaceRequests are Ready, it collects the provisioned namespace names, builds the Helm values, and runs the Helm install.
 
 If the setup is already complete (Helm release deployed), POST returns **200 OK** with the current status (no-op).
 
@@ -175,8 +177,8 @@ If the setup is already complete (Helm release deployed), POST returns **200 OK*
     "releaseName": "il-a1b2c3d4e5f6",
     "message": "...",
     "generatedValues": {
-      "passwords.postgres": "xK9mLp...",
-      "passwords.giteaAdmin": "Qp7nRw..."
+      "postgresql.auth.password": "xK9mLp...",
+      "gitea.admin.password": "Qp7nRw..."
     }
   }
 }
@@ -199,13 +201,18 @@ Status values:
 
 The frontend polls GET and shows a progress indicator. The lab opens when `spaceRequests.status` is `ready` **and** `helm.status` is `deployed`.
 
+### Rendering attributes
+
+When all namespaces are ready and Helm is deployed, status also returns top-level `attributes`. Namespace values, generated passwords, and root-url hostnames use the annotated property path with dots replaced by hyphens (case preserved): `namespaces.gitea` → `{namespaces-gitea}`, `gitea.admin.password` → `{gitea-admin-password}`, and `gitea.rootUrl` → `{gitea-rootUrl}`. Password attributes are present only when their deployed release values can be read. Frontend overlays these on bundle attributes before rendering; Asciidoctor receives soft settings (`name@`), so page header declarations can override them.
+
 ### State reconstruction
 
 No new CRD is needed. The setup manager reconstructs setup state on each poll by:
-- Querying identity-marked SpaceRequests in the user's namespace.
-- Discovering the unique identity-marked Helm release, reading its status and generated values, then rechecking release identity before returning those values.
+- Querying identity-verified SpaceRequests in the user's home namespace.
+- Reading the current Lease reservation.
+- Discovering the unique identity-marked Helm release and using one verified snapshot for its status and requested generated values. Generated values are returned only when SpaceRequests are ready and Helm is deployed.
 
-Live release and Lease state take precedence over advisory process-local worker records. Local records retain safe failure details when the cluster has no release outcome; operation-owned updates prevent an old worker from overwriting a successor after takeover.
+A transient process-local worker registry, keyed by home namespace and catalogRef, tracks worker phases and safe failure details. Live release and Lease state take precedence over advisory local records; operation-owned updates prevent an old worker from overwriting a successor after takeover. The registry is not cross-pod coordination.
 
 This supports page refresh and re-launch without losing state.
 
@@ -246,8 +253,8 @@ Setup inventory uses one continuous list with identical rows and separators: exi
 | 11 | Helm Go SDK for chart deployment | Programmatic control, Wait support, bounded timeout |
 | 12 | Single POST triggers full setup (SpaceRequests + Helm) | Simple frontend: one kick, then poll |
 | 13 | Background goroutine watches SpaceRequests and triggers Helm | Async flow; Helm can't start until all namespaces are provisioned |
-| 14 | Release name is deterministic (SHA-256 of subject + catalogRef + sorted binding keys) | Catalog labels discover prior setup despite schema drift |
-| 15 | GET reconstructs both SpaceRequest and Helm state | Stateless; no in-memory tracking needed |
+| 14 | Release name is deterministic (SHA-256 of subject, catalogRef, and sorted namespace binding keys) | Enables idempotent re-launch; catalog labels discover prior setup despite schema drift |
+| 15 | GET reconstructs SpaceRequest, Helm, and Lease state | Cluster state is authoritative; transient worker records provide advisory phases and safe failure details |
 | 16 | Goroutine retries transient errors with backoff | Bounded by timeout; resilient to transient failures |
 | 17 | Configurable Helm timeout (default 300s) | Operational flexibility; keeps setup bounded |
 | 18 | Two status fields in response (spaceRequests + helm) | Frontend has full visibility into each phase |

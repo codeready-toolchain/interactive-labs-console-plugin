@@ -1,0 +1,5 @@
+apiVersion: v2
+name: interactive-labs-sample
+description: Minimal illustrative lab resources; no application or Route.
+type: application
+version: 0.1.0

@@ -1,0 +1,23 @@
+apiVersion: v1alpha1
+kind: Lab
+metadata:
+  title: Interactive Labs sample
+  description: |
+    A small lab demonstrating supported authoring features. This first _paragraph_
+    is shown as the always-visible description on the interactive labs catalog page.
+    
+    Additional paragraphs are hidden by default but the user has the ability to expand
+    the view and read it all.
+
+    This is **Asciidoc**, too, and it should be possible to render any content from
+    the lab including images and partials here.
+
+    Below the partial notification from the first module should be shown.
+    include::modules/010-intro/content/_partials/note.adoc[]
+
+    And below this line an image should be rendered.
+    image::modules/010-intro/content/images/flow.png[]
+
+spec:
+  attributes:
+    lab-title: Interactive Labs sample

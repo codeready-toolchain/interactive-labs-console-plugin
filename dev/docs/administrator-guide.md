@@ -50,13 +50,18 @@ Full wiring: [proxy operational contract](../efforts/interactive-labs/contract/p
 
 ## Configure catalog
 
-Create/update `interactive-labs-catalog` ConfigMap in `interactive-labs-console-plugin` namespace. It must have one `catalog.yaml` key containing top-level YAML sequence. Each entry requires:
+Create/update `interactive-labs-catalog` ConfigMap in `interactive-labs-console-plugin` namespace. It must have one `catalog.yaml` key containing top-level YAML sequence. Each entry requires `repository`, `branch`, and `labPath`; `attributeOverrides` is optional:
 
 ```yaml
 - repository: https://github.com/redhat-scholars/my-lab
   branch: main
   labPath: lab
+  attributeOverrides:
+    lab-title: "Workshop lab"
+    greeting: "Welcome to the workshop"
 ```
+
+`attributeOverrides` is a per-entry map of string values. It overrides same-named values from the lab's `lab.yaml` `spec.attributes`; backend runtime attributes take precedence over both. Authors can use these values in AsciiDoc, for example `{greeting}, welcome to {lab-title}.`. Overrides affect rendered content, not `metadata.title` or the catalog display title. Put the map inside its catalog entry in `data.catalog.yaml`, not as a top-level ConfigMap `data` key.
 
 Repositories must be plain HTTPS URLs. `labPath` must be repository-relative. Customers select approved Red Hat-authored labs by adding catalog entries. Backend reads catalog `title` and optional `description` from each validated `lab.yaml`; legacy ConfigMap display fields are ignored. Lab authors must use `metadata.title` and `modules/<id>/content/` (not old `metadata.displayName`); see [lab content contract](lab-content-contract.md). Entry order controls returned catalog order for successfully resolved labs. `catalogRef` is backend-derived; do not configure an ID.
 
