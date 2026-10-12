@@ -1,0 +1,7 @@
+# Populated by Interactive Labs when this chart is at repository-root setup/helm.
+# Supply explicit demonstration values for local Helm lint/template commands.
+namespaces:
+  demo: ""
+demo:
+  password: ""
+  rootUrl: ""

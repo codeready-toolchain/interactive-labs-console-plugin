@@ -19,6 +19,7 @@ Do not represent planned behavior as shipped.
 - [Design decisions](design-decisions.md) — decisions, rationale, tradeoffs, and deferrals.
 - [Engineering conventions](engineering-conventions.md) — source structure, testing, build, and deployment conventions.
 - [Administrator guide](administrator-guide.md) — deploy, configure, validate, and operate plugin.
+- [Lab author guide and runnable sample](../../examples/sample-lab/README.md) — supported AsciiDoc features and optional illustrative Helm setup.
 - [Lab content contract](lab-content-contract.md) — catalog and lab-author requirements.
 
 ## Sources of truth
