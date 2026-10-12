@@ -23,38 +23,68 @@ func TestSampleLab(t *testing.T) {
 
 	for _, tc := range []struct {
 		name, root, labPath string
-		chartAvailable      bool
 	}{
-		{"nested in plugin repository", repositoryRoot, "examples/sample-lab", false},
-		{"published at standalone repository root", sampleRoot, ".", true},
+		{"nested in plugin repository", repositoryRoot, "examples/sample-lab"},
+		{"published at standalone repository root", sampleRoot, "."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// Given the sample in either supported repository layout.
-			// When loading through the public bundle API.
-			result, err := bundle.LoadFromSnapshot(tc.root, tc.labPath)
-			require.NoError(t, err)
+			t.Run("bundle metadata and navigation", func(t *testing.T) {
+				// Given the sample repository root and lab path for this layout.
+				root, labPath := tc.root, tc.labPath
 
-			// Then partials stay out of navigation and only root-level setup is active.
-			assert.Equal(t, "Interactive Labs sample", result.Manifest.Metadata.Title)
-			assert.Equal(t, []bundle.Module{{ID: "010-intro", Pages: []string{"010-start.adoc", "020-resources.adoc"}}}, result.Modules)
-			assert.Equal(t, tc.chartAvailable, result.HelmChartAvailable)
+				// When loading through the public bundle API.
+				result, err := bundle.LoadFromSnapshot(root, labPath)
 
-			image, err := bundle.ReadResource(tc.root, filepath.ToSlash(filepath.Join(tc.labPath, "modules/010-intro/content/images/flow.png")))
-			require.NoError(t, err)
-			_, err = png.Decode(bytes.NewReader(image.Bytes))
-			require.NoError(t, err)
-
-			if tc.chartAvailable {
-				bindings, err := setup.ParseSchemaBindings(result.ValuesSchema)
+				// Then metadata identifies the sample and partials stay out of navigation.
 				require.NoError(t, err)
-				assert.Equal(t, []setup.NamespaceBinding{{Key: "demo", Path: "namespaces.demo"}}, bindings.Namespaces)
-				assert.Equal(t, []setup.ValueBinding{{Key: "password", Path: "demo.password", Kind: setup.KindGeneratedPassword}}, bindings.Passwords)
-				assert.Equal(t, []setup.RootURLBinding{{Key: "rootUrl", Path: "demo.rootUrl", RouteName: "sample", NamespaceRef: "demo"}}, bindings.RootURLs)
-			}
+				assert.Equal(t, "Interactive Labs sample", result.Manifest.Metadata.Title)
+				assert.Equal(t, []bundle.Module{{ID: "010-intro", Pages: []string{"010-start.adoc", "020-resources.adoc"}}}, result.Modules)
+			})
+
+			t.Run("chart discovery", func(t *testing.T) {
+				// Given the sample repository root and lab path for this layout.
+				root, labPath := tc.root, tc.labPath
+
+				// When loading through the public bundle API.
+				result, err := bundle.LoadFromSnapshot(root, labPath)
+
+				// Then the lab-local chart is available in either layout.
+				require.NoError(t, err)
+				assert.True(t, result.HelmChartAvailable)
+			})
+
+			t.Run("PNG resource decoding", func(t *testing.T) {
+				// Given the sample image path within this repository layout.
+				imagePath := filepath.ToSlash(filepath.Join(tc.labPath, "modules/010-intro/content/images/flow.png"))
+
+				// When reading the resource through the public API and decoding its bytes.
+				image, err := bundle.ReadResource(tc.root, imagePath)
+				require.NoError(t, err)
+				_, err = png.Decode(bytes.NewReader(image.Bytes))
+
+				// Then the resource is a valid PNG.
+				require.NoError(t, err)
+			})
+
+			t.Run("setup selected chart and bindings", func(t *testing.T) {
+				// Given the sample layout and representative subject and catalog identities.
+				root, labPath := tc.root, tc.labPath
+				subject, catalogRef := "learner", "sample"
+
+				// When preparing setup through the public API.
+				plan, err := setup.Prepare(root, labPath, subject, catalogRef)
+
+				// Then setup selects the lab-local chart and its namespace/generated-value bindings.
+				require.NoError(t, err)
+				assert.Equal(t, filepath.Join(sampleRoot, "setup", "helm"), plan.ChartDir)
+				assert.Equal(t, []setup.NamespaceBinding{{Key: "demo", Path: "namespaces.demo"}}, plan.Bindings.Namespaces)
+				assert.Equal(t, []setup.ValueBinding{{Key: "password", Path: "demo.password", Kind: setup.KindGeneratedPassword}}, plan.Bindings.Passwords)
+				assert.Equal(t, []setup.RootURLBinding{{Key: "rootUrl", Path: "demo.rootUrl", RouteName: "sample", NamespaceRef: "demo"}}, plan.Bindings.RootURLs)
+			})
 		})
 	}
 
-	t.Run("Helm schema and templates", func(t *testing.T) {
+	t.Run("valid Helm rendering", func(t *testing.T) {
 		// Given the illustrative chart and representative setup values.
 		chart, err := loader.Load(filepath.Join(sampleRoot, "setup", "helm"))
 		require.NoError(t, err)
@@ -79,7 +109,18 @@ func TestSampleLab(t *testing.T) {
 		assert.Contains(t, resources, "namespace: \"sample-demo\"")
 		assert.Contains(t, resources, "root-url: \"sample-sample-demo.apps.example.test\"")
 		assert.Contains(t, resources, "password: \"example-only\"")
+	})
+
+	t.Run("missing values schema rejection", func(t *testing.T) {
+		// Given the illustrative chart and release identity without setup values.
+		chart, err := loader.Load(filepath.Join(sampleRoot, "setup", "helm"))
+		require.NoError(t, err)
+		release := chartutil.ReleaseOptions{Name: "sample", Namespace: "learner-dev", IsInstall: true}
+
+		// When Helm validates missing values against the chart schema.
 		_, err = chartutil.ToRenderValues(chart, nil, release, chartutil.DefaultCapabilities)
+
+		// Then required string values fail minimum-length validation.
 		require.ErrorContains(t, err, "minLength")
 	})
 }
