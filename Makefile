@@ -6,6 +6,7 @@ NAMESPACE ?= interactive-labs-console-plugin
 REGISTRY ?= $(shell $(OC) get route default-route -n openshift-image-registry --template='{{ .spec.host }}' 2>/dev/null)
 DEV_IMAGE ?= $(REGISTRY)/$(NAMESPACE)/interactive-labs-console-plugin:latest
 PLATFORM ?= linux/amd64
+DEV_CONTAINER_BUILD_NO_CACHE ?=
 COMMIT ?= $(shell c=$$(git rev-parse --short HEAD 2>/dev/null) && { git diff --quiet HEAD 2>/dev/null || c="$$c-dirty"; } && echo "$$c" || echo unknown)
 BUILDTIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -88,7 +89,7 @@ create-namespace: ## Create plugin namespace
 	$(OC) apply -f deploy/base/namespace.yaml
 
 dev-image: create-namespace ## Build development image
-	$(CONTAINER_TOOL) build --no-cache --platform=${PLATFORM} \
+	$(CONTAINER_TOOL) build $(DEV_CONTAINER_BUILD_NO_CACHE) --platform=${PLATFORM} \
 	  --build-arg COMMIT=$(COMMIT) \
       --build-arg BUILDTIME=$(BUILDTIME) \
       -f Containerfile -t $(DEV_IMAGE) .
