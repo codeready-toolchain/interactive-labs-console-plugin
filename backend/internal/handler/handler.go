@@ -655,6 +655,130 @@ func logPodDiagnostics(cfg Config, token string, nsValues map[string]string) {
 	}
 }
 
+type namespaceStatus struct {
+	Status string `json:"status"`
+	Name   string `json:"name"`
+}
+
+type namespaceStatuses struct {
+	entries   map[string]namespaceStatus
+	allReady  bool
+	anyFailed bool
+}
+
+func resolveNamespaceStatuses(ctx context.Context, cfg Config, token, userNamespace string, nsBindings []setup.SchemaBinding) namespaceStatuses {
+	result := namespaceStatuses{
+		entries:  make(map[string]namespaceStatus, len(nsBindings)),
+		allReady: true,
+	}
+	for _, b := range nsBindings {
+		sr, err := cfg.SetupClient.GetSpaceRequest(ctx, token, userNamespace, b.Key)
+		if err != nil {
+			cfg.Logger.Warn("get SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
+			result.entries[b.Key] = namespaceStatus{Status: "pending", Name: b.Key}
+			result.allReady = false
+			continue
+		}
+		if sr == nil {
+			result.entries[b.Key] = namespaceStatus{Status: "pending", Name: b.Key}
+			result.allReady = false
+			continue
+		}
+		if sr.IsReady() && sr.TargetNamespace() != "" {
+			cfg.Logger.Info("SpaceRequest ready", "name", b.Key, "namespace", sr.TargetNamespace())
+			result.entries[b.Key] = namespaceStatus{Status: "ready", Name: sr.TargetNamespace()}
+		} else if sr.IsFailed() {
+			result.entries[b.Key] = namespaceStatus{Status: "failed", Name: b.Key}
+			result.anyFailed = true
+			result.allReady = false
+		} else {
+			result.entries[b.Key] = namespaceStatus{Status: "pending", Name: b.Key}
+			result.allReady = false
+		}
+	}
+	return result
+}
+
+func (ns namespaceStatuses) srStatus() string {
+	if ns.anyFailed {
+		return "failed"
+	}
+	if ns.allReady {
+		return "ready"
+	}
+	return "provisioning"
+}
+
+func resolveHelmStatus(ctx context.Context, cfg Config, releaseName, userNamespace, token string, bindings []setup.SchemaBinding) (helmStatus, helmMessage string, releaseValues map[string]string) {
+	helmStatus = "pending"
+	if cfg.HelmManager == nil {
+		return
+	}
+	status, err := cfg.HelmManager.ReleaseStatus(ctx, releaseName, userNamespace, token)
+	if err == nil && status != "" {
+		helmStatus = setup.HelmStatusLabel(status)
+		if helmStatus == "deployed" {
+			releaseValues = fetchHelmValues(ctx, cfg, releaseName, userNamespace, token, bindings)
+		}
+		return
+	}
+	if val, loaded := activeSetups.Load(releaseName); loaded {
+		state := val.(*workerState)
+		switch state.phase {
+		case "installing":
+			helmStatus = "installing"
+		case "failed":
+			helmStatus = "failed"
+			helmMessage = state.err
+		case "polling":
+			helmStatus = "pending"
+		}
+	}
+	return
+}
+
+func fetchHelmValues(ctx context.Context, cfg Config, releaseName, userNamespace, token string, bindings []setup.SchemaBinding) map[string]string {
+	var valuePaths []string
+	for _, b := range bindings {
+		// Namespace and root-URL bindings are resolved from SpaceRequest/cluster
+		// config, not from Helm values — skip them here.
+		if b.Kind == setup.KindNamespaceName || b.Kind == setup.KindRootURL {
+			continue
+		}
+		valuePaths = append(valuePaths, b.Path)
+	}
+	if len(valuePaths) == 0 {
+		return nil
+	}
+	values, _ := cfg.HelmManager.ReleaseValues(ctx, releaseName, userNamespace, token, valuePaths)
+	return values
+}
+
+func buildAttributes(bindings []setup.SchemaBinding, namespaces map[string]namespaceStatus, releaseValues map[string]string, clusterIngressDomain string) map[string]string {
+	attributes := make(map[string]string, len(bindings))
+	for _, b := range bindings {
+		key := strings.ReplaceAll(b.Path, ".", "-")
+		switch b.Kind {
+		case setup.KindNamespaceName:
+			attributes[key] = namespaces[b.Key].Name
+		case setup.KindRootURL:
+			if clusterIngressDomain == "" {
+				continue
+			}
+			ns, ok := namespaces[b.NamespaceRef]
+			if !ok {
+				continue
+			}
+			attributes[key] = fmt.Sprintf("%s-%s.%s", b.RouteName, ns.Name, clusterIngressDomain)
+		default:
+			if v, ok := releaseValues[b.Path]; ok {
+				attributes[key] = v
+			}
+		}
+	}
+	return attributes
+}
+
 func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 	sctx, ok := resolveSetupContext(w, r, cfg)
 	if !ok {
@@ -664,113 +788,20 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 	userNamespace := sctx.subject + "-dev"
 	nsBindings := setup.BindingsByKind(sctx.bindings, setup.KindNamespaceName)
 
-	type namespaceStatus struct {
-		Status string `json:"status"`
-		Name   string `json:"name"`
-	}
-	namespaces := make(map[string]namespaceStatus, len(nsBindings))
-	allReady := true
-	anyFailed := false
-
-	for _, b := range nsBindings {
-		sr, err := cfg.SetupClient.GetSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key)
-		if err != nil {
-			cfg.Logger.Warn("get SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
-			namespaces[b.Key] = namespaceStatus{Status: "pending", Name: b.Key}
-			allReady = false
-			continue
-		}
-		if sr == nil {
-			namespaces[b.Key] = namespaceStatus{Status: "pending", Name: b.Key}
-			allReady = false
-			continue
-		}
-		if sr.IsReady() && sr.TargetNamespace() != "" {
-			cfg.Logger.Info("SpaceRequest ready", "name", b.Key, "namespace", sr.TargetNamespace())
-			namespaces[b.Key] = namespaceStatus{Status: "ready", Name: sr.TargetNamespace()}
-		} else if sr.IsFailed() {
-			namespaces[b.Key] = namespaceStatus{Status: "failed", Name: b.Key}
-			anyFailed = true
-			allReady = false
-		} else {
-			namespaces[b.Key] = namespaceStatus{Status: "pending", Name: b.Key}
-			allReady = false
-		}
-	}
-
-	srStatus := "provisioning"
-	if anyFailed {
-		srStatus = "failed"
-	} else if allReady {
-		srStatus = "ready"
-	}
+	ns := resolveNamespaceStatuses(r.Context(), cfg, sctx.token, userNamespace, nsBindings)
 
 	releaseName := setup.HelmReleaseName(sctx.subject, sctx.entry.CatalogRef, nsBindings)
-	helmStatus := "pending"
-	helmMessage := ""
-	var releaseValues map[string]string
-
-	if cfg.HelmManager != nil {
-		releaseStatus, err := cfg.HelmManager.ReleaseStatus(r.Context(), releaseName, userNamespace, sctx.token)
-		if err == nil && releaseStatus != "" {
-			helmStatus = setup.HelmStatusLabel(releaseStatus)
-			if helmStatus == "deployed" {
-				var valuePaths []string
-				for _, b := range sctx.bindings {
-					// Namespace and root-URL bindings are resolved from SpaceRequest/cluster
-					// config, not from Helm values — skip them here.
-					if b.Kind == setup.KindNamespaceName || b.Kind == setup.KindRootURL {
-						continue
-					}
-					valuePaths = append(valuePaths, b.Path)
-				}
-				if len(valuePaths) > 0 {
-					releaseValues, _ = cfg.HelmManager.ReleaseValues(r.Context(), releaseName, userNamespace, sctx.token, valuePaths)
-				}
-			}
-		} else if val, loaded := activeSetups.Load(releaseName); loaded {
-			state := val.(*workerState)
-			switch state.phase {
-			case "installing":
-				helmStatus = "installing"
-			case "failed":
-				helmStatus = "failed"
-				helmMessage = state.err
-			case "polling":
-				helmStatus = "pending"
-			}
-		}
-	}
+	helmStatus, helmMessage, releaseValues := resolveHelmStatus(r.Context(), cfg, releaseName, userNamespace, sctx.token, sctx.bindings)
 
 	var attributes map[string]string
-	if allReady && helmStatus == "deployed" {
-		attributes = make(map[string]string, len(sctx.bindings))
-		for _, b := range sctx.bindings {
-			key := strings.ReplaceAll(b.Path, ".", "-")
-			switch b.Kind {
-			case setup.KindNamespaceName:
-				attributes[key] = namespaces[b.Key].Name
-			case setup.KindRootURL:
-				if cfg.ClusterIngressDomain == "" {
-					continue
-				}
-				ns, ok := namespaces[b.NamespaceRef]
-				if !ok {
-					continue
-				}
-				attributes[key] = fmt.Sprintf("%s-%s.%s", b.RouteName, ns.Name, cfg.ClusterIngressDomain)
-			default:
-				if v, ok := releaseValues[b.Path]; ok {
-					attributes[key] = v
-				}
-			}
-		}
+	if ns.allReady && helmStatus == "deployed" {
+		attributes = buildAttributes(sctx.bindings, ns.entries, releaseValues, cfg.ClusterIngressDomain)
 	}
 
 	if len(attributes) > 0 {
 		cfg.Logger.Info("setup status attributes", "keys", slices.Sorted(maps.Keys(attributes)))
 	}
-	writeJSON(w, http.StatusOK, buildSetupStatusResponse(srStatus, namespaces, helmStatus, releaseName, helmMessage, attributes))
+	writeJSON(w, http.StatusOK, buildSetupStatusResponse(ns.srStatus(), ns.entries, helmStatus, releaseName, helmMessage, attributes))
 }
 
 func buildSetupStatusResponse(srStatus string, namespaces any, helmStatus, releaseName, helmMessage string, attributes map[string]string) map[string]any {
