@@ -1775,3 +1775,50 @@ func makeTestJWT(sub string) string {
 	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":%q}`, sub)))
 	return header + "." + payload + "."
 }
+
+// --- GET /api/healthz ---
+
+func TestHealthzHandler(t *testing.T) {
+	t.Run("returns 200", func(t *testing.T) {
+		rw := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/healthz", nil)
+		newRouter(t).ServeHTTP(rw, req)
+
+		assert.Equal(t, http.StatusOK, rw.Code)
+	})
+}
+
+// --- GET /api/readyz ---
+
+func TestReadyzHandler(t *testing.T) {
+	t.Run("returns 200 when ready", func(t *testing.T) {
+		router := handler.NewRouter(handler.Config{
+			ReadinessCheck: func() bool { return true },
+		})
+		rw := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/readyz", nil)
+		router.ServeHTTP(rw, req)
+
+		assert.Equal(t, http.StatusOK, rw.Code)
+	})
+
+	t.Run("returns 503 when not ready", func(t *testing.T) {
+		router := handler.NewRouter(handler.Config{
+			ReadinessCheck: func() bool { return false },
+		})
+		rw := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/readyz", nil)
+		router.ServeHTTP(rw, req)
+
+		assert.Equal(t, http.StatusServiceUnavailable, rw.Code)
+	})
+
+	t.Run("returns 200 when no readiness check configured", func(t *testing.T) {
+		router := handler.NewRouter(handler.Config{})
+		rw := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/readyz", nil)
+		router.ServeHTTP(rw, req)
+
+		assert.Equal(t, http.StatusOK, rw.Code)
+	})
+}

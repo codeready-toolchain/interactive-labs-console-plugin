@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -76,7 +77,6 @@ func main() {
 
 	backend := &http.Server{
 		Addr:         backendAddr,
-		Handler:      combinedHandler(handler.NewRouter(cfg), pluginAssets),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 600 * time.Second, // Helm setup can be slow
 	}
@@ -84,6 +84,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	var shuttingDown atomic.Bool
 	refreshCoordinator := bundle.NewRefreshCoordinator(
 		loadCatalogEntries(catalogSource),
 		cache.Refresh,
@@ -93,6 +94,11 @@ func main() {
 		serverConfig.CacheRefreshInterval,
 		int(serverConfig.CacheConcurrentRefreshLimit),
 	)
+	cfg.ReadinessCheck = func() bool {
+		return refreshCoordinator.IsReady() && !shuttingDown.Load()
+	}
+	backend.Handler = combinedHandler(handler.NewRouter(cfg), pluginAssets)
+
 	watchDone := make(chan struct{})
 	go func() {
 		defer close(watchDone)
@@ -109,7 +115,15 @@ func main() {
 	go serveTLS(log, "backend", backend, backendTLSCert, backendTLSKey)
 
 	<-ctx.Done()
-	log.Info("shutting down")
+	// Signal not-ready before draining connections so Kubernetes removes the pod
+	// from Service endpoints while existing requests finish. The server keeps
+	// accepting in-flight requests during this window; Shutdown() follows once
+	// endpoint removal has propagated. The total (5s + 15s) fits within the
+	// default 30s terminationGracePeriodSeconds.
+	shuttingDown.Store(true)
+	log.Info("shutting down, waiting for endpoint removal")
+	time.Sleep(5 * time.Second)
+	log.Info("draining connections")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	backend.Shutdown(shutCtx) //nolint:errcheck

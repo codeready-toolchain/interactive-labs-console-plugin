@@ -479,4 +479,70 @@ func TestRefreshCoordinatorRun(t *testing.T) {
 			<-done
 		})
 	})
+
+	t.Run("IsReady becomes true after first sweep completes", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// given
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			release := make(chan struct{})
+			coordinator := NewRefreshCoordinator(
+				func(context.Context) ([]RefreshEntry, error) {
+					return []RefreshEntry{{Repository: "https://example.test/labs.git", Branch: "main", LabPath: "lab"}}, nil
+				},
+				func(ctx context.Context, _ RepositoryRefreshRequest) error {
+					select {
+					case <-release:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				},
+				nil, time.Hour, 1,
+			)
+			done := make(chan struct{})
+
+			// when
+			go func() { coordinator.Run(ctx); close(done) }()
+			synctest.Wait()
+
+			// then
+			assert.False(t, coordinator.IsReady(), "must not be ready before first sweep completes")
+
+			// when
+			close(release)
+			synctest.Wait()
+
+			// then
+			assert.True(t, coordinator.IsReady(), "must be ready after first sweep completes")
+
+			// Cleanup: stop the run loop.
+			cancel()
+			<-done
+		})
+	})
+
+	t.Run("IsReady becomes true even when first sweep errors", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// given
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			coordinator := NewRefreshCoordinator(
+				func(context.Context) ([]RefreshEntry, error) { return nil, errors.New("catalog unavailable") },
+				nil, nil, time.Hour, 1,
+			)
+			done := make(chan struct{})
+
+			// when
+			go func() { coordinator.Run(ctx, func(error) {}); close(done) }()
+			synctest.Wait()
+
+			// then
+			assert.True(t, coordinator.IsReady(), "must be ready after first sweep even if it errored")
+
+			// Cleanup: stop the run loop.
+			cancel()
+			<-done
+		})
+	})
 }
