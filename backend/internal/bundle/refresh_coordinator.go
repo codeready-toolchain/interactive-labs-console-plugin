@@ -46,6 +46,8 @@ type RefreshCoordinator struct {
 	interval    time.Duration
 	concurrency int
 	requests    chan struct{}
+	ready       chan struct{}
+	readyOnce   sync.Once
 }
 
 // NewRefreshCoordinator creates a coordinator for periodic and requested source refreshes.
@@ -56,6 +58,17 @@ func NewRefreshCoordinator(entries LoadEntries, refresh RepositoryRefresher, rep
 	return &RefreshCoordinator{
 		entries: entries, refresh: refresh, report: report,
 		interval: interval, concurrency: concurrency, requests: make(chan struct{}, 1),
+		ready: make(chan struct{}),
+	}
+}
+
+// IsReady reports whether at least one full refresh sweep has completed.
+func (c *RefreshCoordinator) IsReady() bool {
+	select {
+	case <-c.ready:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -128,6 +141,7 @@ func (c *RefreshCoordinator) Run(ctx context.Context, onError ...func(error)) {
 		if err := c.Refresh(ctx); err != nil && ctx.Err() == nil && len(onError) > 0 && onError[0] != nil {
 			onError[0](err)
 		}
+		c.readyOnce.Do(func() { close(c.ready) })
 		discardReadyTicks(ticker.C)
 
 		select {

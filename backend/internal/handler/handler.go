@@ -63,6 +63,9 @@ type Config struct {
 	// ClusterIngressDomain is the cluster's ingress domain (e.g. "apps.cluster.example.com"),
 	// injected as a Helm value for properties with x-interactive-labs.kind "cluster-ingress-domain".
 	ClusterIngressDomain string
+	// ReadinessCheck reports whether the server is ready to handle traffic.
+	// nil means always ready.
+	ReadinessCheck func() bool
 }
 
 // NewRouter returns an http.Handler with all three MVP routes registered.
@@ -86,6 +89,17 @@ func NewRouter(cfg Config) http.Handler {
 	})
 	mux.HandleFunc("GET /api/v1alpha1/labs/{catalogRef}/setup/status", func(w http.ResponseWriter, r *http.Request) {
 		handleSetupStatus(w, r, cfg)
+	})
+
+	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /api/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if cfg.ReadinessCheck != nil && !cfg.ReadinessCheck() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	})
 
 	return mux
