@@ -20,6 +20,29 @@ spec:
           ports:
             - containerPort: 9001
               name: backend-https
+          startupProbe:
+            httpGet:
+              path: /api/healthz
+              port: 9001
+              scheme: HTTPS
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /api/healthz
+              port: 9001
+              scheme: HTTPS
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/readyz
+              port: 9001
+              scheme: HTTPS
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
           env:
             - name: NAMESPACE
               valueFrom:

@@ -44,6 +44,9 @@ type Config struct {
 	RuntimeAttributes func(r *http.Request, subject string) (map[string]string, error)
 	// SetupManager owns the setup, status, inventory, and teardown lifecycle.
 	SetupManager *setup.Manager
+	// ReadinessCheck reports whether the server is ready to handle traffic.
+	// nil means always ready.
+	ReadinessCheck func() bool
 }
 
 // NewRouter returns an http.Handler with all three MVP routes registered.
@@ -76,6 +79,17 @@ func NewRouter(cfg Config) http.Handler {
 	})
 	mux.HandleFunc("GET /api/v1alpha1/labs/{catalogRef}/teardown/status", func(w http.ResponseWriter, r *http.Request) {
 		handleTeardownStatus(w, r, cfg)
+	})
+
+	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /api/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if cfg.ReadinessCheck != nil && !cfg.ReadinessCheck() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	})
 
 	return mux
