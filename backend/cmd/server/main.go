@@ -116,9 +116,14 @@ func main() {
 
 	<-ctx.Done()
 	// Signal not-ready before draining connections so Kubernetes removes the pod
-	// from Service endpoints while existing requests finish.
+	// from Service endpoints while existing requests finish. The server keeps
+	// accepting in-flight requests during this window; Shutdown() follows once
+	// endpoint removal has propagated. The total (5s + 15s) fits within the
+	// default 30s terminationGracePeriodSeconds.
 	shuttingDown.Store(true)
-	log.Info("shutting down")
+	log.Info("shutting down, waiting for endpoint removal")
+	time.Sleep(5 * time.Second)
+	log.Info("draining connections")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	backend.Shutdown(shutCtx) //nolint:errcheck
