@@ -46,8 +46,8 @@ type RefreshCoordinator struct {
 	report      RefreshFailureReporter
 	interval    time.Duration
 	concurrency int
-	requests chan struct{}
-	ready    atomic.Bool
+	requests    chan struct{}
+	ready       atomic.Bool
 }
 
 // NewRefreshCoordinator creates a coordinator for periodic and requested source refreshes.
