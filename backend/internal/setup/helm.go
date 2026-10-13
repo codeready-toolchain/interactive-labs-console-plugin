@@ -12,7 +12,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
+	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	"helm.sh/helm/v3/pkg/strvals"
@@ -29,8 +31,8 @@ type HelmManager interface {
 	UninstallLabRelease(ctx context.Context, namespace, token string, target LabRelease, srs []SpaceRequestResult) error
 }
 
-// LabRelease carries a discovered snapshot. Config is request-local, excluded
-// from JSON, and removed from inventory; only requested generated paths may leave setup.
+// LabRelease carries a discovered snapshot. Chart and Config are request-local,
+// excluded from JSON, and removed from inventory; only annotated string paths may leave setup.
 type LabRelease struct {
 	Name           string                 `json:"name"`
 	Namespace      string                 `json:"-"`
@@ -41,6 +43,7 @@ type LabRelease struct {
 	CleanupBlocked bool                   `json:"cleanupBlocked,omitempty"`
 	BlockedReason  BlockedReason          `json:"-"`
 	Config         map[string]interface{} `json:"-"`
+	Chart          *chart.Chart           `json:"-"`
 }
 
 func (r LabRelease) hasStorageIdentity(namespace string) bool {
@@ -157,6 +160,35 @@ func (c *HelmClient) Install(ctx context.Context, opts HelmInstallOpts) error {
 	return nil
 }
 
+// bindingValues resolves only requested value attributes from the verified snapshot.
+// Cleanup never needs to coalesce values or depend on the current chart schema.
+func (r LabRelease) bindingValues(bindings []SchemaBinding) (map[string]string, error) {
+	var paths []string
+	for _, b := range bindings {
+		if b.Kind != KindNamespaceName && b.Kind != KindRootURL {
+			paths = append(paths, b.Path)
+		}
+	}
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	values := r.Config
+	if r.Chart != nil {
+		merged, err := chartutil.CoalesceValues(r.Chart, r.Config)
+		if err != nil {
+			return nil, errors.New("unable to coalesce Helm values")
+		}
+		values = merged
+	}
+	result := make(map[string]string, len(paths))
+	for _, path := range paths {
+		if value, ok := extractNestedValue(values, path); ok {
+			result[path] = value
+		}
+	}
+	return result, nil
+}
+
 func extractNestedValue(m map[string]interface{}, dotPath string) (string, bool) {
 	parts := strings.Split(dotPath, ".")
 	current := m
@@ -217,7 +249,7 @@ func (c *HelmClient) ListLabReleases(ctx context.Context, namespace, token strin
 		out = append(out, LabRelease{
 			Name: rel.Name, Namespace: namespace, CatalogRef: ref,
 			Status: string(rel.Info.Status), Revision: rel.Version, UID: string(secret.UID),
-			CleanupBlocked: reason != "", BlockedReason: reason, Config: rel.Config,
+			CleanupBlocked: reason != "", BlockedReason: reason, Config: rel.Config, Chart: rel.Chart,
 		})
 	}
 	return out, nil
@@ -361,7 +393,7 @@ func BuildValues(flat map[string]string) (map[string]interface{}, error) {
 }
 
 // mapVerifiedBindingsToValues maps namespaces only after checking lab identity and UID.
-func mapVerifiedBindingsToValues(ctx context.Context, client *SpaceRequestClient, token, namespace, catalogRef string, bindings []NamespaceBinding, uids map[string]string) (map[string]string, error) {
+func mapVerifiedBindingsToValues(ctx context.Context, client *SpaceRequestClient, token, namespace, catalogRef string, bindings []SchemaBinding, uids map[string]string) (map[string]string, error) {
 	label, err := CatalogRefLabel(catalogRef)
 	if err != nil {
 		return nil, err

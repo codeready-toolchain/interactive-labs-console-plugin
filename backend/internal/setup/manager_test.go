@@ -16,6 +16,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"helm.sh/helm/v3/pkg/chart"
+	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/release"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -82,7 +84,7 @@ func TestManagerInventoryLifecycle(t *testing.T) {
 	ref := strings.Repeat("ab", 32)
 	label, err := CatalogRefLabel(ref)
 	require.NoError(t, err)
-	bindings := SchemaBindings{Namespaces: []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}}
+	bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
 	srJSON := func(failed bool) string {
 		condition := `{"type":"Ready","status":"True"}`
 		if failed {
@@ -245,7 +247,7 @@ func TestManagerInventoryLifecycle(t *testing.T) {
 			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, Coordinator: coord})
 			workerBindings := bindings
 			if tc.noSR {
-				workerBindings = SchemaBindings{}
+				workerBindings = nil
 			}
 			_, ready, err := manager.Start(ctx, "alice", "user-token", ref, "chart", workerBindings)
 			require.NoError(t, err)
@@ -420,7 +422,7 @@ func TestManagerTerminatingSpaceRequests(t *testing.T) {
 	ref := strings.Repeat("ab", 32)
 	label, err := CatalogRefLabel(ref)
 	require.NoError(t, err)
-	bindings := SchemaBindings{Namespaces: []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}}
+	bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
 	t.Run("unrelated terminating lab does not block healthy deployment", func(t *testing.T) {
 		otherLabel, err := CatalogRefLabel(strings.Repeat("cd", 32))
 		require.NoError(t, err)
@@ -525,7 +527,7 @@ func TestManagerTerminatingSpaceRequests(t *testing.T) {
 			namedGets.Store(0)
 			startBindings := bindings
 			if tc.oldBinding {
-				startBindings = SchemaBindings{Namespaces: []NamespaceBinding{{Key: "new-binding", Path: "namespaces.new"}}}
+				startBindings = []SchemaBinding{{Key: "new-binding", Path: "namespaces.new", Kind: KindNamespaceName}}
 			}
 			_, ready, err := manager.Start(ctx, "alice", "user-token", ref, "chart", startBindings)
 			if err == nil && !ready {
@@ -569,7 +571,7 @@ func TestManager(t *testing.T) {
 	ref := strings.Repeat("ab", 32)
 	label, err := CatalogRefLabel(ref)
 	require.NoError(t, err)
-	bindings := SchemaBindings{Namespaces: []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}}
+	bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
 	newManager := func(server *httptest.Server, helm HelmManager) *Manager {
 		return NewManager(ManagerConfig{
 			Helm: helm, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL},
@@ -717,7 +719,7 @@ func TestManager(t *testing.T) {
 			_, _ = fmt.Fprintf(w, `{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
 		}))
 		defer server.Close()
-		helm := &managerTestHelm{status: "deployed", releases: []LabRelease{{Name: HelmReleaseName("alice", ref, bindings.Namespaces), Namespace: "alice-dev", CatalogRef: ref, UID: "helm-uid", Status: "deployed"}}}
+		helm := &managerTestHelm{status: "deployed", releases: []LabRelease{{Name: HelmReleaseName("alice", ref, bindings), Namespace: "alice-dev", CatalogRef: ref, UID: "helm-uid", Status: "deployed"}}}
 		status, err := newManager(server, helm).Status(ctx, "alice", "user-token", ref, bindings)
 		require.NoError(t, err)
 		payload, err := json.Marshal(status)
@@ -741,7 +743,7 @@ func TestManager(t *testing.T) {
 		assert.Equal(t, "ready", actual.SpaceRequests.Namespaces["gitea"].Status)
 		assert.Equal(t, "alice-gitea", actual.SpaceRequests.Namespaces["gitea"].Name)
 		assert.Equal(t, "deployed", actual.Helm.Status)
-		assert.Equal(t, HelmReleaseName("alice", ref, bindings.Namespaces), actual.Helm.ReleaseName)
+		assert.Equal(t, HelmReleaseName("alice", ref, bindings), actual.Helm.ReleaseName)
 		assert.Equal(t, "alice-gitea", actual.Attributes["namespaces-gitea"])
 	})
 
@@ -770,8 +772,7 @@ func TestManager(t *testing.T) {
 				helm := &managerTestHelm{list: func(context.Context, []SpaceRequestResult) ([]LabRelease, error) {
 					return nil, tc.listErr
 				}}
-				statusBindings := bindings
-				statusBindings.Passwords = []ValueBinding{{Key: "gitea.password", Path: "gitea.adminPassword", Kind: KindGeneratedPassword}}
+				statusBindings := append(append([]SchemaBinding(nil), bindings...), SchemaBinding{Key: "gitea.password", Path: "gitea.adminPassword", Kind: KindGeneratedPassword})
 				status, err := newManager(server, helm).Status(ctx, "alice", "user-token", ref, statusBindings)
 				if tc.wantError {
 					require.Error(t, err, "read failure must not be reported as pending or as a usable deployment")
@@ -780,7 +781,6 @@ func TestManager(t *testing.T) {
 					assert.Equal(t, ManagerBadGateway, managerErr.Kind)
 					assert.NotContains(t, err.Error(), "user-token")
 					assert.Empty(t, status.Attributes, "failed reads must not expose incomplete launch attributes")
-					assert.Empty(t, status.Helm.GeneratedValues)
 					return
 				}
 				require.NoError(t, err)
@@ -838,7 +838,7 @@ func TestManager(t *testing.T) {
 		assert.Equal(t, "ready", status.SpaceRequests.Status)
 		assert.Equal(t, NamespaceStatus{Status: "ready", Name: "alice-gitea"}, status.SpaceRequests.Namespaces["gitea"])
 		assert.Equal(t, "pending", status.Helm.Status)
-		assert.Equal(t, HelmReleaseName("alice", ref, bindings.Namespaces), status.Helm.ReleaseName)
+		assert.Equal(t, HelmReleaseName("alice", ref, bindings), status.Helm.ReleaseName)
 	})
 }
 
@@ -1166,7 +1166,7 @@ func TestManagerRestartRecovery(t *testing.T) {
 	ref := strings.Repeat("ab", 32)
 	label, err := CatalogRefLabel(ref)
 	require.NoError(t, err)
-	bindings := SchemaBindings{Namespaces: []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}}
+	bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
 	stale := metav1.NewMicroTime(time.Now().Add(-201 * time.Second))
 	fresh := metav1.NewMicroTime(time.Now())
 	newManager := func(t *testing.T, helm HelmManager, renewed *metav1.MicroTime) *Manager {
@@ -1353,7 +1353,7 @@ func TestManagerRestartRecovery(t *testing.T) {
 		assert.Equal(t, "fresh-token", opts.Token)
 		assert.Equal(t, "chart", opts.ChartDir)
 		assert.Equal(t, "alice-dev", opts.Namespace)
-		assert.Equal(t, HelmReleaseName("alice", ref, bindings.Namespaces), opts.ReleaseName)
+		assert.Equal(t, HelmReleaseName("alice", ref, bindings), opts.ReleaseName)
 		assert.Equal(t, map[string]string{"namespaces.gitea": "alice-gitea"}, opts.Values)
 		assert.Equal(t, map[string]string{CatalogRefLabelKey: label}, opts.Labels)
 		assert.True(t, manager.config.Coordinator.IsHeld(ctx, "alice", ref))
@@ -1379,6 +1379,50 @@ func TestManagerWorkerValues(t *testing.T) {
 	label, err := CatalogRefLabel(ref)
 	require.NoError(t, err)
 	sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"conditions":[{"type":"Ready","status":"True"}],"namespaceAccess":[{"name":"alice-gitea"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+	t.Run("given mixed kinds with overlapping keys when worker runs then only namespace bindings identify the release", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// Given namespace and password bindings share a key alongside root URL and plain values.
+			ctx := context.Background()
+			workerFinished := false
+			client := managerWorkerValuesClient(t, sr, "", 0, &workerFinished)
+			var installed []HelmInstallOpts
+			manager, helm := managerWorkerValuesManager(client, "apps.example.com", &installed)
+			bindings := []SchemaBinding{
+				{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName},
+				{Path: "gitea.rootUrl", Kind: KindRootURL, RouteName: "gitea", NamespaceRef: "gitea"},
+				{Key: "gitea", Path: "admin.password", Kind: KindGeneratedPassword},
+				{Key: "username", Path: "admin.username", Kind: "value"},
+			}
+
+			// When setup hands off to the worker.
+			status, ready, err := manager.Start(ctx, "alice", "user-token", ref, "chart", bindings)
+			require.NoError(t, err)
+			assert.False(t, ready)
+			synctest.Wait()
+			workerFinished = true
+
+			// Then only namespace bindings drive SR reads and release identity.
+			assert.False(t, manager.config.Coordinator.IsHeld(ctx, "alice", ref))
+			require.Len(t, installed, 1)
+			assert.Equal(t, "alice-gitea", installed[0].Values["namespaces.gitea"])
+			assert.Equal(t, "gitea-alice-gitea.apps.example.com", installed[0].Values["gitea.rootUrl"])
+			assert.Equal(t, map[string]string{CatalogRefLabelKey: label}, installed[0].Labels)
+			wantName := HelmReleaseName("alice", ref, []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}})
+			assert.Equal(t, wantName, status.Helm.ReleaseName)
+			assert.Equal(t, []string{wantName}, helm.statusNames)
+			assert.Equal(t, wantName, installed[0].ReleaseName)
+			assert.Len(t, installed[0].Values["admin.password"], passwordLength)
+			assert.NotContains(t, installed[0].Values, "admin.username")
+
+			// Non-namespace bindings must not make a deployed lab's SRs drift when reopening.
+			helm.releases = []LabRelease{{Name: wantName, Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: "deployed"}}
+			opened, ready, err := manager.Start(ctx, "alice", "user-token", ref, "chart", bindings)
+			require.NoError(t, err)
+			assert.True(t, ready)
+			assert.Equal(t, wantName, opened.Helm.ReleaseName)
+		})
+	})
+
 	for _, tc := range []struct {
 		name, ingress, rootRef, message string
 		workerBody                      string
@@ -1401,39 +1445,18 @@ func TestManagerWorkerValues(t *testing.T) {
 	} {
 		t.Run("given "+tc.name+" when worker runs then only verified values install", func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
+				// Given a ready preflight SR and the configured worker response.
 				ctx := context.Background()
-				namedGets := 0
 				workerFinished := false
-				client := &http.Client{Transport: managerRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-					assert.Equal(t, http.MethodGet, r.Method)
-					assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
-					body, code := sr, http.StatusOK
-					if strings.HasSuffix(r.URL.Path, "/spacerequests") {
-						body = `{"items":[` + sr + `]}`
-					} else {
-						namedGets++
-						if namedGets > 2 && !workerFinished {
-							if tc.workerBody != "" {
-								body = tc.workerBody
-							}
-							if tc.workerCode != 0 {
-								code = tc.workerCode
-							}
-						}
-					}
-					return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
-				})}
+				client := managerWorkerValuesClient(t, sr, tc.workerBody, tc.workerCode, &workerFinished)
 				var installed []HelmInstallOpts
-				helm := &managerTestHelm{installOpts: func(_ context.Context, opts HelmInstallOpts) error {
-					installed = append(installed, opts)
-					return nil
-				}}
-				coord := NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")
-				manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: "https://cluster.test", HTTPClient: client}, Coordinator: coord, ClusterIngressDomain: tc.ingress})
-				bindings := SchemaBindings{Namespaces: []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}}
+				manager, _ := managerWorkerValuesManager(client, tc.ingress, &installed)
+				bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
 				if tc.rootRef != "" {
-					bindings.RootURLs = []RootURLBinding{{Path: "gitea.rootUrl", RouteName: "gitea", NamespaceRef: tc.rootRef}}
+					bindings = append(bindings, SchemaBinding{Path: "gitea.rootUrl", Kind: KindRootURL, RouteName: "gitea", NamespaceRef: tc.rootRef})
 				}
+
+				// When setup hands off to the worker.
 				_, ready, err := manager.Start(ctx, "alice", "user-token", ref, "chart", bindings)
 				require.NoError(t, err)
 				assert.False(t, ready)
@@ -1444,7 +1467,9 @@ func TestManagerWorkerValues(t *testing.T) {
 					synctest.Wait()
 				}
 				workerFinished = true
-				assert.False(t, coord.IsHeld(ctx, "alice", ref))
+
+				// Then only verified values install, or a safe failure is reported.
+				assert.False(t, manager.config.Coordinator.IsHeld(ctx, "alice", ref))
 				if tc.message == "" && tc.workerBody == "" && tc.workerCode == 0 {
 					require.Len(t, installed, 1)
 					assert.Equal(t, "alice-gitea", installed[0].Values["namespaces.gitea"])
@@ -1465,6 +1490,41 @@ func TestManagerWorkerValues(t *testing.T) {
 			})
 		})
 	}
+}
+
+func managerWorkerValuesClient(t *testing.T, sr, workerBody string, workerCode int, workerFinished *bool) *http.Client {
+	t.Helper()
+	namedGets := 0
+	return &http.Client{Transport: managerRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+		body, code := sr, http.StatusOK
+		if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+			body = `{"items":[` + sr + `]}`
+		} else {
+			assert.True(t, strings.HasSuffix(r.URL.Path, "/spacerequests/gitea"), "only namespace bindings may read SRs")
+			namedGets++
+			if namedGets > 2 && !*workerFinished {
+				if workerBody != "" {
+					body = workerBody
+				}
+				if workerCode != 0 {
+					code = workerCode
+				}
+			}
+		}
+		return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+}
+
+func managerWorkerValuesManager(client *http.Client, ingress string, installed *[]HelmInstallOpts) (*Manager, *managerTestHelm) {
+	helm := &managerTestHelm{installOpts: func(_ context.Context, opts HelmInstallOpts) error {
+		*installed = append(*installed, opts)
+		return nil
+	}}
+	coord := NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")
+	manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: "https://cluster.test", HTTPClient: client}, Coordinator: coord, ClusterIngressDomain: ingress})
+	return manager, helm
 }
 
 func TestManagerLabBindingReadback(t *testing.T) {
@@ -1539,7 +1599,7 @@ func TestManagerLabBindingReadback(t *testing.T) {
 				}}
 				coord := NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")
 				manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: "https://cluster.test", HTTPClient: client}, Coordinator: coord, TierName: tc.tier})
-				bindings := SchemaBindings{Namespaces: []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}}
+				bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
 
 				// When Start ensures and rereads the binding before launching the worker.
 				status, ready, err := manager.Start(context.Background(), "alice", "user-token", ref, "chart", bindings)
@@ -1761,7 +1821,7 @@ func (h *managerSnapshotOnlyHelm) ReleaseStatus(context.Context, string, string,
 func TestManagerVerifiedRelease(t *testing.T) {
 	ctx := context.Background()
 	ref := strings.Repeat("ab", 32)
-	bindings := SchemaBindings{Passwords: []ValueBinding{{Path: "admin.password", Kind: KindGeneratedPassword}}}
+	bindings := []SchemaBinding{{Path: "admin.password", Kind: KindGeneratedPassword}}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodGet, r.Method)
 		_, _ = fmt.Fprint(w, `{"items":[]}`)
@@ -1791,12 +1851,12 @@ func TestManagerVerifiedRelease(t *testing.T) {
 		assert.Equal(t, verified.Name, status.Helm.ReleaseName, "schema-derived name must not replace discovered name")
 		assert.Equal(t, "deployed", status.Helm.Status)
 		assert.Empty(t, status.Helm.Message)
-		assert.Equal(t, map[string]string{"admin.password": "snapshot-password"}, status.Helm.GeneratedValues)
 		assert.Equal(t, map[string]string{"admin-password": "snapshot-password"}, status.Attributes)
 		payload, err := json.Marshal(status)
 		require.NoError(t, err)
 		assert.NotContains(t, string(payload), "private-secret")
 		assert.NotContains(t, string(payload), "private-token")
+		assert.NotContains(t, string(payload), "generatedValues")
 		items, err := newManager(helm).List(ctx, "alice", "user-token")
 		require.NoError(t, err)
 		require.Len(t, items, 1)
@@ -1808,6 +1868,70 @@ func TestManagerVerifiedRelease(t *testing.T) {
 		assert.NotContains(t, string(payload), "private-secret")
 		assert.NotContains(t, string(payload), "private-token")
 		assert.Empty(t, *mutations)
+	})
+
+	t.Run("given invalid chart values when polling then safe error leaves cleanup independent", func(t *testing.T) {
+		// Given a real coalescing failure in the verified release snapshot.
+		ch := &chart.Chart{Metadata: &chart.Metadata{Name: "lab", Version: "1.0.0"}}
+		ch.AddDependency(&chart.Chart{Metadata: &chart.Metadata{Name: "child", Version: "1.0.0"}})
+		config := map[string]interface{}{"child": "private-invalid-value"}
+		_, err := chartutil.CoalesceValues(ch, config)
+		require.Error(t, err)
+		label, err := CatalogRefLabel(ref)
+		require.NoError(t, err)
+		client, mutations := cleanupTestHelm(t, &release.Release{
+			Name: verified.Name, Namespace: "alice-dev", Version: 1,
+			Labels: map[string]string{CatalogRefLabelKey: label}, Info: &release.Info{Status: release.StatusDeployed}, Chart: ch, Config: config,
+		}, "helm-uid")
+		// Helm storage JSON drops private chart dependencies; keep them in memory.
+		snapshot := verified
+		snapshot.CleanupBlocked, snapshot.Chart, snapshot.Config = false, ch, config
+		helm := &managerTestHelm{
+			releases: []LabRelease{snapshot},
+			uninstall: func(ctx context.Context, target LabRelease, srs []SpaceRequestResult) error {
+				return client.UninstallLabRelease(ctx, "alice-dev", "user-token", target, srs)
+			},
+		}
+		manager := newManager(helm)
+
+		// When polling a deployed setup that needs annotated values.
+		status, err := manager.Status(ctx, "alice", "user-token", ref, bindings)
+
+		// Then coalescing fails safely, without blocking inventory or SDK uninstall.
+		var managerErr *ManagerError
+		require.ErrorAs(t, err, &managerErr)
+		assert.Equal(t, ManagerBadGateway, managerErr.Kind)
+		assert.NotContains(t, err.Error(), "private-invalid-value")
+		assert.Empty(t, status.Attributes)
+		for _, tc := range []struct{ name, helmStatus string }{
+			{"pending Helm", "pending-install"},
+			{"failed Helm", "failed"},
+			{"pending namespace", "deployed"},
+		} {
+			t.Run("given "+tc.name+" when polling then invalid values do not replace lifecycle status", func(t *testing.T) {
+				pending := snapshot
+				pending.Status = tc.helmStatus
+				cfg := manager.config
+				cfg.Helm = &managerTestHelm{releases: []LabRelease{pending}}
+				pendingBindings := bindings
+				if tc.name == "pending namespace" {
+					pendingBindings = append(append([]SchemaBinding(nil), bindings...), SchemaBinding{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName})
+					cfg.SpaceRequests = &SpaceRequestClient{APIHost: "https://cluster.test", HTTPClient: &http.Client{Transport: managerRoundTripFunc(func(_ *http.Request) (*http.Response, error) {
+						body := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"conditions":[{"type":"Ready","status":"False"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+						return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+					})}}
+				}
+				pendingStatus, statusErr := NewManager(cfg).Status(ctx, "alice", "user-token", ref, pendingBindings)
+				require.NoError(t, statusErr)
+				assert.Empty(t, pendingStatus.Attributes)
+			})
+		}
+		items, err := manager.List(ctx, "alice", "user-token")
+		require.NoError(t, err)
+		require.Len(t, items, 1)
+		assert.False(t, items[0].Blocked)
+		require.Error(t, awaitTeardown(ctx, t, manager, ref, items[0].Generation), "local Helm fixture forbids mutations")
+		assert.NotEmpty(t, *mutations, "coalescing must not gate SDK uninstall")
 	})
 
 	t.Run("given same revision lifecycle transition when polling then no release-change conflict", func(t *testing.T) {
@@ -1831,13 +1955,11 @@ func TestManagerVerifiedRelease(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "installing", pending.Helm.Status)
 		assert.Empty(t, pending.Helm.Message)
-		assert.Empty(t, pending.Helm.GeneratedValues)
 		assert.Empty(t, pending.Attributes)
 		deployed, err := manager.Status(ctx, "alice", "user-token", ref, bindings)
 		require.NoError(t, err)
 		assert.Equal(t, "deployed", deployed.Helm.Status)
 		assert.Empty(t, deployed.Helm.Message)
-		assert.Equal(t, map[string]string{"admin.password": "deployed-password"}, deployed.Helm.GeneratedValues)
 		assert.Equal(t, "deployed-password", deployed.Attributes["admin-password"])
 		assert.Equal(t, 2, reads, "one discovery per poll")
 		assert.Empty(t, helm.statusNames)
@@ -1851,7 +1973,6 @@ func TestManagerVerifiedRelease(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "failed", status.Helm.Status)
 		assert.Equal(t, "Lab setup failed. Tear down this lab before launching again. If teardown is unavailable, contact an administrator.", status.Helm.Message)
-		assert.Empty(t, status.Helm.GeneratedValues)
 		assert.Empty(t, status.Attributes)
 		assert.False(t, status.RetrySetup)
 	})
@@ -1888,7 +2009,6 @@ func TestManagerVerifiedRelease(t *testing.T) {
 			require.ErrorAs(t, err, &managerErr)
 			assert.Equal(t, ManagerConflict, managerErr.Kind)
 			assert.Empty(t, status.Attributes)
-			assert.Empty(t, status.Helm.GeneratedValues)
 			assert.NotContains(t, err.Error(), "user-token")
 		})
 	}
@@ -1904,7 +2024,7 @@ func TestManagerVerifiedRelease(t *testing.T) {
 			helm := &managerTestHelm{status: "deployed"}
 			if tc.ref != "" {
 				other := verified
-				other.Name = HelmReleaseName("alice", ref, bindings.Namespaces)
+				other.Name = HelmReleaseName("alice", ref, nil)
 				other.CatalogRef = tc.ref
 				other.Config = map[string]interface{}{"admin": map[string]interface{}{"password": "foreign-secret"}}
 				helm.releases = []LabRelease{other}
@@ -1913,7 +2033,6 @@ func TestManagerVerifiedRelease(t *testing.T) {
 			require.NoError(t, err, "only marked releases for this catalogRef participate in status")
 			assert.Equal(t, "pending", status.Helm.Status)
 			assert.Empty(t, status.Attributes)
-			assert.Empty(t, status.Helm.GeneratedValues)
 			assert.Empty(t, helm.statusNames, "never inspect unmarked/foreign same-name releases")
 		})
 	}
@@ -1929,7 +2048,7 @@ func TestManagerVerifiedRelease(t *testing.T) {
 		}))
 		t.Cleanup(server.Close)
 		manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")})
-		_, ready, err := manager.Start(ctx, "alice", "user-token", ref, "chart", SchemaBindings{Namespaces: []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}})
+		_, ready, err := manager.Start(ctx, "alice", "user-token", ref, "chart", []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}})
 		var managerErr *ManagerError
 		require.ErrorAs(t, err, &managerErr)
 		assert.Equal(t, ManagerConflict, managerErr.Kind)
@@ -1964,9 +2083,9 @@ func TestManagerNamespaceReadiness(t *testing.T) {
 	ref := strings.Repeat("ab", 32)
 	label, err := CatalogRefLabel(ref)
 	require.NoError(t, err)
-	bindings := SchemaBindings{
-		Namespaces: []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}},
-		Passwords:  []ValueBinding{{Path: "admin.password", Kind: KindGeneratedPassword}},
+	bindings := []SchemaBinding{
+		{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName},
+		{Path: "admin.password", Kind: KindGeneratedPassword},
 	}
 	for _, tc := range []struct {
 		name, target, wantSR, wantNamespace string
@@ -2018,14 +2137,12 @@ func TestManagerNamespaceReadiness(t *testing.T) {
 			if tc.target != "" {
 				require.NoError(t, openErr)
 				assert.Equal(t, "il-original", opened.Helm.ReleaseName)
-				assert.Equal(t, map[string]string{"admin.password": "generated-value"}, status.Helm.GeneratedValues)
 				assert.Equal(t, map[string]string{"namespaces-gitea": tc.target, "admin-password": "generated-value"}, status.Attributes)
 			} else {
 				var managerErr *ManagerError
 				require.ErrorAs(t, openErr, &managerErr)
 				assert.Equal(t, ManagerConflict, managerErr.Kind)
 				assert.Equal(t, "Existing lab namespaces are not ready or bindings changed. Refresh or clean up before relaunch.", managerErr.Message)
-				assert.Empty(t, status.Helm.GeneratedValues)
 				assert.Empty(t, status.Attributes)
 			}
 			assert.Empty(t, helm.statusNames, "verified snapshots need no name-based rereads")
@@ -2054,12 +2171,22 @@ func TestManagerSnapshotValues(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				assert.Equal(t, http.MethodGet, r.Method)
 				assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
-				_, _ = fmt.Fprintf(w, `{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":%q,"reason":%q}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation, tc.srReady, tc.srReason)
+				sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":%q,"reason":%q}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation, tc.srReady, tc.srReason)
+				if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+					_, _ = fmt.Fprintf(w, `{"items":[%s]}`, sr)
+				} else {
+					_, _ = fmt.Fprint(w, sr)
+				}
 			}))
 			t.Cleanup(server.Close)
 			client, mutations := cleanupTestHelm(t, &release.Release{
 				Name: "il-original-schema", Namespace: "alice-dev", Version: 1,
 				Labels: map[string]string{CatalogRefLabelKey: label}, Info: &release.Info{Status: tc.status},
+				Chart: &chart.Chart{Metadata: &chart.Metadata{Name: "lab", Version: "1.0.0"}, Values: map[string]interface{}{
+					"admin":      map[string]interface{}{"username": "default-user", "password": "default-password", "hidden": "hidden-default"},
+					"namespaces": map[string]interface{}{"gitea": "stale-default-namespace"},
+					"gitea":      map[string]interface{}{"rootUrl": "stale-default-url"},
+				}},
 				Config: map[string]interface{}{
 					"admin":  map[string]interface{}{"password": "snapshot-password", "other": "unrequested-secret"},
 					"number": 42, "list": []string{"private-item"}, "token": "private-token",
@@ -2070,20 +2197,25 @@ func TestManagerSnapshotValues(t *testing.T) {
 			_, finish, err := coord.Acquire(ctx, "alice", ref)
 			require.NoError(t, err)
 			t.Cleanup(finish)
-			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: coord})
-			bindings := SchemaBindings{Namespaces: []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}}
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: coord, ClusterIngressDomain: "apps.example.com"})
+			bindings := []SchemaBinding{
+				{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName},
+				{Path: "gitea.rootUrl", Kind: KindRootURL, RouteName: "gitea", NamespaceRef: "gitea"},
+			}
 			if tc.passwords {
+				bindings = append(bindings, SchemaBinding{Path: "admin.username", Kind: "value"})
 				for _, path := range []string{"admin.password", "admin.missing", "number", "list", "admin.password.child"} {
-					bindings.Passwords = append(bindings.Passwords, ValueBinding{Path: path, Kind: KindGeneratedPassword})
+					bindings = append(bindings, SchemaBinding{Path: path, Kind: KindGeneratedPassword})
 				}
 			}
 			status, err := manager.Status(ctx, "alice", "user-token", ref, bindings)
 			require.NoError(t, err)
 			if tc.wantValues {
-				assert.Equal(t, map[string]string{"admin.password": "snapshot-password"}, status.Helm.GeneratedValues)
-				assert.Equal(t, "snapshot-password", status.Attributes["admin-password"])
+				assert.Equal(t, map[string]string{
+					"namespaces-gitea": "alice-gitea", "gitea-rootUrl": "gitea-alice-gitea.apps.example.com",
+					"admin-password": "snapshot-password", "admin-username": "default-user",
+				}, status.Attributes)
 			} else {
-				assert.Empty(t, status.Helm.GeneratedValues)
 				assert.NotContains(t, status.Attributes, "admin-password")
 				if tc.status != release.StatusDeployed || tc.srReady != "True" {
 					assert.Empty(t, status.Attributes)
@@ -2091,7 +2223,7 @@ func TestManagerSnapshotValues(t *testing.T) {
 			}
 			payload, err := json.Marshal(status)
 			require.NoError(t, err)
-			for _, secret := range []string{"unrequested-secret", "private-item", "private-token", "user-token"} {
+			for _, secret := range []string{"unrequested-secret", "private-item", "private-token", "user-token", "hidden-default", "default-password", "stale-default-namespace", "stale-default-url"} {
 				assert.NotContains(t, string(payload), secret)
 			}
 			if !tc.wantValues {
@@ -2100,6 +2232,18 @@ func TestManagerSnapshotValues(t *testing.T) {
 			assert.Equal(t, 1, helm.lists)
 			assert.Zero(t, helm.statusReads)
 			assert.Empty(t, *mutations)
+			if tc.wantValues {
+				items, err := manager.List(ctx, "alice", "user-token")
+				require.NoError(t, err)
+				require.Len(t, items, 1)
+				require.NotNil(t, items[0].Release)
+				assert.Nil(t, items[0].Release.Config)
+				assert.Nil(t, items[0].Release.Chart)
+				payload, err := json.Marshal(items)
+				require.NoError(t, err)
+				assert.NotContains(t, string(payload), "default-user")
+				assert.NotContains(t, string(payload), "snapshot-password")
+			}
 		})
 	}
 }
@@ -2129,10 +2273,10 @@ func TestManagerWorkerOwnership(t *testing.T) {
 		})
 		coord := NewOperationCoordinator(client, "plugin-ns")
 		manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: coord})
-		_, _, err := manager.Start(ctx, "alice", "user-token", ref, "chart", SchemaBindings{})
+		_, _, err := manager.Start(ctx, "alice", "user-token", ref, "chart", nil)
 		require.NoError(t, err)
 		require.Eventually(t, func() bool { return !coord.IsHeld(ctx, "alice", ref) }, time.Second, time.Millisecond)
-		status, err := manager.Status(ctx, "alice", "user-token", ref, SchemaBindings{})
+		status, err := manager.Status(ctx, "alice", "user-token", ref, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "failed", status.Helm.Status)
 		assert.Equal(t, "Helm install failed", status.Helm.Message, "retain safe failure detail when cluster has no outcome")
@@ -2143,7 +2287,7 @@ func TestManagerWorkerOwnership(t *testing.T) {
 			defer unknownHolder.Store(false)
 
 			// When observing public status and inventory.
-			pending, statusErr := manager.Status(ctx, "alice", "user-token", ref, SchemaBindings{})
+			pending, statusErr := manager.Status(ctx, "alice", "user-token", ref, nil)
 			require.NoError(t, statusErr)
 			pendingItems, listErr := manager.List(ctx, "alice", "user-token")
 
@@ -2165,10 +2309,10 @@ func TestManagerWorkerOwnership(t *testing.T) {
 			return nil
 		}}
 		otherPod := NewManager(ManagerConfig{Helm: otherHelm, SpaceRequests: manager.config.SpaceRequests, Coordinator: NewOperationCoordinator(coord.client, "plugin-ns")})
-		_, _, err = otherPod.Start(ctx, "alice", "user-token", ref, "chart", SchemaBindings{})
+		_, _, err = otherPod.Start(ctx, "alice", "user-token", ref, "chart", nil)
 		require.NoError(t, err)
 		<-started
-		status, err = manager.Status(ctx, "alice", "user-token", ref, SchemaBindings{})
+		status, err = manager.Status(ctx, "alice", "user-token", ref, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "pending", status.Helm.Status, "old failure must not override another pod's live operation")
 		assert.False(t, status.RetrySetup)
@@ -2230,13 +2374,13 @@ func TestManagerWorkerOwnership(t *testing.T) {
 			_, err = leases.Update(ctx, lease, metav1.UpdateOptions{})
 			require.NoError(t, err)
 			deployed = false // Old in-flight Helm can outlive the reservation.
-			_, _, err = manager.Start(ctx, "alice", "user-token", ref, "chart", SchemaBindings{})
+			_, _, err = manager.Start(ctx, "alice", "user-token", ref, "chart", nil)
 			require.NoError(t, err)
 			<-successorStarted
 			close(oldFinish)
 			synctest.Wait()
 			require.ErrorIs(t, oldCtx.Err(), context.Canceled)
-			status, err := manager.Status(ctx, "alice", "user-token", ref, SchemaBindings{})
+			status, err := manager.Status(ctx, "alice", "user-token", ref, nil)
 			require.NoError(t, err)
 			assert.Equal(t, "installing", status.Helm.Status)
 			assert.True(t, coord.IsHeld(ctx, "alice", ref))
@@ -2274,7 +2418,7 @@ func TestManagerWorkerOwnership(t *testing.T) {
 			}}
 			coord := NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")
 			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: coord})
-			_, _, err := manager.Start(ctx, "alice", "user-token", ref, "chart", SchemaBindings{})
+			_, _, err := manager.Start(ctx, "alice", "user-token", ref, "chart", nil)
 			require.NoError(t, err)
 			oldCtx := <-started
 			t.Cleanup(func() {
@@ -2293,15 +2437,15 @@ func TestManagerWorkerOwnership(t *testing.T) {
 			require.Len(t, items, 1)
 			assert.Equal(t, "failed", items[0].Status, "expired local installer must not permanently block recovery")
 			assert.False(t, items[0].Blocked)
-			status, err := manager.Status(ctx, "alice", "user-token", ref, SchemaBindings{})
+			status, err := manager.Status(ctx, "alice", "user-token", ref, nil)
 			require.NoError(t, err)
 			assert.True(t, status.RetrySetup)
-			_, _, err = manager.Start(ctx, "alice", "user-token", ref, "chart", SchemaBindings{})
+			_, _, err = manager.Start(ctx, "alice", "user-token", ref, "chart", nil)
 			require.NoError(t, err)
 			<-started
 			close(oldFinish)
 			require.Eventually(t, func() bool { return oldCtx.Err() != nil }, time.Second, time.Millisecond)
-			status, err = manager.Status(ctx, "alice", "user-token", ref, SchemaBindings{})
+			status, err = manager.Status(ctx, "alice", "user-token", ref, nil)
 			require.NoError(t, err)
 			assert.Equal(t, "installing", status.Helm.Status, "old success/failure must not replace successor's record")
 			assert.True(t, coord.IsHeld(ctx, "alice", ref), "old completion must not release successor")

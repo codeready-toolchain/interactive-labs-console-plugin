@@ -46,7 +46,6 @@ export interface HelmStatus {
   status: "pending" | "installing" | "deployed" | "failed";
   releaseName: string;
   message?: string;
-  generatedValues?: Record<string, string>;
 }
 
 export interface SetupStatus {

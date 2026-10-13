@@ -92,7 +92,7 @@ func TestVerifiedNamespaceBinding(t *testing.T) {
 			}))
 			defer server.Close()
 			client := &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}
-			values, err := mapVerifiedBindingsToValues(context.Background(), client, "token", "alice-dev", ref, []NamespaceBinding{{Key: "gitea", Path: "namespace"}}, map[string]string{"gitea": "expected-uid"})
+			values, err := mapVerifiedBindingsToValues(context.Background(), client, "token", "alice-dev", ref, []SchemaBinding{{Key: "gitea", Path: "namespace", Kind: KindNamespaceName}}, map[string]string{"gitea": "expected-uid"})
 			if tc.wantErr {
 				require.Error(t, err)
 				assert.Empty(t, values)

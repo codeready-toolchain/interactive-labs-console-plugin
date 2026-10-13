@@ -33,7 +33,7 @@ func TestGeneratePassword(t *testing.T) {
 
 func TestGeneratePasswordValues(t *testing.T) {
 	t.Run("returns correct paths", func(t *testing.T) {
-		bindings := []ValueBinding{
+		bindings := []SchemaBinding{
 			{Key: "postgres", Path: "passwords.postgres", Kind: KindGeneratedPassword},
 			{Key: "giteaAdmin", Path: "passwords.giteaAdmin", Kind: KindGeneratedPassword},
 		}

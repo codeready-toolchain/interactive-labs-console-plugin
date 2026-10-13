@@ -253,6 +253,7 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
 		return
 	}
+	cfg.Logger.Info("bundle loaded", "repository", entry.Repository, "branch", entry.Branch, "commit", result.Revision)
 
 	type page struct {
 		Path string `json:"path"`

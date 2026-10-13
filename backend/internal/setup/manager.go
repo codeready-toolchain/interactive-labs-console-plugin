@@ -87,10 +87,16 @@ type NamespaceStatus struct {
 }
 
 type HelmSetupStatus struct {
-	Status          string            `json:"status"`
-	ReleaseName     string            `json:"releaseName"`
-	Message         string            `json:"message,omitempty"`
-	GeneratedValues map[string]string `json:"generatedValues,omitempty"`
+	Status      string `json:"status"`
+	ReleaseName string `json:"releaseName"`
+	Message     string `json:"message,omitempty"`
+}
+
+// Attribute values stay private to this request, never in the Helm wire status.
+type helmSetupObservation struct {
+	helm       HelmSetupStatus
+	retrySetup bool
+	values     map[string]string
 }
 
 func newStatus(srStatus, helmStatus, releaseName string, namespaces map[string]NamespaceStatus) Status {
@@ -134,7 +140,7 @@ func (m *Manager) labRelease(ctx context.Context, namespace, token, ref string) 
 
 // Start either reports an existing verified deployment or hands the reservation
 // to a background worker. bool is true only for an already-ready setup.
-func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir string, bindings SchemaBindings) (Status, bool, error) {
+func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir string, bindings []SchemaBinding) (Status, bool, error) {
 	if !m.available() || m.config.Coordinator == nil {
 		return Status{}, false, managerError(ManagerUnavailable, "lab setup unavailable")
 	}
@@ -162,7 +168,8 @@ func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir strin
 	defer stopRequest()
 
 	namespace := subjectHomeSpace(subject)
-	releaseName := HelmReleaseName(subject, ref, bindings.Namespaces)
+	nsBindings := BindingsByKind(bindings, KindNamespaceName)
+	releaseName := HelmReleaseName(subject, ref, nsBindings)
 	existing, err := m.labRelease(preflightCtx, namespace, token, ref)
 	if err != nil {
 		return Status{}, false, err
@@ -185,10 +192,10 @@ func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir strin
 		}
 	}
 	if existing != nil {
-		if len(srs) != len(bindings.Namespaces) {
+		if len(srs) != len(nsBindings) {
 			return Status{}, false, managerError(ManagerConflict, "Existing lab namespace bindings changed. Clean up before relaunch.")
 		}
-		for _, b := range bindings.Namespaces {
+		for _, b := range nsBindings {
 			if !slices.ContainsFunc(srs, func(sr SpaceRequestResult) bool {
 				return sr.Annotations[BindingKeyAnnotation] == b.Key && sr.readyNamespace() != ""
 			}) {
@@ -209,8 +216,8 @@ func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir strin
 		return Status{}, false, managerError(ManagerConflict, "Unverified existing lab release. Contact an administrator before retrying.")
 	}
 
-	uids := make(map[string]string, len(bindings.Namespaces))
-	for _, b := range bindings.Namespaces {
+	uids := make(map[string]string, len(nsBindings))
+	for _, b := range nsBindings {
 		if preflightCtx.Err() != nil {
 			return Status{}, false, managerError(ManagerConflict, "Lab operation lost its reservation; reopen to retry.")
 		}
@@ -258,7 +265,7 @@ const (
 	managerPollTimeout  = 30 * time.Minute
 )
 
-func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, ref, chartDir string, bindings SchemaBindings, uids map[string]string, worker managerWorkerState) {
+func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, ref, chartDir string, bindings []SchemaBinding, uids map[string]string, worker managerWorkerState) {
 	store := func(phase, message string) {
 		next := worker
 		next.phase, next.message = phase, message
@@ -266,12 +273,15 @@ func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, 
 		worker = next
 	}
 	fail := func(message string) { store("failed", message) }
+	nsBindings := BindingsByKind(bindings, KindNamespaceName)
+	pwBindings := BindingsByKind(bindings, KindGeneratedPassword)
+	urlBindings := BindingsByKind(bindings, KindRootURL)
 	pollCtx, cancel := context.WithTimeout(ctx, managerPollTimeout)
 	defer cancel()
 	var namespaces map[string]string
 	for {
 		var err error
-		namespaces, err = mapVerifiedBindingsToValues(pollCtx, m.config.SpaceRequests, token, namespace, ref, bindings.Namespaces, uids)
+		namespaces, err = mapVerifiedBindingsToValues(pollCtx, m.config.SpaceRequests, token, namespace, ref, nsBindings, uids)
 		if err == nil {
 			break
 		}
@@ -282,12 +292,12 @@ func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, 
 		case <-time.After(managerPollInterval):
 		}
 	}
-	values := make(map[string]string, len(namespaces)+len(bindings.Passwords)+len(bindings.RootURLs))
+	values := make(map[string]string, len(namespaces)+len(pwBindings)+len(urlBindings))
 	for k, v := range namespaces {
 		values[k] = v
 	}
-	if len(bindings.Passwords) > 0 {
-		passwords, err := GeneratePasswordValues(bindings.Passwords)
+	if len(pwBindings) > 0 {
+		passwords, err := GeneratePasswordValues(pwBindings)
 		if err != nil {
 			fail("password generation failed")
 			return
@@ -296,12 +306,12 @@ func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, 
 			values[k] = v
 		}
 	}
-	for _, b := range bindings.RootURLs {
+	for _, b := range urlBindings {
 		if m.config.ClusterIngressDomain == "" {
 			fail("cluster ingress domain not configured")
 			return
 		}
-		ns := namespaces[NamespaceBindingPath(bindings.Namespaces, b.NamespaceRef)]
+		ns := namespaces[BindingPath(nsBindings, b.NamespaceRef)]
 		if ns == "" {
 			fail("root-url references unknown namespace binding")
 			return
@@ -330,9 +340,9 @@ func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, 
 	store("done", "")
 }
 
-// Status reports SpaceRequest readiness and Helm state, including only explicitly
-// generated value paths and their corresponding attributes.
-func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindings SchemaBindings) (Status, error) {
+// Status reports verified SpaceRequest readiness and Helm state, exposing only
+// annotated string values as attributes once the setup is ready and deployed.
+func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindings []SchemaBinding) (Status, error) {
 	if m == nil || m.config.SpaceRequests == nil {
 		return Status{}, managerError(ManagerUnavailable, "lab setup unavailable")
 	}
@@ -344,9 +354,10 @@ func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindin
 		return Status{}, managerError(ManagerBadRequest, "invalid catalog identity")
 	}
 	namespace := subjectHomeSpace(subject)
-	namespaces := make(map[string]NamespaceStatus, len(bindings.Namespaces))
+	nsBindings := BindingsByKind(bindings, KindNamespaceName)
+	namespaces := make(map[string]NamespaceStatus, len(nsBindings))
 	allReady, anyFailed := true, false
-	for _, b := range bindings.Namespaces {
+	for _, b := range nsBindings {
 		sr, readErr := m.config.SpaceRequests.GetSpaceRequest(ctx, token, namespace, b.Key)
 		if readErr != nil {
 			return Status{}, managerError(ManagerBadGateway, "Unable to check SpaceRequests. Check permissions before retrying.")
@@ -375,26 +386,26 @@ func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindin
 	} else if allReady {
 		srStatus = "ready"
 	}
-	helm, retrySetup, err := m.observeHelmSetup(ctx, subject, token, ref, bindings, srStatus)
+	observed, err := m.observeHelmSetup(ctx, subject, token, ref, bindings, srStatus)
 	if err != nil {
 		return Status{}, err
 	}
-	result := newStatus(srStatus, helm.Status, helm.ReleaseName, namespaces)
-	result.Helm, result.RetrySetup = helm, retrySetup
+	result := newStatus(srStatus, observed.helm.Status, observed.helm.ReleaseName, namespaces)
+	result.Helm, result.RetrySetup = observed.helm, observed.retrySetup
 	if allReady && result.Helm.Status == "deployed" {
-		result.Attributes = make(map[string]string, len(bindings.Namespaces)+len(bindings.Passwords)+len(bindings.RootURLs))
-		for _, b := range bindings.Namespaces {
-			result.Attributes[strings.ReplaceAll(b.Path, ".", "-")] = namespaces[b.Key].Name
-		}
-		for _, b := range bindings.Passwords {
-			if value, ok := result.Helm.GeneratedValues[b.Path]; ok {
-				result.Attributes[strings.ReplaceAll(b.Path, ".", "-")] = value
-			}
-		}
-		for _, b := range bindings.RootURLs {
-			if m.config.ClusterIngressDomain != "" {
-				if ns, ok := namespaces[b.NamespaceRef]; ok {
-					result.Attributes[strings.ReplaceAll(b.Path, ".", "-")] = fmt.Sprintf("%s-%s.%s", b.RouteName, ns.Name, m.config.ClusterIngressDomain)
+		result.Attributes = make(map[string]string, len(bindings))
+		for _, b := range bindings {
+			key := strings.ReplaceAll(b.Path, ".", "-")
+			switch b.Kind {
+			case KindNamespaceName:
+				result.Attributes[key] = namespaces[b.Key].Name
+			case KindRootURL:
+				if ns, ok := namespaces[b.NamespaceRef]; ok && m.config.ClusterIngressDomain != "" {
+					result.Attributes[key] = fmt.Sprintf("%s-%s.%s", b.RouteName, ns.Name, m.config.ClusterIngressDomain)
+				}
+			default:
+				if value, ok := observed.values[b.Path]; ok {
+					result.Attributes[key] = value
 				}
 			}
 		}
@@ -403,15 +414,16 @@ func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindin
 }
 
 // observeHelmSetup uses one verified release snapshot and advisory local state.
-func (m *Manager) observeHelmSetup(ctx context.Context, subject, token, ref string, bindings SchemaBindings, srStatus string) (HelmSetupStatus, bool, error) {
+func (m *Manager) observeHelmSetup(ctx context.Context, subject, token, ref string, bindings []SchemaBinding, srStatus string) (helmSetupObservation, error) {
 	namespace := subjectHomeSpace(subject)
-	result := HelmSetupStatus{Status: "pending", ReleaseName: HelmReleaseName(subject, ref, bindings.Namespaces)}
+	result := HelmSetupStatus{Status: "pending", ReleaseName: HelmReleaseName(subject, ref, BindingsByKind(bindings, KindNamespaceName))}
 	var releaseStatus string
+	var values map[string]string
 	holder, held := m.config.Coordinator.currentHolder(ctx, subject, ref)
 	if m.config.Helm != nil {
 		existing, err := m.labRelease(ctx, namespace, token, ref)
 		if err != nil {
-			return HelmSetupStatus{}, false, err
+			return helmSetupObservation{}, err
 		}
 		if existing != nil {
 			result.ReleaseName = existing.Name
@@ -420,12 +432,10 @@ func (m *Manager) observeHelmSetup(ctx context.Context, subject, token, ref stri
 			if result.Status == "failed" {
 				result.Message = "Lab setup failed. Tear down this lab before launching again. If teardown is unavailable, contact an administrator."
 			}
-			if srStatus == "ready" && result.Status == "deployed" && len(bindings.Passwords) > 0 {
-				result.GeneratedValues = make(map[string]string, len(bindings.Passwords))
-				for _, b := range bindings.Passwords {
-					if value, ok := extractNestedValue(existing.Config, b.Path); ok {
-						result.GeneratedValues[b.Path] = value
-					}
+			if srStatus == "ready" && result.Status == "deployed" {
+				values, err = existing.bindingValues(bindings)
+				if err != nil {
+					return helmSetupObservation{}, managerError(ManagerBadGateway, "Unable to resolve Helm setup attributes. Refresh or contact an administrator.")
 				}
 			}
 		} else if state, ok := m.workers.Load(namespace + "\x00" + ref); ok {
@@ -444,7 +454,7 @@ func (m *Manager) observeHelmSetup(ctx context.Context, subject, token, ref stri
 		if releaseStatus == "" && result.Status == "pending" && srStatus != "failed" {
 			tornDown, err := m.config.Coordinator.HasTeardownReceipt(ctx, subject, ref)
 			if err != nil {
-				return HelmSetupStatus{}, false, managerError(ManagerUnavailable, "Unable to check lab recovery. Retry status.")
+				return helmSetupObservation{}, managerError(ManagerUnavailable, "Unable to check lab recovery. Retry status.")
 			}
 			if tornDown {
 				result.Status, result.Message = "failed", "Lab was torn down. Close this panel and launch again to recreate it."
@@ -456,7 +466,7 @@ func (m *Manager) observeHelmSetup(ctx context.Context, subject, token, ref stri
 			result.Message = "Helm installation was interrupted. Refresh setups and tear down this lab before relaunching; unsafe releases need administrator help."
 		}
 	}
-	return result, retrySetup, nil
+	return helmSetupObservation{helm: result, retrySetup: retrySetup, values: values}, nil
 }
 
 // BlockedReason is a fixed, non-secret cleanup blocker code.
@@ -548,7 +558,7 @@ func (m *Manager) readLabInventory(ctx context.Context, subject, token, reserved
 			return nil, managerError(ManagerBadGateway, "Unable to list lab setups. Check permissions or ask an administrator for help.")
 		}
 		snapshot := rel
-		snapshot.Config = nil // Inventory never retains or exposes Helm values.
+		snapshot.Config, snapshot.Chart = nil, nil // Inventory never retains or exposes Helm values or defaults.
 		item.Release = &snapshot
 	}
 	workers := map[string]managerWorkerState{}

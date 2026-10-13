@@ -19,7 +19,7 @@ type setupContext struct {
 	subject  string
 	entry    *catalog.Entry
 	result   *bundle.Result
-	bindings setup.SchemaBindings
+	bindings []setup.SchemaBinding
 }
 
 func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*setupContext, bool) {
@@ -72,12 +72,7 @@ func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*s
 			laberr.New(laberr.TypeConfigurationError, "invalid values schema", nil))
 		return nil, false
 	}
-	if bindings == nil {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeConfigurationError, "failed to parse values schema", nil))
-		return nil, false
-	}
-	if len(bindings.Namespaces) == 0 {
+	if len(setup.BindingsByKind(bindings, setup.KindNamespaceName)) == 0 {
 		writeError(w, http.StatusUnprocessableEntity,
 			laberr.New(laberr.TypeConfigurationError, "values schema declares no namespace bindings", nil))
 		return nil, false
@@ -88,7 +83,7 @@ func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*s
 		subject:  subject,
 		entry:    entry,
 		result:   result,
-		bindings: *bindings,
+		bindings: bindings,
 	}, true
 }
 

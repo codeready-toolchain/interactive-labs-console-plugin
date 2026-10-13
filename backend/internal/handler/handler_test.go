@@ -625,6 +625,25 @@ func goodCatalogRef() string {
 }
 
 func TestSetupHandler(t *testing.T) {
+	t.Run("given only non-namespace bindings when setup or status is requested then schema is rejected", func(t *testing.T) {
+		router := handler.NewRouter(handler.Config{
+			CatalogSource: goodCatalogCM,
+			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
+			BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
+				return &bundle.Result{ValuesSchema: []byte(`{"properties":{"password":{"x-interactive-labs":{"kind":"generated-password"}},"url":{"x-interactive-labs":{"kind":"root-url"}}}}`)}, nil
+			},
+			SetupManager: newTestManager(t, nil, nil),
+		})
+		for _, target := range []struct{ method, suffix string }{{http.MethodPost, "/setup"}, {http.MethodGet, "/setup/status"}} {
+			req := httptest.NewRequestWithContext(t.Context(), target.method, "/api/v1alpha1/labs/"+goodCatalogRef()+target.suffix, nil)
+			req.Header.Set("Authorization", "Bearer user1")
+			rw := httptest.NewRecorder()
+			router.ServeHTTP(rw, req)
+			assert.Equal(t, http.StatusUnprocessableEntity, rw.Code)
+			assert.Contains(t, rw.Body.String(), "values schema declares no namespace bindings")
+		}
+	})
+
 	t.Run("rejects missing authorization", func(t *testing.T) {
 		rw := httptest.NewRecorder()
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
@@ -1174,7 +1193,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		assert.Contains(t, helmSection["message"], "interrupted")
 	})
 
-	t.Run("with generated values", func(t *testing.T) {
+	t.Run("password values in attributes not in generatedValues", func(t *testing.T) {
 		server := statusSpaceRequestServer(t, "True", "", "ns-abc")
 
 		helm := &stubHelmManager{
@@ -1206,40 +1225,9 @@ func TestSetupStatusHandler(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
 		helmSection := body["helm"].(map[string]any)
 		assert.Equal(t, "deployed", helmSection["status"])
-		genVals := helmSection["generatedValues"].(map[string]any)
-		assert.Equal(t, "secret123", genVals["passwords.postgres"])
-	})
-
-	t.Run("no generated values when no passwords", func(t *testing.T) {
-		server := statusSpaceRequestServer(t, "True", "", "ns-abc")
-
-		helm := &stubHelmManager{status: "deployed"}
-		router := handler.NewRouter(handler.Config{
-			CatalogSource: goodCatalogCM,
-			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchema, // no password bindings
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
-		})
-
-		ref := goodCatalogRef()
-		rw := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/labs/"+ref+"/setup/status", nil)
-		req.Header.Set("Authorization", "Bearer user1")
-		router.ServeHTTP(rw, req)
-
-		require.Equal(t, http.StatusOK, rw.Code)
-		var body map[string]any
-		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
-		helmSection := body["helm"].(map[string]any)
-		assert.Equal(t, "deployed", helmSection["status"])
-		assert.Nil(t, helmSection["generatedValues"])
+		assert.NotContains(t, helmSection, "generatedValues")
+		attrs := body["attributes"].(map[string]any)
+		assert.Equal(t, "secret123", attrs["passwords-postgres"])
 	})
 
 	t.Run("attributes with namespace names when deployed", func(t *testing.T) {

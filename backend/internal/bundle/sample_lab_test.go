@@ -47,9 +47,9 @@ func TestSampleLab(t *testing.T) {
 			if tc.chartAvailable {
 				bindings, err := setup.ParseSchemaBindings(result.ValuesSchema)
 				require.NoError(t, err)
-				assert.Equal(t, []setup.NamespaceBinding{{Key: "demo", Path: "namespaces.demo"}}, bindings.Namespaces)
-				assert.Equal(t, []setup.ValueBinding{{Key: "password", Path: "demo.password", Kind: setup.KindGeneratedPassword}}, bindings.Passwords)
-				assert.Equal(t, []setup.RootURLBinding{{Key: "rootUrl", Path: "demo.rootUrl", RouteName: "sample", NamespaceRef: "demo"}}, bindings.RootURLs)
+				assert.Equal(t, []setup.SchemaBinding{{Key: "demo", Path: "namespaces.demo", Kind: setup.KindNamespaceName}}, setup.BindingsByKind(bindings, setup.KindNamespaceName))
+				assert.Equal(t, []setup.SchemaBinding{{Key: "password", Path: "demo.password", Kind: setup.KindGeneratedPassword}}, setup.BindingsByKind(bindings, setup.KindGeneratedPassword))
+				assert.Equal(t, []setup.SchemaBinding{{Key: "rootUrl", Path: "demo.rootUrl", Kind: setup.KindRootURL, RouteName: "sample", NamespaceRef: "demo"}}, setup.BindingsByKind(bindings, setup.KindRootURL))
 			}
 		})
 	}
