@@ -75,7 +75,7 @@ func TestMapBindingsToValues(t *testing.T) {
 		defer server.Close()
 
 		client := &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}
-		bindings := []NamespaceBinding{
+		bindings := []SchemaBinding{
 			{Key: "gitea", Path: "namespaces.gitea"},
 			{Key: "lab", Path: "namespaces.lab"},
 		}
@@ -92,7 +92,7 @@ func TestMapBindingsToValues(t *testing.T) {
 		defer server.Close()
 
 		client := &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}
-		bindings := []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}
+		bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea"}}
 		_, err := MapBindingsToValues(context.Background(), client, "token", "user1-dev", bindings)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "not found")
@@ -106,7 +106,7 @@ func TestMapBindingsToValues(t *testing.T) {
 		defer server.Close()
 
 		client := &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}
-		bindings := []NamespaceBinding{{Key: "gitea", Path: "namespaces.gitea"}}
+		bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea"}}
 		_, err := MapBindingsToValues(context.Background(), client, "token", "user1-dev", bindings)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "not ready")

@@ -12,6 +12,7 @@ import (
 
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart/loader"
+	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/strvals"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -126,8 +127,9 @@ func (c *HelmClient) Install(ctx context.Context, opts HelmInstallOpts) error {
 	return nil
 }
 
-// ReleaseValues retrieves the user-supplied values from a deployed Helm release
-// and returns only those matching the given dot-separated paths.
+// ReleaseValues retrieves values from a deployed Helm release (merging chart
+// defaults with user-supplied overrides) and returns only those matching the
+// given dot-separated paths.
 func (c *HelmClient) ReleaseValues(_ context.Context, releaseName, namespace, token string, paths []string) (map[string]string, error) {
 	actionConfig, err := c.newActionConfig(namespace, token, false)
 	if err != nil {
@@ -140,9 +142,14 @@ func (c *HelmClient) ReleaseValues(_ context.Context, releaseName, namespace, to
 		return nil, fmt.Errorf("helm status: %w", err)
 	}
 
+	merged, err := chartutil.CoalesceValues(rel.Chart, rel.Config)
+	if err != nil {
+		return nil, fmt.Errorf("coalesce helm values: %w", err)
+	}
+
 	result := make(map[string]string, len(paths))
 	for _, path := range paths {
-		if val, ok := extractNestedValue(rel.Config, path); ok {
+		if val, ok := extractNestedValue(merged, path); ok {
 			result[path] = val
 		}
 	}
@@ -249,7 +256,7 @@ func MapBindingsToValues(
 	ctx context.Context,
 	client *SpaceRequestClient,
 	token, namespace string,
-	bindings []NamespaceBinding,
+	bindings []SchemaBinding,
 ) (map[string]string, error) {
 	values := make(map[string]string, len(bindings))
 	for _, b := range bindings {
