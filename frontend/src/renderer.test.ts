@@ -234,7 +234,7 @@ describe("renderAsciiDoc", () => {
     expect(result.html).not.toMatch(/foreignObject|script|onload/i);
   });
 
-  it("namespaces generated fragment IDs and same-fragment links for concurrent renders", async () => {
+  it("given concurrent renders, when IDs are namespaced, then return exact original-to-rendered fragment maps", async () => {
     const load = jest.spyOn(asciidoctor, "load").mockResolvedValue({
       convert: async () => '<h2 id="step">Step</h2><a href="#step">Read step</a>',
       getDocumentTitle: () => null,
@@ -252,6 +252,8 @@ describe("renderAsciiDoc", () => {
     expect(headings[0].id).not.toBe(headings[1].id);
     expect(new Set(ids).size).toBe(ids.length);
     for (const heading of headings) expect(root.querySelector(`a[href="#${heading.id}"]`)).not.toBeNull();
+    expect(first).toMatchObject({ fragmentIds: new Map([["step", headings[0].id]]) });
+    expect(second).toMatchObject({ fragmentIds: new Map([["step", headings[1].id]]) });
     load.mockRestore();
   });
 

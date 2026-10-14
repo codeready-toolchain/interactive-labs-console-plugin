@@ -72,12 +72,12 @@ Use source-relative paths for files. To refer to a page in another module, for e
 
 Use local PNG, JPEG, GIF, or WebP images. Remote images, remote includes, and author-provided SVG are not supported. Add meaningful alt text to images. Arbitrary scripts, selectors, and extensions are not allowed, and rendered output is sanitized. Include nesting is limited to 64 levels.
 
-Use page xrefs to navigate between pages and local fragments to move within a page. Jumping to a section in another document is currently not supported:
+Use page xrefs to navigate between known pages and fragments to scroll to sections inside the drawer, including sections on another page. Missing sections do not scroll:
 
 ```asciidoc
 xref:020-resources.adoc[]              // Open another page
 <<try-links,Try links>>                // Jump within the current page
-xref:020-resources.adoc#setup[Setup]   // Not supported: jump to a section in another document
+xref:010-start.adoc#try-links[Try links] // Jump to a section on another known page
 ```
 
 ### Lab attributes

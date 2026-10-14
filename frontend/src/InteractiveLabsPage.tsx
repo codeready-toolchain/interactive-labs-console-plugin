@@ -80,6 +80,7 @@ type GuidanceRequest = {
   startingRoute: { pathname: string; search: string };
   phase: "waiting-route" | "waiting-target" | "spotlight";
   target?: HTMLElement;
+  expandedSections: Set<string>;
 };
 
 type GuidanceState = GuidanceRequest | { phase: "notice"; message: string };
@@ -160,13 +161,62 @@ const routeMatches = (
   expected: { pathname: string; search: string },
 ): boolean => location.pathname === expected.pathname && location.search === expected.search;
 
+const guidanceTargets = (id: string): HTMLElement[] => {
+  if (!Object.prototype.hasOwnProperty.call(consoleGuidanceRegistry, id)) return [];
+  // Console perspectives are unified starting in 4.19: default Workloads navigation
+  // uses the admin marker, while optional Developer navigation uses the developer marker.
+  // Both Topology variants identify the same destination; prefer the requested marker,
+  // then fall back to the other perspective's marker.
+  const ids = id === "qs-nav-topology" ? [id, "qs-admin-nav-topology"]
+    : id === "qs-admin-nav-topology" ? [id, "qs-nav-topology"] : [id];
+  const targets = Array.from(document.querySelectorAll<HTMLElement>("[data-quickstart-id]"));
+  return ids.flatMap((targetID) => targets.filter((candidate) => candidate.dataset.quickstartId === targetID));
+};
+
+const isGuidanceTargetVisible = (target: HTMLElement): boolean => {
+  const rect = target.getBoundingClientRect();
+  const style = window.getComputedStyle(target);
+  return target.isConnected && !target.closest("[hidden], [inert]") &&
+    rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+};
+
 const visibleGuidanceTarget = (id: string): HTMLElement | undefined =>
-  Array.from(document.querySelectorAll<HTMLElement>("[data-quickstart-id]")).find((target) => {
-    const rect = target.getBoundingClientRect();
-    const style = window.getComputedStyle(target);
-    return target.dataset.quickstartId === id && target.isConnected && !target.hidden &&
-      rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-  });
+  guidanceTargets(id).find(isGuidanceTargetVisible);
+
+const expandGuidanceAncestors = (id: string, expandedSections: Set<string>): boolean => {
+  for (const target of guidanceTargets(id)) {
+    const nav = target.closest("nav.pf-v6-c-nav");
+    if (!nav || nav.closest(".interactive-labs-content") || target.hidden || target.hasAttribute("inert")) continue;
+    const buttons: HTMLButtonElement[] = [];
+    let valid = true;
+    // Coupled to Console's PatternFly NavExpandable DOM: each subnav is a direct
+    // sibling of its own disclosure button in a nav item (there is no aria-controls).
+    // Never resolve arbitrary aria-labelledby references or activate destination links.
+    for (let ancestor = target.parentElement; ancestor && ancestor !== nav; ancestor = ancestor.parentElement) {
+      if (!ancestor.matches("[hidden], [inert]")) continue;
+      const item = ancestor.parentElement;
+      const button = item?.matches("li.pf-v6-c-nav__item")
+        ? Array.from(item.children).find((child): child is HTMLButtonElement =>
+          child instanceof HTMLButtonElement && child.matches("button.pf-v6-c-nav__link[aria-expanded='false']") &&
+          !!child.id && child.id === ancestor.getAttribute("aria-labelledby") && !child.disabled)
+        : undefined;
+      if (!ancestor.matches("section.pf-v6-c-nav__subnav[hidden]") || !button) {
+        valid = false;
+        break;
+      }
+      buttons.unshift(button);
+    }
+    const button = buttons[0];
+    if (!valid || !button || !isGuidanceTargetVisible(button)) continue;
+    // React may not have committed expansion yet. Wait without clicking twice or navigating.
+    if (!expandedSections.has(button.id)) {
+      expandedSections.add(button.id);
+      button.click();
+    }
+    return true;
+  }
+  return false;
+};
 
 const overlapsHorizontally = (first: DOMRect, second: DOMRect): boolean =>
   first.left < second.right && first.right > second.left;
@@ -478,7 +528,9 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
     guidanceControllerRef.current = controller;
     const startingRoute = { pathname: location.pathname, search: location.search };
     const target = visibleGuidanceTarget(id);
-    const expectedRoute = entry.route && !target
+    const expandedSections = new Set<string>();
+    const expanding = !target && expandGuidanceAncestors(id, expandedSections);
+    const expectedRoute = entry.route && !target && !expanding
       ? { pathname: entry.route, search: "" }
       : startingRoute;
     const request: GuidanceRequest = {
@@ -491,14 +543,14 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
         ? "waiting-route"
         : "waiting-target",
       target,
+      expandedSections,
     };
     setGuidance(request);
     if (target) {
       spotlightGuidanceTarget(request, target);
-    } else if (entry.route) {
-      navigate(entry.route);
-    } else {
-      unavailableGuidance(controller);
+    } else if (!expanding) {
+      if (entry.route) navigate(entry.route);
+      else unavailableGuidance(controller);
     }
   }, [clearGuidance, location.pathname, location.search, navigate, spotlightGuidanceTarget, unavailableGuidance]);
 
@@ -555,9 +607,21 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       return pageURL.origin === target.origin && pageURL.pathname === target.pathname;
     });
     if (targetPage) {
-      if (targetPage.path === currentPage.path && href.startsWith("#")) return;
       event.preventDefault();
-      pendingFragmentRef.current = target.hash ? decodeURIComponent(target.hash.slice(1)) : undefined;
+      if (target.hash || href.startsWith("#")) event.stopPropagation();
+      if (targetPage.path === currentPage.path && href.startsWith("#")) {
+        let fragment: string;
+        try {
+          fragment = decodeURIComponent(target.hash.slice(1));
+        } catch {
+          return;
+        }
+        Array.from(renderedContentRef.current?.querySelectorAll<HTMLElement>("[id]") ?? [])
+          .find((element) => element.id === fragment)
+          ?.scrollIntoView?.();
+        return;
+      }
+      pendingFragmentRef.current = target.hash.slice(1) || undefined;
       selectPage(targetPage.path);
       return;
     }
@@ -600,15 +664,17 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   React.useEffect(() => {
     if (!guidance || guidance.phase !== "waiting-target") return undefined;
     const findTarget = (): void => {
+      if (guidance.controller.signal.aborted) return;
       const target = visibleGuidanceTarget(guidance.id);
       if (target) spotlightGuidanceTarget(guidance, target);
+      else expandGuidanceAncestors(guidance.id, guidance.expandedSections);
     };
     const observer = new MutationObserver(findTarget);
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["class", "data-quickstart-id", "hidden", "style"],
+      attributeFilter: ["class", "data-quickstart-id", "hidden", "inert", "aria-expanded", "style"],
     });
     const timeout = window.setTimeout(() => unavailableGuidance(guidance.controller), 10_000);
     findTarget();
@@ -621,7 +687,9 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   React.useEffect(() => {
     if (!guidance || guidance.phase !== "spotlight" || !guidance.target) return undefined;
     const { controller, id, target } = guidance;
-    const dismiss = (): void => clearGuidance();
+    const dismiss = (): void => {
+      if (!controller.signal.aborted && guidanceControllerRef.current === controller) clearGuidance();
+    };
     const onTargetKeyDown = (event: KeyboardEvent): void => {
       if (event.key === "Enter" || event.key === " ") dismiss();
     };
@@ -708,8 +776,15 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
 
   React.useEffect(() => {
     if (renderState.status !== "success" || !pendingFragmentRef.current) return;
-    const fragment = pendingFragmentRef.current;
+    const pendingFragment = pendingFragmentRef.current;
     pendingFragmentRef.current = undefined;
+    let fragment: string | undefined;
+    try {
+      fragment = renderState.result.fragmentIds?.get(decodeURIComponent(pendingFragment));
+    } catch {
+      return;
+    }
+    if (!fragment) return;
     Array.from(renderedContentRef.current?.querySelectorAll<HTMLElement>("[id]") ?? [])
       .find((element) => element.id === fragment)
       ?.scrollIntoView?.();
