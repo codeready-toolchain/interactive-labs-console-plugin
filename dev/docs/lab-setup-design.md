@@ -1,6 +1,6 @@
 # Lab Setup Design
 
-Current chart-backed setup behavior. Namespace selection/lifecycle policy remains open. For a runnable authoring example, see the [sample guide](../../examples/sample-lab/README.md#optional-helm-setup).
+Current chart-backed setup behavior. Namespace selection/lifecycle policy remains open. For a runnable authoring example, see the [sample guide](../../examples/sample-lab/README.md#understand-the-helm-setup).
 
 ## Overview
 

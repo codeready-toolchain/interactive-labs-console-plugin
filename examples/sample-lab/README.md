@@ -38,8 +38,6 @@ Apply the manifest with `oc apply -f catalog.yaml`. The `data.catalog.yaml` valu
 
 You can also catalog the sample directly from this plugin repository by using its published HTTPS URL and branch, with `labPath: examples/sample-lab`.
 
-Chart discovery checks `<labPath>/setup/helm` first, then falls back to `<repository-root>/setup/helm` when the lab-local chart directory is absent. Cataloging `examples/sample-lab` here activates its nested chart. Keep the chart lab-local to avoid sharing it with other labs. An explicit `spec.setupDir` selects a chart directory relative to the lab directory instead of using either default. For a standalone lab with content only, omit `setup/`.
-
 ## Understand the file layout and navigation
 
 ```text
@@ -114,7 +112,24 @@ The resource target is `version/Kind` or `group/version/Kind`. Put the label fir
 
 To open a specific namespaced resource's details, provide both its namespace and name. For example, `resource:v1/ConfigMap[Sample ConfigMap,namespace={namespaces-demo},name=sample-info]` opens the named ConfigMap. Providing only a name opens a filtered list, not the resource details page. Console handles resource existence and RBAC; these links do not create resources and leave the lab drawer open. See the [content contract](../../dev/docs/lab-content-contract.md#implemented-authoring-rules) for the full rules.
 
-## Add optional Helm setup
+## Understand the Helm setup
+
+Helm setup can be colocated with the lab: put the chart in `<labPath>/setup/helm`, beside `lab.yaml` and `modules/`. This sample already uses that layout, so its chart works both when cataloged here with `labPath: examples/sample-lab` and when copied into a standalone repository with `labPath: .`.
+
+Chart selection follows these rules:
+
+1. A nonempty `spec.setupDir` selects the chart directory itself, relative to the lab directory. It is authoritative: a missing or invalid chart fails validation without falling back.
+2. Otherwise, use `<labPath>/setup/helm` when that directory exists. An invalid lab-local chart does not trigger fallback.
+3. Only when the lab-local directory is absent, try `<repository-root>/setup/helm`.
+
+For example, a lab at `labs/intro` can select a shared chart at `<repository-root>/shared/chart`:
+
+```yaml
+spec:
+  setupDir: ../../shared/chart
+```
+
+The selected chart must remain within the approved repository; symlinks in the chart path or tree are rejected. Labs may share chart files, but never installed Helm releases or SpaceRequests. See the [chart-selection contract](../../dev/docs/lab-content-contract.md#prerequisite-chart-selection) for details. For a content-only lab, omit `spec.setupDir` and ensure neither default chart directory exists; in a standalone repository, omit `setup/`.
 
 The sample chart creates only a `sample-info` ConfigMap and a `sample-credentials` Secret in a provisioned demo namespace. It has no dependencies, Pods, application, Service, or Route.
 
