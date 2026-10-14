@@ -12,6 +12,7 @@ import { InteractiveLabsPage, InteractiveLabsProvider } from './InteractiveLabsP
 import type { CatalogList } from './types/catalog';
 import type { LabError } from './types/errors';
 import type { LabBundle } from './types/manifest';
+import type { LabSetup, SetupStatus } from './types/setup';
 import * as client from './api/client';
 import { extractAsciiDocTitle, renderAsciiDoc } from './renderer';
 
@@ -41,6 +42,11 @@ beforeEach(() => {
   container = document.createElement('div');
   document.body.appendChild(container);
   mockListCatalog.mockReset();
+  (client.listSetups as jest.MockedFunction<typeof client.listSetups>).mockReset();
+  (client.listSetups as jest.MockedFunction<typeof client.listSetups>).mockResolvedValue({ apiVersion: 'v1alpha1', kind: 'SetupList', items: [] });
+  (client.teardownLab as jest.MockedFunction<typeof client.teardownLab>).mockReset();
+  (client.getTeardownStatus as jest.MockedFunction<typeof client.getTeardownStatus>).mockReset();
+  sessionStorage.removeItem('interactive-labs-teardown');
   mockLoadLabBundle.mockReset();
   mockSetupLab.mockReset();
   mockGetSetupStatus.mockReset();
@@ -184,6 +190,675 @@ const launchGuidanceLab = async (html: string, trusted = true): Promise<void> =>
   await renderCatalog();
   await act(async () => { getButton(/^Launch$/).click(); });
 };
+
+const renderPageCatalog = renderCatalog;
+describe('catalog setup actions', () => {
+  const ref = 'ab'.repeat(32);
+  const otherRef = 'ef'.repeat(32);
+  const setupCatalog: CatalogList = { ...sampleCatalog, items: sampleCatalog.items.map((entry, index) => ({ ...entry, catalogRef: index === 0 ? ref : otherRef })) };
+  const renderCatalog = (catalog = setupCatalog) => renderPageCatalog(catalog);
+  const chartBundle: LabBundle = {
+    ...noChartBundle,
+    runtimeContext: { ...noChartBundle.runtimeContext, catalogRef: ref, helmChartAvailable: true },
+    modules: noChartBundle.modules.map((module) => ({ ...module, pages: module.pages.map((page) => ({ ...page, url: page.url.replace('/labs/lab-1/', `/labs/${ref}/`) })) })),
+  };
+  const firstPage = chartBundle.modules[0].pages[0];
+  const inventory = client.listSetups as jest.MockedFunction<typeof client.listSetups>;
+  const teardown = client.teardownLab as jest.MockedFunction<typeof client.teardownLab>;
+  const setup: LabSetup = {
+    catalogRef: ref, generation: 'cd'.repeat(32), status: 'deployed', spaceRequests: ['lab-sr'],
+    release: { name: 'il-one' },
+  };
+  const ready: SetupStatus = {
+    apiVersion: 'v1alpha1', kind: 'SetupStatus',
+    spaceRequests: { status: 'ready', namespaces: {} },
+    helm: { status: 'deployed', releaseName: 'il-one' },
+    attributes: { 'lab-namespace': 'runtime-ns' },
+  };
+  const pending: SetupStatus = {
+    ...ready, attributes: undefined,
+    spaceRequests: { status: 'provisioning', namespaces: null },
+    helm: { status: 'pending', releaseName: 'il-one' },
+  };
+  const setInventory = (items: LabSetup[]): void => {
+    inventory.mockResolvedValue({ apiVersion: 'v1alpha1', kind: 'SetupList', items });
+  };
+  const row = (): HTMLElement => container.querySelector(`#lab-${ref}`)!.closest<HTMLElement>('.pf-v6-c-data-list__item-row')!;
+  const actions = (): HTMLElement => {
+    const action = row().querySelector<HTMLElement>('.pf-v6-c-data-list__item-action');
+    if (!action) throw new Error('Missing catalog actions');
+    return action;
+  };
+  const rowButton = (name: string): HTMLButtonElement => {
+    const button = Array.from(actions().querySelectorAll('button')).find((candidate) => candidate.textContent?.trim() === name);
+    if (!button) throw new Error(`Missing catalog action ${name}`);
+    return button;
+  };
+  const filterBy = async (value: string): Promise<void> => {
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="Filter labs"]')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  };
+
+  test('given interleaved catalog entries, when inventory loads, then one list stably places every existing setup before inactive entries', async () => {
+    const entries = ['inactive-one', 'failed', 'pending', 'inactive-two', 'deployed', 'remnants'].map((catalogRef) => ({ catalogRef, title: catalogRef, labPath: catalogRef }));
+    setInventory([
+      { ...setup, catalogRef: 'deployed' },
+      { ...setup, catalogRef: 'remnants', release: undefined },
+      { ...setup, catalogRef: 'failed', status: 'failed' },
+      { ...setup, catalogRef: 'pending', status: 'pending', blocked: true },
+    ]);
+
+    await renderCatalog({ ...setupCatalog, items: entries });
+
+    const lists = container.querySelectorAll('.pf-v6-c-data-list');
+    expect(lists).toHaveLength(1);
+    const list = lists[0];
+    expect(list.tagName).toBe('UL');
+    expect(Array.from(list.children).map((child) => child.querySelector('h2')?.id)).toEqual([
+      'lab-failed', 'lab-pending', 'lab-deployed', 'lab-remnants', 'lab-inactive-one', 'lab-inactive-two',
+    ]);
+    expect(Array.from(list.children).every((child) => child.classList.contains('pf-v6-c-data-list__item'))).toBe(true);
+    expect(container.querySelector('section[aria-label="Your lab setups"]')).toBeNull();
+    expect(Array.from(list.querySelectorAll('h2')).map((heading) => heading.textContent)).toEqual([
+      'failed', 'pending', 'deployed', 'remnants', 'inactive-one', 'inactive-two',
+    ]);
+    const order = list.innerHTML;
+    await act(async () => { getButton(/Refresh setups/).click(); });
+    expect(list.innerHTML).toBe(order);
+    expect(list.contains(getButton(/Refresh setups/))).toBe(false);
+  });
+
+  test('unprepared catalog row shows only Launch', async () => {
+    await renderCatalog();
+    expect(Array.from(actions().querySelectorAll('button')).map((button) => button.textContent?.trim())).toEqual(['Launch']);
+    expect(rowButton('Launch').disabled).toBe(false);
+    expect(container.textContent).not.toContain('No lab setups found.');
+  });
+
+  test.each(['pending', 'deployed', 'failed'] as const)('%s setup replaces Launch with stacked Open and Tear down', async (status) => {
+    setInventory([{ ...setup, status, blocked: status === 'pending' }]);
+    await renderCatalog();
+    expect(Array.from(actions().querySelectorAll('button')).map((button) => button.textContent?.trim())).toEqual(['Open', 'Tear down']);
+    expect(rowButton('Open').disabled).toBe(status === 'failed');
+    expect(rowButton('Tear down').disabled).toBe(status === 'pending');
+    expect(rowButton('Open').querySelector('[role="progressbar"]') !== null).toBe(status === 'pending');
+    const stack = rowButton('Open').parentElement!;
+    expect(stack.contains(rowButton('Tear down'))).toBe(true);
+    expect(stack.style.flexDirection).toBe('column');
+    expect(container.querySelectorAll('section[aria-label="Your lab setups"] li')).toHaveLength(0);
+  });
+
+  test.each(['deployed', 'failed'] as const)('blocked %s setup keeps Tear down visible but disabled with recovery text', async (status) => {
+    setInventory([{ ...setup, status, blocked: true }]);
+    await renderCatalog();
+    expect(rowButton('Tear down').disabled).toBe(true);
+    expect(row().textContent).toMatch(/administrator/i);
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  test.each(['helm-hook', 'helm-retained', 'helm-manifest'] as const)('unsafe-to-delete deployed release with %s remains openable via GET', async (blockedReason) => {
+    setInventory([{ ...setup, blocked: true, blockedReason }]);
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockGetSetupStatus.mockResolvedValue(ready);
+    await renderCatalog();
+    expect(rowButton('Open').disabled).toBe(false);
+    expect(rowButton('Tear down').disabled).toBe(true);
+    await act(async () => { rowButton('Open').click(); });
+    expect(mockGetSetupStatus).toHaveBeenCalledWith(ref, expect.any(AbortSignal));
+    expect(mockSetupLab).not.toHaveBeenCalled();
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  test.each(['pending', 'deployed', 'failed'] as const)('%s setup keeps catalog buttons equally sized independently of recovery text', async (status) => {
+    setInventory([{ ...setup, status, blocked: true }]);
+    await renderCatalog();
+    const stack = rowButton('Open').parentElement!;
+    expect(stack.classList.contains('pfext-lab-catalog-actions')).toBe(true);
+    expect(Array.from(stack.querySelectorAll(':scope > button'))).toEqual([rowButton('Open'), rowButton('Tear down')]);
+    expect(stack.querySelector(':scope > p')?.textContent).toMatch(/recovery|administrator/i);
+    const css = readFileSync(`${__dirname}/interactive-labs.css`, 'utf8');
+    const buttons = css.match(/\.pfext-lab-catalog-actions\s*>\s*button\s*\{([^}]*)\}/)?.[1];
+    expect(buttons).toContain('inline-size: 9rem;');
+    expect(buttons).toContain('max-inline-size: 100%;');
+    expect(buttons).toContain('margin-inline-start: auto;');
+  });
+
+  test('catalog row explains held operation rather than pending status', async () => {
+    const blockedSetup = { ...setup, status: 'pending' as const, blocked: true, blockedReason: 'operation' as const };
+    setInventory([blockedSetup]);
+    await renderCatalog();
+    expect(rowButton('Tear down').disabled).toBe(true);
+    expect(row().textContent).toContain('A lab operation is in progress or its reservation cannot be verified.');
+    expect(row().textContent).toContain('Wait for completion; interrupted operations become recoverable after the reservation expires.');
+    expect(row().textContent).not.toContain('Setup is pending.');
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  test.each([true, false])('pending held operation with release=%s permits Open to resume GET without setup POST', async (hasRelease) => {
+    setInventory([{ ...setup, status: 'pending', blocked: true, blockedReason: 'operation', release: hasRelease ? setup.release : undefined }]);
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockGetSetupStatus.mockImplementation(() => new Promise(() => {}));
+    await renderCatalog();
+    expect(rowButton('Open').disabled).toBe(false);
+    expect(rowButton('Open').querySelector('[role="progressbar"]')).not.toBeNull();
+    expect(rowButton('Tear down').disabled).toBe(true);
+    expect(row().textContent).not.toContain('Opening is unavailable');
+    await act(async () => { rowButton('Open').click(); });
+    expect(mockGetSetupStatus).toHaveBeenCalledTimes(1);
+    expect(mockSetupLab).not.toHaveBeenCalled();
+    expect(getButton(/^Launch$/).disabled).toBe(false);
+  });
+
+  test.each([true, false])('pending cleanup with release=%s blocks Open and catalog page links', async (hasRelease) => {
+    setInventory([{ ...setup, status: 'pending', blocked: true, blockedReason: 'cleanup', release: hasRelease ? setup.release : undefined }]);
+    mockRenderAsciiDoc.mockResolvedValue({ html: `<p><a href="${firstPage.url}">Lab page</a></p>`, warnings: [] });
+    await renderCatalog();
+    expect(rowButton('Open').disabled).toBe(true);
+    expect(rowButton('Open').querySelector('[role="progressbar"]')).toBeNull();
+    expect(row().textContent).toContain('Lab namespace cleanup is still in progress.');
+    expect(row().textContent).not.toContain('Lab setup pending');
+    await act(async () => {
+      rowButton('Open').click();
+      row().querySelector('a')!.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    });
+    expect(row().textContent).toContain('Lab cannot be opened until its setup is available.');
+    expect(mockLoadLabBundle).not.toHaveBeenCalled();
+    expect(mockGetSetupStatus).not.toHaveBeenCalled();
+    expect(mockSetupLab).not.toHaveBeenCalled();
+    expect(getButton(/^Launch$/).disabled).toBe(false);
+  });
+
+  test('deployed lab with held operation cannot be opened during teardown in another tab', async () => {
+    setInventory([{ ...setup, status: 'deployed', blocked: true, blockedReason: 'operation' }]);
+    mockRenderAsciiDoc.mockResolvedValue({ html: `<p><a href="${firstPage.url}">Lab page</a></p>`, warnings: [] });
+    await renderCatalog();
+    expect(rowButton('Open').disabled).toBe(true);
+    await act(async () => {
+      rowButton('Open').click();
+      row().querySelector('a')!.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    });
+    expect(row().textContent).toContain('Lab cannot be opened until its setup is available.');
+    expect(mockLoadLabBundle).not.toHaveBeenCalled();
+    expect(mockGetSetupStatus).not.toHaveBeenCalled();
+  });
+
+  test('ordinary pending setup without release still permits Open to resume GET polling', async () => {
+    setInventory([{ ...setup, release: undefined, status: 'pending', blocked: true, blockedReason: 'pending' }]);
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockGetSetupStatus.mockImplementation(() => new Promise(() => {}));
+    await renderCatalog();
+    expect(rowButton('Open').disabled).toBe(false);
+    expect(rowButton('Open').querySelector('[role="progressbar"]')).not.toBeNull();
+    await act(async () => { rowButton('Open').click(); });
+    expect(mockGetSetupStatus).toHaveBeenCalledTimes(1);
+    expect(mockSetupLab).not.toHaveBeenCalled();
+  });
+
+  test('deployed Open fetches runtime attributes without setup POST, and Close never tears down', async () => {
+    setInventory([setup]);
+    mockLoadLabBundle.mockResolvedValue({ ...chartBundle, manifest: { ...chartBundle.manifest, spec: { attributes: { author: 'value', 'lab-namespace': 'old' } } } });
+    mockGetSetupStatus.mockResolvedValue(ready);
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Existing environment</p>', warnings: [] });
+    await renderCatalog();
+    await act(async () => { rowButton('Open').click(); });
+    expect(mockLoadLabBundle).toHaveBeenCalledWith(ref, 'labs/one', expect.any(AbortSignal));
+    expect(mockGetSetupStatus).toHaveBeenCalled();
+    expect(mockSetupLab).not.toHaveBeenCalled();
+    const renderedPage = mockRenderAsciiDoc.mock.calls.find(([input]) => input.sourceURL === firstPage.url);
+    expect(renderedPage?.[0].attributes).toEqual({ author: 'value', 'lab-namespace': 'runtime-ns' });
+    expect(container.querySelector('#interactive-labs-drawer-panel')?.textContent).toContain('Existing environment');
+    await act(async () => { getButton(/Close lab/).click(); });
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  test('pending Open resumes GET polling and enables teardown when setup becomes deployed', async () => {
+    jest.useFakeTimers();
+    try {
+      setInventory([{ ...setup, status: 'pending', blocked: true }]);
+      mockLoadLabBundle.mockResolvedValue(chartBundle);
+      mockGetSetupStatus.mockResolvedValueOnce(pending).mockResolvedValueOnce(ready);
+      mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Ready environment</p>', warnings: [] });
+      await renderCatalog();
+      expect(rowButton('Open').disabled).toBe(false);
+      await act(async () => { rowButton('Open').click(); });
+      expect(container.querySelector('#interactive-labs-drawer-panel')?.textContent).toContain('Setting up your lab environment...');
+      expect(mockGetSetupStatus).toHaveBeenCalledTimes(1);
+      expect(mockSetupLab).not.toHaveBeenCalled();
+      expect(rowButton('Tear down').disabled).toBe(true);
+      setInventory([setup]);
+      await act(async () => { jest.advanceTimersByTime(3000); });
+      expect(mockGetSetupStatus).toHaveBeenCalledTimes(2);
+      expect(inventory.mock.calls.length).toBeGreaterThan(1);
+      expect(rowButton('Tear down').disabled).toBe(false);
+      expect(rowButton('Open').querySelector('[role="progressbar"]')).toBeNull();
+      expect(container.querySelector('#interactive-labs-drawer-panel')?.textContent).toContain('Ready environment');
+      expect(mockSetupLab).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('pending Open retries setup once through the client when GET explicitly allows retry, then polls until deployed', async () => {
+    jest.useFakeTimers();
+    try {
+      const retryable = { ...pending, retrySetup: true };
+      setInventory([{ ...setup, release: undefined, status: 'pending', blocked: true, blockedReason: 'pending' }]);
+      mockLoadLabBundle.mockResolvedValue(chartBundle);
+      mockGetSetupStatus.mockResolvedValueOnce(retryable).mockResolvedValue(pending);
+      mockSetupLab.mockResolvedValue(pending);
+      mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Recovered environment</p>', warnings: [] });
+      await renderCatalog();
+      await act(async () => { rowButton('Open').click(); });
+      expect(mockSetupLab).toHaveBeenCalledTimes(1);
+      expect(mockSetupLab).toHaveBeenCalledWith(ref, expect.any(AbortSignal));
+      expect(mockGetSetupStatus.mock.invocationCallOrder[0]).toBeLessThan(mockSetupLab.mock.invocationCallOrder[0]);
+      expect(container.querySelector('#interactive-labs-drawer-panel')?.textContent).toContain('Setting up your lab environment...');
+      const initialPolls = mockGetSetupStatus.mock.calls.length;
+      await act(async () => { jest.advanceTimersByTime(3000); });
+      expect(mockGetSetupStatus.mock.calls.length).toBeGreaterThan(initialPolls);
+      expect(mockSetupLab).toHaveBeenCalledTimes(1);
+      mockGetSetupStatus.mockResolvedValue(ready);
+      setInventory([setup]);
+      await act(async () => { jest.advanceTimersByTime(3000); });
+      expect(container.querySelector('#interactive-labs-drawer-panel')?.textContent).toContain('Recovered environment');
+      expect(rowButton('Tear down').disabled).toBe(false);
+      expect(rowButton('Open').querySelector('[role="progressbar"]')).toBeNull();
+      expect(mockSetupLab).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('Open on the same pending lab preserves its in-flight setup POST and waits to poll', async () => {
+    const post = deferred<Awaited<ReturnType<typeof client.setupLab>>>();
+    let postSignal!: AbortSignal;
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockSetupLab.mockImplementation((_catalogRef, signal) => {
+      postSignal = signal!;
+      return post.promise;
+    });
+    mockGetSetupStatus.mockResolvedValue(ready);
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Ready environment</p>', warnings: [] });
+    await renderCatalog();
+    await act(async () => { rowButton('Launch').click(); });
+    expect(mockSetupLab).toHaveBeenCalledTimes(1);
+    expect(postSignal.aborted).toBe(false);
+
+    try {
+      setInventory([{ ...setup, status: 'pending', blocked: true }]);
+      await act(async () => { getButton(/Refresh setups/).click(); });
+      expect(rowButton('Open').disabled).toBe(false);
+      await act(async () => { rowButton('Open').click(); });
+
+      expect(postSignal.aborted).toBe(false);
+      expect(mockSetupLab).toHaveBeenCalledTimes(1);
+      expect(container.querySelector('#interactive-labs-drawer-panel')?.textContent).toContain('Setting up your lab environment...');
+      expect(mockGetSetupStatus).not.toHaveBeenCalled();
+
+      setInventory([setup]);
+      await act(async () => { post.resolve(pending); });
+      expect(postSignal.aborted).toBe(false);
+      expect(mockSetupLab).toHaveBeenCalledTimes(1);
+      expect(mockGetSetupStatus).toHaveBeenCalledTimes(1);
+      expect(container.querySelector('#interactive-labs-drawer-panel')?.textContent).toContain('Ready environment');
+    } finally {
+      await act(async () => { post.resolve(pending); });
+    }
+  });
+
+  test('new launch refreshes accepted pending inventory, then refreshes successful setup', async () => {
+    const final = deferred<SetupStatus>();
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockSetupLab.mockImplementation(async () => {
+      setInventory([{ ...setup, status: 'pending', blocked: true }]);
+      return pending;
+    });
+    mockGetSetupStatus.mockReturnValue(final.promise);
+    await renderCatalog();
+    await act(async () => { rowButton('Launch').click(); });
+    expect(rowButton('Open').disabled).toBe(false);
+    expect(rowButton('Tear down').disabled).toBe(true);
+    setInventory([setup]);
+    await act(async () => { final.resolve(ready); });
+    expect(rowButton('Tear down').disabled).toBe(false);
+    expect(rowButton('Open').querySelector('[role="progressbar"]')).toBeNull();
+    expect(mockSetupLab).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(['POST', 'status'] as const)('refreshes inventory after %s setup failure so retry cannot silently launch', async (failure) => {
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    const fail = async (): Promise<never> => {
+      setInventory([{ ...setup, status: 'failed' }]);
+      throw new Error('Setup failed');
+    };
+    if (failure === 'POST') mockSetupLab.mockImplementation(fail);
+    else {
+      mockSetupLab.mockResolvedValue(pending);
+      mockGetSetupStatus.mockImplementation(fail);
+    }
+    await renderCatalog();
+    await act(async () => { rowButton('Launch').click(); });
+    expect(rowButton('Open').disabled).toBe(true);
+    expect(rowButton('Tear down').disabled).toBe(false);
+    expect(container.querySelector('#interactive-labs-drawer-panel')?.textContent).toContain('Setup failed');
+    expect(actions().querySelector('[role="alert"], [aria-live="polite"], [aria-live="assertive"]')?.textContent).toContain('Setup failed');
+    expect(actions().querySelector('.pf-v6-c-alert')).toBeNull();
+  });
+
+  test('catalog teardown preserves confirmation targets and generation and returns row to Launch', async () => {
+    const confirm = jest.spyOn(window, 'confirm').mockReturnValue(false);
+    try {
+      setInventory([setup]);
+      await renderCatalog();
+      await act(async () => { rowButton('Tear down').click(); });
+      expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Lab One'));
+      expect(confirm).toHaveBeenCalledWith(expect.stringContaining('il-one'));
+      expect(confirm).toHaveBeenCalledWith(expect.stringContaining('lab-sr'));
+      expect(teardown).not.toHaveBeenCalled();
+      confirm.mockReturnValue(true);
+      setInventory([]);
+      teardown.mockResolvedValue({ apiVersion: 'v1alpha1', kind: 'TeardownStatus', catalogRef: setup.catalogRef, operationId: '12'.repeat(16), status: 'running' });
+      (client.getTeardownStatus as jest.MockedFunction<typeof client.getTeardownStatus>).mockResolvedValue({ apiVersion: 'v1alpha1', kind: 'TeardownStatus', catalogRef: setup.catalogRef, operationId: '12'.repeat(16), status: 'succeeded' });
+      await act(async () => { rowButton('Tear down').click(); });
+      expect(teardown).toHaveBeenCalledWith(setup.catalogRef, setup.generation);
+      expect(rowButton('Launch').disabled).toBe(false);
+      expect(actions().textContent).not.toContain('Managed lab cleanup completed.');
+      expect(actions().textContent?.trim()).toBe('Launch');
+      expect(getButton(/Refresh setups/).parentElement?.textContent).not.toContain('Managed lab cleanup completed.');
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  test('catalog A and B tear down concurrently with row-local notices and direct equal-width buttons', async () => {
+    const confirm = jest.spyOn(window, 'confirm').mockReturnValue(true);
+    const getStatus = client.getTeardownStatus as jest.MockedFunction<typeof client.getTeardownStatus>;
+    const firstRef = 'ab'.repeat(32);
+    const secondRef = 'ef'.repeat(32);
+    const firstSetup = { ...setup, catalogRef: firstRef };
+    const secondSetup = { ...setup, catalogRef: secondRef, release: { name: 'il-two' } };
+    const catalog = { ...setupCatalog, items: setupCatalog.items.map((item, index) => ({ ...item, catalogRef: index === 0 ? firstRef : secondRef })) };
+    const status = (catalogRef: string) => ({ apiVersion: 'v1alpha1' as const, kind: 'TeardownStatus' as const, catalogRef, operationId: (catalogRef === firstRef ? '12' : '34').repeat(16), status: 'running' as const });
+    const catalogActions = (catalogRef: string) => container.querySelector(`#lab-${catalogRef}`)!.closest('.pf-v6-c-data-list__item-row')!.querySelector('.pf-v6-c-data-list__item-action')!;
+    try {
+      setInventory([firstSetup, secondSetup]);
+      teardown.mockImplementation(async (catalogRef) => status(catalogRef));
+      getStatus.mockImplementation(() => new Promise(() => {}));
+      await renderCatalog(catalog);
+      const firstActions = catalogActions(firstRef);
+      const secondActions = catalogActions(secondRef);
+      const firstButtons = Array.from(firstActions.querySelectorAll('button'));
+      const secondButtons = Array.from(secondActions.querySelectorAll('button'));
+      await act(async () => { firstButtons[1].click(); });
+      expect(firstButtons[0].disabled).toBe(true);
+      expect(firstButtons[1].disabled).toBe(true);
+      expect(secondButtons[0].disabled).toBe(false);
+      expect(secondButtons[1].disabled).toBe(false);
+      expect(getButton(/Refresh setups/).disabled).toBe(false);
+      expect(firstActions.textContent).toContain('Lab teardown in progress');
+      expect(secondActions.textContent).not.toContain('Lab teardown in progress');
+      await act(async () => { secondButtons[1].click(); });
+      expect(teardown).toHaveBeenCalledTimes(2);
+      expect(secondActions.textContent).toContain('Lab teardown in progress');
+      for (const action of [firstActions, secondActions]) {
+        const stack = action.querySelector('.pfext-lab-catalog-actions')!;
+        const buttons = Array.from(stack.querySelectorAll(':scope > button'));
+        expect(buttons).toHaveLength(2);
+        const notice = Array.from(stack.children).find((child) => child.textContent?.includes('Lab teardown in progress'));
+        expect(notice).toBeDefined();
+        expect(buttons[1].compareDocumentPosition(notice!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+        expect(buttons.some((button) => button.contains(notice!))).toBe(false);
+        expect(buttons[1].querySelector('[role="progressbar"]')).not.toBeNull();
+        expect(notice?.querySelector('[role="progressbar"]')).toBeNull();
+        expect(notice?.querySelector('[aria-label="Tearing down lab"]')).toBeNull();
+        expect(stack.querySelector('.pf-v6-c-alert')).toBeNull();
+      }
+      expect(getButton(/Refresh setups/).parentElement?.textContent).not.toContain('Lab teardown in progress');
+    } finally { confirm.mockRestore(); }
+  });
+
+  test('teardown terminal status keeps same-lab Open disabled until live remnant SpaceRequest disappears', async () => {
+    const confirm = jest.spyOn(window, 'confirm').mockReturnValue(true);
+    const getStatus = client.getTeardownStatus as jest.MockedFunction<typeof client.getTeardownStatus>;
+    const firstRef = 'ab'.repeat(32);
+    const firstSetup = { ...setup, catalogRef: firstRef };
+    const catalog = { ...setupCatalog, items: [{ ...setupCatalog.items[0], catalogRef: firstRef }, setupCatalog.items[1]] };
+    const terminal = deferred<Awaited<ReturnType<typeof client.getTeardownStatus>>>();
+    const progress = { apiVersion: 'v1alpha1' as const, kind: 'TeardownStatus' as const, catalogRef: firstRef, operationId: '12'.repeat(16), status: 'running' as const };
+    const labActions = () => container.querySelector(`#lab-${firstRef}`)!.closest('.pf-v6-c-data-list__item-row')!.querySelector('.pf-v6-c-data-list__item-action')!;
+    const labButton = () => labActions().querySelector('button')!;
+    try {
+      setInventory([firstSetup]);
+      teardown.mockResolvedValue(progress);
+      getStatus.mockReturnValue(terminal.promise);
+      await renderCatalog(catalog);
+      await act(async () => { labActions().querySelectorAll('button')[1].click(); });
+      expect(labButton().disabled).toBe(true);
+      expect(getButton(/^Launch$/).disabled).toBe(false);
+      setInventory([{ ...firstSetup, release: undefined, status: 'pending', blocked: true, blockedReason: 'cleanup', spaceRequests: ['terminating-sr'] }]);
+      await act(async () => { terminal.resolve({ ...progress, status: 'succeeded' }); });
+      expect(labButton().textContent).toBe('Open');
+      expect(labButton().disabled).toBe(true);
+      expect(labButton().querySelector('[role="progressbar"]')).toBeNull();
+      expect(labActions().querySelectorAll('button')[1].querySelector('[role="progressbar"]')).toBeNull();
+      expect(labActions().textContent).toContain('Lab namespace cleanup is still in progress. Wait for previous lab resources to disappear before opening or launching; contact an administrator if cleanup stalls.');
+      expect(labActions().textContent).not.toContain('Waiting for previous lab resources to disappear.');
+      expect(labActions().textContent).not.toContain('Checking setups automatically every 10 seconds.');
+      expect(labActions().textContent).not.toContain('Managed lab cleanup completed.');
+      expect(labActions().querySelector('.pf-v6-c-alert')).toBeNull();
+      expect(labActions().textContent).not.toMatch(/namespace.*(gone|deleted)|SpaceRequest deletion requested/i);
+      expect(getButton(/^Launch$/).disabled).toBe(false);
+      await act(async () => { labButton().click(); });
+      expect(mockLoadLabBundle).not.toHaveBeenCalled();
+      setInventory([]);
+      await act(async () => { getButton(/Refresh setups/).click(); });
+      expect(labButton().textContent).toBe('Launch');
+      expect(labButton().disabled).toBe(false);
+      expect(labActions().textContent).not.toContain('Managed lab cleanup completed.');
+      expect(labActions().textContent).not.toContain('Lab namespace cleanup is still in progress.');
+      expect(labActions().textContent?.trim()).toBe('Launch');
+      expect(labActions().querySelector('.pf-v6-c-alert')).toBeNull();
+    } finally { confirm.mockRestore(); }
+  });
+
+  test('inventory alone blocks terminating cleanup after reload but permits a pending held setup', async () => {
+    setInventory([{ ...setup, release: undefined, status: 'pending', blocked: true, blockedReason: 'cleanup', spaceRequests: ['terminating-sr'] }]);
+    await renderCatalog();
+    expect(rowButton('Open').disabled).toBe(true);
+    expect(getButton(/^Launch$/).disabled).toBe(false);
+    setInventory([{ ...setup, status: 'pending', blocked: true, blockedReason: 'operation' }]);
+    await act(async () => { getButton(/Refresh setups/).click(); });
+    expect(rowButton('Open').disabled).toBe(false);
+    expect(getButton(/^Launch$/).disabled).toBe(false);
+    expect(mockLoadLabBundle).not.toHaveBeenCalled();
+  });
+
+  test('receipt keeps Launch disabled when inventory disappears before worker terminal status', async () => {
+    const confirm = jest.spyOn(window, 'confirm').mockReturnValue(true);
+    const getStatus = client.getTeardownStatus as jest.MockedFunction<typeof client.getTeardownStatus>;
+    const terminal = deferred<Awaited<ReturnType<typeof client.getTeardownStatus>>>();
+    const progress = { apiVersion: 'v1alpha1' as const, kind: 'TeardownStatus' as const, catalogRef: setup.catalogRef, operationId: '12'.repeat(16), status: 'running' as const };
+    try {
+      setInventory([setup]);
+      teardown.mockResolvedValue(progress);
+      getStatus.mockReturnValue(terminal.promise);
+      await renderCatalog();
+      await act(async () => { rowButton('Tear down').click(); });
+      setInventory([]);
+      await act(async () => { getButton(/Refresh setups/).click(); });
+      expect(rowButton('Launch').disabled).toBe(true);
+      expect(actions().textContent).toContain('Lab teardown in progress');
+      const refreshed = deferred<Awaited<ReturnType<typeof client.listSetups>>>();
+      inventory.mockReturnValue(refreshed.promise);
+      await act(async () => { terminal.resolve({ ...progress, status: 'succeeded' }); });
+      expect(rowButton('Launch').disabled).toBe(true);
+      await act(async () => { refreshed.resolve({ apiVersion: 'v1alpha1', kind: 'SetupList', items: [] }); });
+      expect(rowButton('Launch').disabled).toBe(false);
+      expect(actions().textContent).not.toContain('Managed lab cleanup completed.');
+      expect(actions().textContent?.trim()).toBe('Launch');
+    } finally { confirm.mockRestore(); }
+  });
+
+  test('backend cleanup conflict appears below affected row buttons while another lab stays usable', async () => {
+    const message = 'Lab namespace cleanup is still in progress. Wait until the SpaceRequest disappears before relaunch.';
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockSetupLab.mockRejectedValue({ ...sampleError, type: 'configuration_error', message });
+    await renderCatalog();
+    await act(async () => { rowButton('Launch').click(); });
+    expect(actions().textContent).toContain(message);
+    const notice = actions().querySelector('[role="alert"], [aria-live="polite"], [aria-live="assertive"]');
+    expect(notice?.textContent).toContain(message);
+    expect(rowButton('Launch').compareDocumentPosition(notice!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const otherActions = container.querySelector(`#lab-${otherRef}`)!.closest('.pf-v6-c-data-list__item-row')!.querySelector('.pf-v6-c-data-list__item-action')!;
+    expect(otherActions.textContent).not.toContain(message);
+    expect(otherActions.querySelector('button')!.disabled).toBe(false);
+    expect(actions().querySelector('.pf-v6-c-alert')).toBeNull();
+  });
+
+  test('catalog teardown failure is unframed, announced and scoped below affected row buttons', async () => {
+    const confirm = jest.spyOn(window, 'confirm').mockReturnValue(true);
+    const progress = { apiVersion: 'v1alpha1' as const, kind: 'TeardownStatus' as const, catalogRef: setup.catalogRef, operationId: '12'.repeat(16), status: 'running' as const };
+    try {
+      setInventory([setup]);
+      teardown.mockResolvedValue(progress);
+      (client.getTeardownStatus as jest.MockedFunction<typeof client.getTeardownStatus>).mockResolvedValue({ ...progress, status: 'failed' });
+      await renderCatalog();
+      await act(async () => { rowButton('Tear down').click(); });
+      const notice = actions().querySelector('[role="alert"], [aria-live="polite"], [aria-live="assertive"]');
+      expect(notice?.textContent).toContain('Lab cleanup failed.');
+      expect(rowButton('Tear down').compareDocumentPosition(notice!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      const otherActions = container.querySelector(`#lab-${otherRef}`)!.closest('.pf-v6-c-data-list__item-row')!.querySelector('.pf-v6-c-data-list__item-action')!;
+      expect(otherActions.textContent).not.toContain('Lab cleanup failed.');
+      expect(otherActions.querySelector('button')!.disabled).toBe(false);
+      expect(actions().querySelector('.pf-v6-c-alert')).toBeNull();
+    } finally { confirm.mockRestore(); }
+  });
+
+  test('release-only cleanup success returns to Launch without an SR or namespace deletion notice', async () => {
+    const confirm = jest.spyOn(window, 'confirm').mockReturnValue(true);
+    const progress = { apiVersion: 'v1alpha1' as const, kind: 'TeardownStatus' as const, catalogRef: setup.catalogRef, operationId: '12'.repeat(16), status: 'succeeded' as const };
+    try {
+      setInventory([{ ...setup, spaceRequests: [] }]);
+      teardown.mockResolvedValue(progress);
+      (client.getTeardownStatus as jest.MockedFunction<typeof client.getTeardownStatus>).mockResolvedValue(progress);
+      await renderCatalog();
+      setInventory([]);
+      await act(async () => { rowButton('Tear down').click(); });
+      expect(actions().textContent).not.toContain('Managed lab cleanup completed.');
+      expect(actions().textContent?.trim()).toBe('Launch');
+      expect(actions().textContent).not.toMatch(/SpaceRequest deletion requested|namespace.*(gone|deleted)/i);
+      expect(rowButton('Launch').disabled).toBe(false);
+    } finally { confirm.mockRestore(); }
+  });
+
+  test('given mixed orphan and catalog setups, when searching, then fallback cleanup stays in the same row layout without Open', async () => {
+    const orphan = { ...setup, catalogRef: '01'.repeat(32), blocked: true, release: undefined, spaceRequests: ['removed-lab-sr'] };
+    setInventory([setup, orphan]);
+    await renderCatalog();
+
+    const list = container.querySelector('.pf-v6-c-data-list')!;
+    const orphanRow = container.querySelector(`#lab-${orphan.catalogRef}`)!.closest<HTMLElement>('.pf-v6-c-data-list__item-row')!;
+    expect(container.querySelectorAll('.pf-v6-c-data-list')).toHaveLength(1);
+    expect(Array.from(list.children).map((child) => child.querySelector('h2')?.id)).toEqual([
+      `lab-${ref}`, `lab-${orphan.catalogRef}`, `lab-${otherRef}`,
+    ]);
+    expect(container.querySelector('section[aria-label="Your lab setups"]')).toBeNull();
+    expect(orphanRow.className).toBe(row().className);
+    expect(orphanRow.style.cssText).toBe(row().style.cssText);
+    expect(orphanRow.querySelector('.pf-v6-c-data-list__cell')?.className).toBe(row().querySelector('.pf-v6-c-data-list__cell')?.className);
+    expect(orphanRow.querySelector('h2')?.textContent).toBe(orphan.catalogRef);
+    expect(orphanRow.textContent).toContain('removed-lab-sr');
+    const orphanActions = orphanRow.querySelector('.pfext-lab-catalog-actions')!;
+    expect(Array.from(orphanActions.querySelectorAll('button')).map((button) => button.textContent)).toEqual(['Tear down']);
+    expect(orphanActions.querySelector('button')?.disabled).toBe(true);
+    expect(orphanActions.textContent).toMatch(/administrator/i);
+    expect(list.querySelectorAll('h2')).toHaveLength(3);
+
+    await filterBy('Lab Two');
+    expect(Array.from(list.children).map((child) => child.querySelector('h2')?.id)).toEqual([`lab-${orphan.catalogRef}`, `lab-${otherRef}`]);
+    expect(container.textContent).not.toContain('Lab One');
+    await filterBy('nothing matches');
+    expect(container.textContent).not.toContain('No labs match your filter.');
+    expect(list.children).toHaveLength(1);
+    expect(list.textContent).toContain('removed-lab-sr');
+    expect(mockLoadLabBundle).not.toHaveBeenCalled();
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  test.each(['empty', 'error'] as const)('given an %s catalog, when inventory loads, then cleanup remains in the unified list with release-name fallback', async (catalogState) => {
+    setInventory([setup]);
+    if (catalogState === 'error') mockListCatalog.mockRejectedValue(sampleError);
+    else mockListCatalog.mockResolvedValue(emptyCatalog);
+    await act(async () => { ReactDOM.render(<InteractiveLabsPage />, container); });
+
+    const lists = container.querySelectorAll('.pf-v6-c-data-list');
+    expect(lists).toHaveLength(1);
+    expect(lists[0].querySelector('h2')?.textContent).toBe('il-one');
+    expect(lists[0].textContent).toContain('lab-sr');
+    expect(Array.from(lists[0].querySelectorAll('button')).map((button) => button.textContent)).toEqual(['Tear down']);
+    expect(getButton(/^Tear down /).disabled).toBe(false);
+    if (catalogState === 'error') expect(container.textContent).toContain('Catalog service unavailable');
+    expect(container.textContent).not.toContain('No labs available');
+    expect(lists[0].contains(getButton(/Refresh setups/))).toBe(false);
+    expect(mockLoadLabBundle).not.toHaveBeenCalled();
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  test.each(['running', 'unknown'] as const)('given receipt-only %s cleanup, when resources disappear, then row-local orphan notices and existing-first order remain', async (status) => {
+    const orphanRef = '01'.repeat(32);
+    const operationId = '12'.repeat(16);
+    sessionStorage.setItem('interactive-labs-teardown', JSON.stringify([{ catalogRef: ref, operationId }, { catalogRef: orphanRef, operationId }]));
+    (client.getTeardownStatus as jest.MockedFunction<typeof client.getTeardownStatus>).mockImplementation((catalogRef) => catalogRef === ref
+      ? new Promise(() => {})
+      : Promise.resolve({ apiVersion: 'v1alpha1', kind: 'TeardownStatus', catalogRef, operationId, status }));
+
+    await renderCatalog({ ...setupCatalog, items: [...setupCatalog.items].reverse() });
+
+    const list = container.querySelector('.pf-v6-c-data-list')!;
+    expect(container.querySelectorAll('.pf-v6-c-data-list')).toHaveLength(1);
+    expect(Array.from(list.children).map((child) => child.querySelector('h2')?.id)).toEqual([
+      `lab-${ref}`, `lab-${orphanRef}`, `lab-${otherRef}`,
+    ]);
+    const orphanRow = container.querySelector(`#lab-${orphanRef}`)!.closest('.pf-v6-c-data-list__item-row')!;
+    expect(orphanRow.querySelector('h2')?.textContent).toBe(orphanRef);
+    expect(orphanRow.querySelectorAll('button')).toHaveLength(0);
+    const notice = orphanRow.querySelector(status === 'running' ? '[role="status"]' : '[role="alert"]');
+    expect(notice?.textContent).toContain(status === 'running' ? 'Lab teardown in progress' : 'outcome could not be verified');
+    expect(orphanRow.querySelector('.pf-v6-c-alert')).toBeNull();
+    expect(rowButton('Launch').disabled).toBe(true);
+    expect(container.querySelector(`#lab-${otherRef}`)!.closest('.pf-v6-c-data-list__item-row')!.querySelector('button')?.disabled).toBe(false);
+    expect(mockLoadLabBundle).not.toHaveBeenCalled();
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  test('inventory loading and error fail closed instead of assuming no setup', async () => {
+    const load = deferred<Awaited<ReturnType<typeof client.listSetups>>>();
+    inventory.mockReturnValue(load.promise);
+    await renderCatalog();
+    expect(rowButton('Launch').disabled).toBe(true);
+    await act(async () => { load.reject(new Error('Inventory unavailable')); });
+    expect(container.textContent).toContain('Inventory unavailable');
+    expect(rowButton('Launch').disabled).toBe(true);
+    expect(mockLoadLabBundle).not.toHaveBeenCalled();
+    setInventory([]);
+    await act(async () => { getButton(/Refresh setups/).click(); });
+    expect(rowButton('Launch').disabled).toBe(false);
+  });
+
+  test('failed inventory refresh disables known actions without reclassifying an existing setup as Launch', async () => {
+    setInventory([setup]);
+    await renderCatalog();
+    inventory.mockRejectedValue(new Error('Inventory unavailable'));
+    await act(async () => { getButton(/Refresh setups/).click(); });
+    expect(rowButton('Open').disabled).toBe(true);
+    expect(rowButton('Tear down').disabled).toBe(true);
+    expect(actions().textContent).not.toContain('Launch');
+    expect(teardown).not.toHaveBeenCalled();
+  });
+});
 
 describe('InteractiveLabsPage', () => {
   test('shows heading and loading indicator on initial render', async () => {
@@ -560,7 +1235,7 @@ describe('InteractiveLabsPage', () => {
       });
     });
 
-    expect(mockGetSetupStatus).toHaveBeenCalledWith('lab-1');
+    expect(mockGetSetupStatus).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
     expect(mockFetchResourceText).toHaveBeenCalledWith(firstPage.url, expect.any(AbortSignal));
     expect(container.textContent).toContain('Ready page');
     expect(container.querySelector('.pfext-lab-module-title')?.textContent).toBe('010-intro');

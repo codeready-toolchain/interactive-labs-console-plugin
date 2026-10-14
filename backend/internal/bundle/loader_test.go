@@ -256,17 +256,19 @@ func TestPrepareSetup(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, filepath.Join(root, "shared/chart"), plan.ChartDir)
 		assert.True(t, filepath.IsAbs(plan.ChartDir))
-		assert.Equal(t, []setup.NamespaceBinding{{Key: "lab", Path: "lab"}}, plan.Bindings.Namespaces)
-		assert.Equal(t, []setup.ValueBinding{{Key: "password", Path: "password", Kind: setup.KindGeneratedPassword}}, plan.Bindings.Passwords)
-		assert.Equal(t, []setup.RootURLBinding{{Key: "url", Path: "url", RouteName: "app", NamespaceRef: "lab"}}, plan.Bindings.RootURLs)
-		assert.Equal(t, setup.HelmReleaseName("user1", "ref1", "shared/chart", plan.Bindings.Namespaces), plan.ReleaseName)
+		assert.Equal(t, []setup.SchemaBinding{{Key: "lab", Path: "lab", Kind: setup.KindNamespaceName}}, setup.BindingsByKind(plan.Bindings, setup.KindNamespaceName))
+		assert.Equal(t, []setup.SchemaBinding{{Key: "password", Path: "password", Kind: setup.KindGeneratedPassword}}, setup.BindingsByKind(plan.Bindings, setup.KindGeneratedPassword))
+		assert.Equal(t, []setup.SchemaBinding{{Key: "url", Path: "url", Kind: setup.KindRootURL, RouteName: "app", NamespaceRef: "lab"}}, setup.BindingsByKind(plan.Bindings, setup.KindRootURL))
+		assert.Equal(t, setup.HelmReleaseName("user1", "ref1", "shared/chart", plan.Bindings), plan.ReleaseName)
 		cwd, err := os.Getwd()
 		require.NoError(t, err)
 		relativeRoot, err := filepath.Rel(cwd, root)
 		require.NoError(t, err)
 		relativePlan, err := setup.Prepare(relativeRoot, "lab", "user1", "ref1")
 		require.NoError(t, err)
-		assert.Equal(t, plan, relativePlan, "snapshot spelling must not change absolute chart directory or identity")
+		assert.Equal(t, plan.ChartDir, relativePlan.ChartDir, "snapshot spelling must not change absolute chart directory")
+		assert.Equal(t, plan.ReleaseName, relativePlan.ReleaseName, "snapshot spelling must not change identity")
+		assert.ElementsMatch(t, plan.Bindings, relativePlan.Bindings)
 	})
 	for _, tc := range []struct {
 		name, chart, schema string
@@ -353,8 +355,8 @@ func TestChartSelection(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				assert.Equal(t, filepath.Join(root, tc.selected), plan.ChartDir)
-				assert.Equal(t, []setup.NamespaceBinding{{Key: tc.selected, Path: tc.selected}}, plan.Bindings.Namespaces)
-				assert.Equal(t, setup.HelmReleaseName("user1", "ref1", tc.selected, plan.Bindings.Namespaces), plan.ReleaseName)
+				assert.Equal(t, []setup.SchemaBinding{{Key: tc.selected, Path: tc.selected, Kind: setup.KindNamespaceName}}, setup.BindingsByKind(plan.Bindings, setup.KindNamespaceName))
+				assert.Equal(t, setup.HelmReleaseName("user1", "ref1", tc.selected, plan.Bindings), plan.ReleaseName)
 			}
 		})
 	}
@@ -368,7 +370,7 @@ func TestChartSelection(t *testing.T) {
 		plan, err := setup.Prepare(root, ".", "user1", "ref1")
 		require.NoError(t, err)
 		assert.Equal(t, filepath.Join(root, "setup/helm"), plan.ChartDir)
-		assert.Equal(t, setup.HelmReleaseName("user1", "ref1", "setup/helm", plan.Bindings.Namespaces), plan.ReleaseName)
+		assert.Equal(t, setup.HelmReleaseName("user1", "ref1", "setup/helm", plan.Bindings), plan.ReleaseName)
 	})
 	t.Run("schema is optional", func(t *testing.T) {
 		root, _ := moduleLab(t)

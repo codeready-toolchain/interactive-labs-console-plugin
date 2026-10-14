@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/bundle"
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/catalog"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/chart"
 )
 
@@ -20,7 +21,30 @@ var (
 type Plan struct {
 	ChartDir    string // absolute selected chart directory
 	ReleaseName string // already derived from the authenticated subject and catalog identity
-	Bindings    SchemaBindings
+	Bindings    []SchemaBinding
+}
+
+// prepare releases the snapshot read lock before any lifecycle/cluster work.
+func (m *Manager) prepare(entry catalog.Entry, subject string) (*Plan, error) {
+	if m == nil || m.config.WithSnapshot == nil {
+		return nil, managerError(ManagerPreparationUnavailable, "setup preparer not configured")
+	}
+	var plan *Plan
+	err := m.config.WithSnapshot(entry.Repository, entry.Branch, func(root string) error {
+		var err error
+		plan, err = Prepare(root, entry.LabPath, subject, entry.CatalogRef)
+		return err
+	})
+	switch {
+	case errors.Is(err, ErrChartNotFound):
+		return nil, managerError(ManagerChartNotFound, "lab has no values schema")
+	case errors.Is(err, ErrNamespaceBindingsMissing):
+		return nil, managerError(ManagerSchemaInvalid, "values schema declares no namespace bindings")
+	case err != nil || plan == nil:
+		return nil, managerError(ManagerPreparationFailed, "failed to prepare lab setup")
+	default:
+		return plan, nil
+	}
 }
 
 // Prepare validates lab content and prepares provisioning inputs from an approved
@@ -45,7 +69,7 @@ func Prepare(repositoryRoot, labPath, subject, catalogRef string) (*Plan, error)
 		return nil, ErrChartNotFound
 	}
 	bindings := ParseSchemaBindings(chart.Schema)
-	if len(bindings.Namespaces) == 0 {
+	if len(BindingsByKind(bindings, KindNamespaceName)) == 0 {
 		return nil, ErrNamespaceBindingsMissing
 	}
 	chartPath, err := filepath.Rel(root, chart.Dir)
@@ -54,7 +78,7 @@ func Prepare(repositoryRoot, labPath, subject, catalogRef string) (*Plan, error)
 	}
 	return &Plan{
 		ChartDir:    chart.Dir,
-		ReleaseName: HelmReleaseName(subject, catalogRef, filepath.ToSlash(chartPath), bindings.Namespaces),
-		Bindings:    *bindings,
+		ReleaseName: HelmReleaseName(subject, catalogRef, filepath.ToSlash(chartPath), bindings),
+		Bindings:    bindings,
 	}, nil
 }

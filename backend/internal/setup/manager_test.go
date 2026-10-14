@@ -1,0 +1,2590 @@
+package setup
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"helm.sh/helm/v3/pkg/chart"
+	"helm.sh/helm/v3/pkg/chartutil"
+	"helm.sh/helm/v3/pkg/release"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
+
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/catalog"
+)
+
+// Embed unused Helm methods: each test implements only operations its path needs.
+type managerTestHelm struct {
+	HelmManager
+	releases     []LabRelease
+	status       string
+	statusErr    error
+	statusNames  []string
+	steps        *[]string
+	uninstallErr error
+	uninstall    func(context.Context, LabRelease, []SpaceRequestResult) error
+	install      func() error
+	installOpts  func(context.Context, HelmInstallOpts) error
+	list         func(context.Context, []SpaceRequestResult) ([]LabRelease, error)
+}
+
+func (h *managerTestHelm) ListLabReleases(ctx context.Context, namespace, token string, srs []SpaceRequestResult) ([]LabRelease, error) {
+	if namespace != "alice-dev" || token != "user-token" {
+		return nil, errors.New("Helm called without user namespace/token")
+	}
+	if h.list != nil {
+		return h.list(ctx, srs)
+	}
+	return h.releases, nil
+}
+
+func (h *managerTestHelm) ReleaseStatus(_ context.Context, name, namespace, token string) (string, error) {
+	if namespace != "alice-dev" || token != "user-token" {
+		return "", errors.New("Helm called without user namespace/token")
+	}
+	h.statusNames = append(h.statusNames, name)
+	return h.status, h.statusErr
+}
+
+func (h *managerTestHelm) UninstallLabRelease(ctx context.Context, _, _ string, target LabRelease, srs []SpaceRequestResult) error {
+	if h.uninstall != nil {
+		return h.uninstall(ctx, target, srs)
+	}
+	*h.steps = append(*h.steps, "uninstall:"+target.Name)
+	return h.uninstallErr
+}
+
+func (h *managerTestHelm) Install(ctx context.Context, opts HelmInstallOpts) error {
+	if h.installOpts != nil {
+		return h.installOpts(ctx, opts)
+	}
+	if h.install != nil {
+		return h.install()
+	}
+	if h.steps != nil {
+		*h.steps = append(*h.steps, "install")
+	}
+	return errors.New("unexpected Helm install")
+}
+
+func managerSnapshot(t *testing.T, bindings []SchemaBinding) string {
+	t.Helper()
+	root := t.TempDir()
+	files := map[string]string{
+		"lab/lab.yaml": "apiVersion: v1alpha1\nkind: Lab\nmetadata:\n  title: Test\n",
+		"lab/modules/010-intro/content/intro.adoc": "= Intro\n",
+		"setup/helm/Chart.yaml":                    "apiVersion: v2\nname: test\nversion: 1.0.0\n",
+	}
+	properties := map[string]any{}
+	for _, binding := range bindings {
+		parts := strings.Split(binding.Path, ".")
+		current := properties
+		for _, part := range parts[:len(parts)-1] {
+			if current[part] == nil {
+				current[part] = map[string]any{"type": "object", "properties": map[string]any{}}
+			}
+			node := current[part].(map[string]any)
+			if node["properties"] == nil {
+				node["properties"] = map[string]any{}
+			}
+			current = node["properties"].(map[string]any)
+		}
+		current[parts[len(parts)-1]] = map[string]any{"type": "string", "x-interactive-labs": map[string]string{"kind": binding.Kind, "routeName": binding.RouteName, "namespaceRef": binding.NamespaceRef}}
+	}
+	raw, err := json.Marshal(map[string]any{"properties": properties})
+	require.NoError(t, err)
+	files["setup/helm/values.schema.json"] = string(raw)
+	for name, contents := range files {
+		file := filepath.Join(root, name)
+		require.NoError(t, os.MkdirAll(filepath.Dir(file), 0o755))
+		require.NoError(t, os.WriteFile(file, []byte(contents), 0o600))
+	}
+	return root
+}
+
+func managerFixtureEntry(t *testing.T, manager *Manager, ref string, bindings []SchemaBinding) catalog.Entry {
+	t.Helper()
+	if bindings == nil {
+		bindings = []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
+	}
+	root := managerSnapshot(t, bindings)
+	manager.config.WithSnapshot = func(_, _ string, read func(string) error) error { return read(root) }
+	return catalog.Entry{Repository: "https://github.com/redhat/lab", Branch: "main", LabPath: "lab", CatalogRef: ref}
+}
+
+//nolint:revive // Test fixture helpers keep testing.T and the fixture first.
+func startWithBindings(t *testing.T, manager *Manager, ctx context.Context, subject, token, ref string, bindings []SchemaBinding) (Status, bool, error) {
+	t.Helper()
+	return manager.Start(ctx, subject, token, managerFixtureEntry(t, manager, ref, bindings))
+}
+
+//nolint:revive // Test fixture helpers keep testing.T and the fixture first.
+func statusWithBindings(t *testing.T, manager *Manager, ctx context.Context, subject, token, ref string, bindings []SchemaBinding) (Status, error) {
+	t.Helper()
+	return manager.Status(ctx, subject, token, managerFixtureEntry(t, manager, ref, bindings))
+}
+
+func TestManagerInventoryLifecycle(t *testing.T) {
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
+	srJSON := func(failed bool) string {
+		condition := `{"type":"Ready","status":"True"}`
+		if failed {
+			condition = `{"type":"Ready","status":"False","reason":"UnableToCreateSpace"}`
+		}
+		return fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[%s]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation, condition)
+	}
+	inventory := func(t *testing.T, manager *Manager) map[string]any {
+		t.Helper()
+		items, err := manager.List(ctx, "alice", "user-token")
+		require.NoError(t, err)
+		require.Len(t, items, 1)
+		payload, err := json.Marshal(items[0])
+		require.NoError(t, err)
+		assert.NotContains(t, string(payload), "user-token")
+		var item map[string]any
+		require.NoError(t, json.Unmarshal(payload, &item))
+		return item
+	}
+	for _, tc := range []struct {
+		name, releaseStatus, wantStatus, wantReason                              string
+		held, unknown, missingCoordinator, cleanupBlocked, failedSR, wantBlocked bool
+	}{
+		{name: "deployed opens", releaseStatus: "deployed", wantStatus: "deployed"},
+		{name: "cleanup-blocked deployment still opens", releaseStatus: "deployed", cleanupBlocked: true, wantStatus: "deployed", wantBlocked: true, wantReason: "unknown"},
+		{name: "failed release allows cleanup", releaseStatus: "failed", wantStatus: "failed"},
+		{name: "failed release with keep policy blocks cleanup", releaseStatus: "failed", cleanupBlocked: true, wantStatus: "failed", wantBlocked: true, wantReason: "unknown"},
+		{name: "unheld pending install allows explicit cleanup", releaseStatus: "pending-install", wantStatus: "failed"},
+		{name: "held pending install blocks cleanup", releaseStatus: "pending-install", held: true, wantStatus: "pending", wantBlocked: true, wantReason: "operation"},
+		{name: "pending upgrade blocks cleanup", releaseStatus: "pending-upgrade", wantStatus: "pending", wantBlocked: true, wantReason: "helm-state"},
+		{name: "SR-only abandoned setup allows cleanup", wantStatus: "failed"},
+		{name: "SR-only live or crashed reservation blocks cleanup", held: true, wantStatus: "pending", wantBlocked: true, wantReason: "operation"},
+		{name: "failed SR with held reservation blocks cleanup", held: true, failedSR: true, wantStatus: "failed", wantBlocked: true, wantReason: "operation"},
+		{name: "failed SR without reservation allows cleanup", failedSR: true, wantStatus: "failed"},
+		{name: "failed release with retained reservation blocks cleanup", releaseStatus: "failed", held: true, wantStatus: "failed", wantBlocked: true, wantReason: "operation"},
+		{name: "unknown reservation fails closed", unknown: true, wantStatus: "pending", wantBlocked: true, wantReason: "operation"},
+		{name: "unknown reservation blocks deployed cleanup", releaseStatus: "deployed", unknown: true, wantStatus: "deployed", wantBlocked: true, wantReason: "operation"},
+		{name: "unknown reservation blocks failed cleanup", releaseStatus: "failed", unknown: true, wantStatus: "failed", wantBlocked: true, wantReason: "operation"},
+		{name: "missing coordination blocks cleanup", missingCoordinator: true, wantStatus: "pending", wantBlocked: true, wantReason: "operation"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			steps := []string{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+				if r.Method != http.MethodGet {
+					steps = append(steps, r.Method)
+				}
+				if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+					_, _ = fmt.Fprintf(w, `{"items":[%s]}`, srJSON(tc.failedSR))
+				} else {
+					_, _ = fmt.Fprint(w, srJSON(tc.failedSR))
+				}
+			}))
+			defer server.Close()
+			client := fake.NewSimpleClientset()
+			coord := NewOperationCoordinator(client, "plugin-ns")
+			_, releaseOther, err := coord.Acquire(ctx, "alice", strings.Repeat("cd", 32))
+			require.NoError(t, err)
+			defer releaseOther()
+			if tc.missingCoordinator {
+				coord = nil
+			}
+			if tc.held {
+				_, release, err := coord.Acquire(ctx, "alice", ref)
+				require.NoError(t, err)
+				defer release()
+			}
+			if tc.unknown {
+				client.PrependReactor("get", "leases", func(ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("reservation read unavailable user-token")
+				})
+			}
+			helm := &managerTestHelm{steps: &steps}
+			if tc.releaseStatus != "" {
+				helm.releases = []LabRelease{{Name: "il-first", Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: tc.releaseStatus, CleanupBlocked: tc.cleanupBlocked}}
+			}
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, Coordinator: coord})
+			item := inventory(t, manager)
+			assert.Equal(t, tc.wantStatus, item["status"])
+			assert.Equal(t, tc.wantBlocked, item["blocked"] == true)
+			if tc.wantReason == "" {
+				assert.NotContains(t, item, "blockedReason")
+			} else {
+				assert.Equal(t, tc.wantReason, item["blockedReason"])
+			}
+			if tc.wantBlocked {
+				require.Error(t, awaitTeardown(ctx, t, manager, ref, item["generation"].(string)))
+				assert.Empty(t, steps)
+			} else {
+				require.NoError(t, awaitTeardown(ctx, t, manager, ref, item["generation"].(string)))
+			}
+		})
+	}
+
+	t.Run("denied SpaceRequest create leaves no setup to tear down", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+			switch {
+			case r.Method == http.MethodPost:
+				w.WriteHeader(http.StatusForbidden)
+			case strings.HasSuffix(r.URL.Path, "/spacerequests"):
+				_, _ = fmt.Fprint(w, `{"items":[]}`)
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer server.Close()
+		coord := NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns")
+		manager := NewManager(ManagerConfig{Helm: &managerTestHelm{}, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, Coordinator: coord})
+
+		_, ready, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+		var managerErr *ManagerError
+		require.ErrorAs(t, err, &managerErr)
+		assert.Equal(t, ManagerBadGateway, managerErr.Kind)
+		assert.Equal(t, "failed to create SpaceRequest", managerErr.Message)
+		assert.False(t, ready)
+		assert.NotContains(t, err.Error(), "user-token")
+		items, err := manager.List(ctx, "alice", "user-token")
+		require.NoError(t, err)
+		assert.Empty(t, items, "permission denial before resource creation must not leave a teardown target")
+		assert.False(t, coord.IsHeld(ctx, "alice", ref))
+	})
+
+	for _, tc := range []struct{ retain, noSR bool }{{}, {retain: true}, {noSR: true}, {retain: true, noSR: true}} {
+		t.Run(fmt.Sprintf("worker failure retains reservation=%t noSR=%t", tc.retain, tc.noSR), func(t *testing.T) {
+			retain := tc.retain
+			var removed, missing atomic.Bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					removed.Store(true)
+					return
+				}
+				if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+					if missing.Load() || removed.Load() {
+						_, _ = fmt.Fprint(w, `{"items":[]}`)
+					} else {
+						_, _ = fmt.Fprintf(w, `{"items":[%s]}`, srJSON(false))
+					}
+				} else if removed.Load() {
+					w.WriteHeader(http.StatusNotFound)
+				} else {
+					_, _ = fmt.Fprint(w, srJSON(false))
+				}
+			}))
+			defer server.Close()
+			client := fake.NewSimpleClientset()
+			if retain {
+				client.PrependReactor("update", "leases", func(ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("release failed user-token")
+				})
+			}
+			started, finish := make(chan struct{}), make(chan struct{})
+			defer close(finish)
+			helm := &managerTestHelm{install: func() error {
+				missing.Store(tc.noSR) // A binding may disappear after verified worker handoff.
+				close(started)
+				<-finish
+				return errors.New("install failed user-token")
+			}}
+			coord := NewOperationCoordinator(client, "plugin-ns")
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, Coordinator: coord})
+			workerBindings := bindings
+			_, ready, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, workerBindings)
+			require.NoError(t, err)
+			assert.False(t, ready)
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("worker did not start")
+			}
+			item := inventory(t, manager)
+			assert.Equal(t, "pending", item["status"])
+			assert.Equal(t, true, item["blocked"])
+			require.Error(t, awaitTeardown(ctx, t, manager, ref, item["generation"].(string)))
+			finish <- struct{}{}
+			require.Eventually(t, func() bool {
+				status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, workerBindings)
+				return err == nil && status.Helm.Status == "failed"
+			}, time.Second, time.Millisecond)
+			require.Eventually(t, func() bool {
+				items, err := manager.List(ctx, "alice", "user-token")
+				return err == nil && len(items) == 1 && items[0].Blocked == retain
+			}, time.Second, time.Millisecond)
+			item = inventory(t, manager)
+			assert.Equal(t, "failed", item["status"])
+			assert.Equal(t, retain, item["blocked"] == true)
+			// Ready SRs do not hide a worker's failure; state survives manager restart
+			// through the held reservation when release failed.
+			if retain {
+				require.Error(t, awaitTeardown(ctx, t, manager, ref, item["generation"].(string)))
+				if !tc.noSR {
+					restarted := NewManager(manager.config)
+					assert.Equal(t, true, inventory(t, restarted)["blocked"])
+				}
+			} else {
+				require.NoError(t, awaitTeardown(ctx, t, manager, ref, item["generation"].(string)))
+				items, err := manager.List(ctx, "alice", "user-token")
+				require.NoError(t, err)
+				assert.Empty(t, items, "teardown clears terminal worker inventory")
+			}
+		})
+	}
+}
+
+func TestManagerInventoryOrderAndGeneration(t *testing.T) {
+	ctx := context.Background()
+	refs := []string{strings.Repeat("ab", 32), strings.Repeat("cd", 32), strings.Repeat("ef", 32)}
+	srJSON := func(name, uid, ref string) string {
+		label, err := CatalogRefLabel(ref)
+		require.NoError(t, err)
+		return fmt.Sprintf(`{"metadata":{"name":%q,"namespace":"alice-dev","uid":%q,"labels":{%q:%q},"annotations":{%q:%q}}}`, name, uid, CatalogRefLabelKey, label, BindingKeyAnnotation, name)
+	}
+	// Given shuffled bindings, including an SR-only lab and a release-only lab.
+	srs := []string{srJSON("other", "sr-other", refs[1]), srJSON("zeta", "sr-zeta", refs[0]), srJSON("alpha", "sr-alpha", refs[0])}
+	helm := &managerTestHelm{releases: []LabRelease{
+		{Name: "il-last", Namespace: "alice-dev", UID: "helm-last", CatalogRef: refs[2], Status: "deployed", Revision: 1},
+		{Name: "il-first", Namespace: "alice-dev", UID: "helm-first", CatalogRef: refs[0], Status: "deployed", Revision: 1},
+	}}
+	client := &http.Client{Transport: managerRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+		body := `{"items":[` + strings.Join(srs, ",") + `]}`
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: "https://cluster.test", HTTPClient: client}, Coordinator: NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns")})
+	baseline, err := manager.List(ctx, "alice", "user-token")
+	require.NoError(t, err)
+	require.Len(t, baseline, 3)
+
+	t.Run("given shuffled resources when listing then refs and names sort and generation ignores order", func(t *testing.T) {
+		// When the same resources arrive in a different order.
+		originalSRs, originalReleases := srs, helm.releases
+		t.Cleanup(func() { srs, helm.releases = originalSRs, originalReleases })
+		srs = []string{srs[2], srs[0], srs[1]}
+		helm.releases = []LabRelease{helm.releases[1], helm.releases[0]}
+		items, err := manager.List(ctx, "alice", "user-token")
+
+		// Then both snapshots have deterministic public ordering and generations.
+		require.NoError(t, err)
+		require.Len(t, items, 3)
+		wantNames := [][]string{{"alpha", "zeta"}, {"other"}, {}}
+		for i, ref := range refs {
+			assert.Equal(t, ref, baseline[i].CatalogRef)
+			assert.Equal(t, ref, items[i].CatalogRef)
+			assert.Equal(t, wantNames[i], baseline[i].SpaceRequests)
+			assert.Equal(t, wantNames[i], items[i].SpaceRequests)
+			assert.NotEmpty(t, baseline[i].Generation)
+			assert.Equal(t, baseline[i].Generation, items[i].Generation)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		change func()
+	}{
+		{"SR UID replacement", func() { srs[1] = strings.ReplaceAll(srs[1], "sr-zeta", "sr-replaced") }},
+		{"release UID replacement", func() { helm.releases[1].UID = "helm-replaced" }},
+		{"release revision increment", func() { helm.releases[1].Revision++ }},
+	} {
+		t.Run("given "+tc.name+" when listing then only affected generation changes", func(t *testing.T) {
+			// Given one identity change, without changing either other lab.
+			originalSRs := append([]string(nil), srs...)
+			originalReleases := append([]LabRelease(nil), helm.releases...)
+			t.Cleanup(func() { srs, helm.releases = originalSRs, originalReleases })
+			tc.change()
+			// When listing through the public API.
+			items, err := manager.List(ctx, "alice", "user-token")
+			// Then the old confirmation is invalid only for the changed lab.
+			require.NoError(t, err)
+			require.Len(t, items, 3)
+			assert.NotEqual(t, baseline[0].Generation, items[0].Generation)
+			assert.Equal(t, baseline[1].Generation, items[1].Generation)
+			assert.Equal(t, baseline[2].Generation, items[2].Generation)
+		})
+	}
+}
+
+func TestManagerInventoryRejectsUnverifiedReleases(t *testing.T) {
+	client := &http.Client{Transport: managerRoundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"items":[]}`)), Header: make(http.Header)}, nil
+	})}
+	for _, tc := range []struct {
+		name   string
+		change func(*managerTestHelm)
+	}{
+		{"missing name", func(h *managerTestHelm) { h.releases[0].Name = "" }},
+		{"missing namespace", func(h *managerTestHelm) { h.releases[0].Namespace = "" }},
+		{"wrong namespace", func(h *managerTestHelm) { h.releases[0].Namespace = "bob-dev" }},
+		{"missing UID", func(h *managerTestHelm) { h.releases[0].UID = "" }},
+		{"duplicate release summaries", func(h *managerTestHelm) { h.releases = append(h.releases, h.releases[0]) }},
+	} {
+		t.Run("given "+tc.name+" when listing then reject entire inventory", func(t *testing.T) {
+			// Given an unverified release summary from discovery.
+			helm := &managerTestHelm{releases: []LabRelease{{Name: "il-first", Namespace: "alice-dev", UID: "helm-uid", CatalogRef: strings.Repeat("ab", 32), Status: "deployed", Revision: 1}}}
+			tc.change(helm)
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: "https://cluster.test", HTTPClient: client}, Coordinator: NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns")})
+			// When listing through the public API.
+			items, err := manager.List(context.Background(), "alice", "user-token")
+			// Then no partial inventory or unsafe error details escape.
+			var managerErr *ManagerError
+			require.ErrorAs(t, err, &managerErr)
+			assert.Equal(t, ManagerBadGateway, managerErr.Kind)
+			assert.Equal(t, "Unable to list lab setups. Check permissions or ask an administrator for help.", managerErr.Message)
+			assert.Nil(t, items)
+			assert.NotContains(t, err.Error(), "user-token")
+		})
+	}
+}
+
+func awaitTeardown(ctx context.Context, t *testing.T, manager *Manager, ref, generation string) error {
+	t.Helper()
+	started, err := manager.BeginTeardown(ctx, "alice", "user-token", ref, generation)
+	if err != nil {
+		return err
+	}
+	var outcome string
+	require.Eventually(t, func() bool {
+		progress, err := manager.TeardownStatus(context.Background(), "alice", ref, started.OperationID)
+		if err != nil {
+			return false
+		}
+		outcome = progress.Status
+		return outcome == "succeeded" || outcome == "failed"
+	}, 3*time.Second, time.Millisecond)
+	if outcome == "failed" {
+		return errors.New("teardown worker failed")
+	}
+	return nil
+}
+
+func TestManagerTerminatingSpaceRequests(t *testing.T) {
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
+	t.Run("unrelated terminating lab does not block healthy deployment", func(t *testing.T) {
+		otherLabel, err := CatalogRefLabel(strings.Repeat("cd", 32))
+		require.NoError(t, err)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodGet, r.Method)
+			assert.Equal(t, CatalogRefLabelKey+"="+label, r.URL.Query().Get("labelSelector"))
+			selectedLabel, deletion := label, ""
+			if r.URL.Query().Get("labelSelector") != CatalogRefLabelKey+"="+label {
+				selectedLabel, deletion = otherLabel, `,"deletionTimestamp":"2026-10-01T00:00:00Z"`
+			}
+			_, _ = fmt.Fprintf(w, `{"items":[{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}%s},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}]}`, CatalogRefLabelKey, selectedLabel, BindingKeyAnnotation, deletion)
+		}))
+		defer server.Close()
+		helm := &managerTestHelm{releases: []LabRelease{{Name: "il-first", Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: "deployed"}}}
+		manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, Coordinator: NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns")})
+		status, ready, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err)
+		assert.True(t, ready)
+		assert.Equal(t, "ready", status.SpaceRequests.Status)
+		assert.Equal(t, "deployed", status.Helm.Status)
+	})
+	for _, tc := range []struct {
+		name          string
+		afterTeardown bool
+		deployed      bool
+		oldBinding    bool
+		deleteAtGet   int32
+	}{
+		{name: "accepted DELETE blocks relaunch without Helm", afterTeardown: true},
+		{name: "schema drift cannot hide terminating old binding", afterTeardown: true, oldBinding: true},
+		{name: "existing deployed release cannot reuse terminating SR", deployed: true},
+		{name: "external deletion after initial list", deleteAtGet: 1},
+		{name: "external deletion after Ensure", deleteAtGet: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var terminating atomic.Bool
+			terminating.Store(!tc.afterTeardown && tc.deleteAtGet == 0)
+			var namedGets, mutations, installs atomic.Int32
+			coord := NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+				if r.Method == http.MethodDelete {
+					mutations.Add(1)
+					terminating.Store(true)
+					w.WriteHeader(http.StatusAccepted)
+					return
+				}
+				if r.Method != http.MethodGet {
+					mutations.Add(1)
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+				list := strings.HasSuffix(r.URL.Path, "/spacerequests")
+				if !list {
+					count := namedGets.Add(1)
+					if tc.deleteAtGet > 0 && count >= tc.deleteAtGet {
+						terminating.Store(true)
+					}
+				}
+				deletion := ""
+				if terminating.Load() {
+					deletion = `,"deletionTimestamp":"2026-10-01T00:00:00Z"`
+				}
+				sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}%s},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation, deletion)
+				if list {
+					_, _ = fmt.Fprintf(w, `{"items":[%s]}`, sr)
+				} else {
+					_, _ = fmt.Fprint(w, sr)
+				}
+			}))
+			defer server.Close()
+			helm := &managerTestHelm{install: func() error { installs.Add(1); return nil }}
+			if tc.deployed {
+				helm.releases = []LabRelease{{Name: "il-first", Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: "deployed"}}
+				helm.status = "deployed"
+			}
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, Coordinator: coord})
+			if tc.afterTeardown {
+				items, err := manager.List(ctx, "alice", "user-token")
+				require.NoError(t, err)
+				require.Len(t, items, 1)
+				require.NoError(t, awaitTeardown(ctx, t, manager, ref, items[0].Generation))
+				assert.True(t, terminating.Load(), "DELETE accepted while finalizers retain the SR")
+				assert.False(t, coord.IsHeld(ctx, "alice", ref), "successful teardown releases the reservation")
+				manager = NewManager(manager.config) // Admission must work across pods, without worker memory.
+				for _, held := range []bool{false, true} {
+					release := func() {}
+					if held {
+						_, release, err = coord.Acquire(ctx, "alice", ref)
+						require.NoError(t, err)
+					}
+					items, err = manager.List(ctx, "alice", "user-token")
+					release()
+					require.NoError(t, err)
+					require.Len(t, items, 1)
+					assert.Equal(t, "pending", items[0].Status, "finalizers still cleaning up, not setup failure")
+					assert.True(t, items[0].Blocked)
+					assert.EqualValues(t, "cleanup", items[0].BlockedReason, "terminating SR cleanup wins over held=%t", held)
+				}
+			}
+			before := mutations.Load()
+			namedGets.Store(0)
+			startBindings := bindings
+			if tc.oldBinding {
+				startBindings = []SchemaBinding{{Key: "new-binding", Path: "namespaces.new", Kind: KindNamespaceName}}
+			}
+			_, ready, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, startBindings)
+			if err == nil && !ready {
+				require.Eventually(t, func() bool { return !coord.IsHeld(ctx, "alice", ref) }, time.Second, time.Millisecond)
+			}
+			var managerErr *ManagerError
+			require.ErrorAs(t, err, &managerErr)
+			assert.Equal(t, ManagerConflict, managerErr.Kind)
+			wantMessage := "Lab namespaces are still terminating. Wait for cleanup before relaunch."
+			if tc.deleteAtGet == 2 {
+				wantMessage = "SpaceRequest identity changed; refresh before retrying."
+			}
+			assert.Equal(t, wantMessage, managerErr.Message)
+			assert.False(t, ready)
+			assert.Equal(t, before, mutations.Load())
+			if tc.deleteAtGet == 0 {
+				assert.Zero(t, namedGets.Load(), "preflight rejects before SR adoption or worker handoff")
+			}
+			assert.Zero(t, installs.Load())
+			assert.False(t, coord.IsHeld(ctx, "alice", ref), "no background worker owns the reservation")
+			status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+			require.NoError(t, err)
+			assert.Equal(t, "provisioning", status.SpaceRequests.Status)
+			assert.Equal(t, "pending", status.SpaceRequests.Namespaces["gitea"].Status)
+			assert.Empty(t, status.Attributes)
+			if tc.afterTeardown {
+				items, err := manager.List(ctx, "alice", "user-token")
+				require.NoError(t, err)
+				require.Len(t, items, 1)
+				_, err = manager.BeginTeardown(ctx, "alice", "user-token", ref, items[0].Generation)
+				var repeatErr *ManagerError
+				require.ErrorAs(t, err, &repeatErr)
+				assert.Equal(t, ManagerConflict, repeatErr.Kind)
+			}
+		})
+	}
+}
+
+func TestManager(t *testing.T) {
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
+	newManager := func(server *httptest.Server, helm HelmManager) *Manager {
+		return NewManager(ManagerConfig{
+			Helm: helm, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL},
+			Coordinator: NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns"), TierName: "base1ns",
+		})
+	}
+
+	t.Run("missing authenticated subject rejects setup and status", func(t *testing.T) {
+		// Given a valid approved snapshot but no authenticated subject.
+		manager := NewManager(ManagerConfig{})
+		// When requesting either public setup operation, then authentication fails closed.
+		_, ready, startErr := startWithBindings(t, manager, ctx, "", "user-token", ref, bindings)
+		_, statusErr := statusWithBindings(t, manager, ctx, "", "user-token", ref, bindings)
+		assert.False(t, ready)
+		for _, err := range []error{startErr, statusErr} {
+			var managerErr *ManagerError
+			require.ErrorAs(t, err, &managerErr)
+			assert.Equal(t, ManagerBadRequest, managerErr.Kind)
+			assert.Equal(t, "authentication required", managerErr.Message)
+		}
+	})
+
+	t.Run("prepares approved entry under snapshot lock before cluster reads", func(t *testing.T) {
+		// Given an approved source and a compatible, verified existing deployment.
+		root := managerSnapshot(t, bindings)
+		entry := catalog.Entry{CatalogRef: ref, Repository: "https://github.com/redhat/approved", Branch: "approved", LabPath: "lab"}
+		var inSnapshot atomic.Bool
+		reads := 0
+		sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.False(t, inSnapshot.Load(), "snapshot lock must not cover SpaceRequest reads")
+			assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+			if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+				_, _ = fmt.Fprintf(w, `{"items":[%s]}`, sr)
+			} else {
+				_, _ = fmt.Fprint(w, sr)
+			}
+		}))
+		t.Cleanup(server.Close)
+		helm := &managerTestHelm{list: func(context.Context, []SpaceRequestResult) ([]LabRelease, error) {
+			assert.False(t, inSnapshot.Load(), "snapshot lock must not cover Helm reads")
+			return []LabRelease{{Name: "il-existing", Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: "deployed"}}, nil
+		}}
+		manager := NewManager(ManagerConfig{
+			WithSnapshot: func(repository, branch string, read func(string) error) error {
+				assert.Equal(t, entry.Repository, repository)
+				assert.Equal(t, entry.Branch, branch)
+				reads++
+				inSnapshot.Store(true)
+				defer inSnapshot.Store(false)
+				return read(root)
+			},
+			Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()},
+			Coordinator: NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns"),
+		})
+		// When reopening and polling through public interfaces.
+		opened, ready, err := manager.Start(ctx, "alice", "user-token", entry)
+		require.NoError(t, err)
+		assert.True(t, ready)
+		status, err := manager.Status(ctx, "alice", "user-token", entry)
+		require.NoError(t, err)
+		// Then approved preparation happens once per request and preserves existing identity.
+		assert.Equal(t, 2, reads)
+		assert.Equal(t, "il-existing", opened.Helm.ReleaseName)
+		assert.Equal(t, opened.Helm.ReleaseName, status.Helm.ReleaseName)
+	})
+
+	t.Run("duplicate releases block SR mutations", func(t *testing.T) {
+		mutations := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				mutations++
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer server.Close()
+		helm := &managerTestHelm{releases: []LabRelease{
+			{Name: "il-first", Namespace: "alice-dev", CatalogRef: ref, Status: "deployed", UID: "uid-1", Revision: 1},
+			{Name: "il-second", Namespace: "alice-dev", CatalogRef: ref, Status: "deployed", UID: "uid-2", Revision: 1},
+		}}
+		_, _, err := startWithBindings(t, newManager(server, helm), ctx, "alice", "user-token", ref, bindings)
+		require.Error(t, err)
+		assert.Zero(t, mutations)
+	})
+
+	t.Run("cleanup-blocked deployed release remains openable", func(t *testing.T) {
+		steps := []string{}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+			if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/spacerequests") {
+				steps = append(steps, "unexpected SR request: "+r.Method+" "+r.URL.Path)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = fmt.Fprintf(w, `{"items":[{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}]}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+		}))
+		defer server.Close()
+		helm := &managerTestHelm{steps: &steps, releases: []LabRelease{{Name: "il-first", Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: "deployed", CleanupBlocked: true}}}
+		manager := newManager(server, helm)
+		status, ready, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err)
+		assert.True(t, ready)
+		assert.Equal(t, "ready", status.SpaceRequests.Status)
+		assert.Equal(t, "deployed", status.Helm.Status)
+		assert.Equal(t, "il-first", status.Helm.ReleaseName)
+		assert.Empty(t, steps, "opening a deployed release must not install Helm or mutate SpaceRequests")
+	})
+
+	t.Run("new SR must have verified UID before worker handoff", func(t *testing.T) {
+		created := false
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+			switch r.Method {
+			case http.MethodGet:
+				if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+					_, _ = fmt.Fprint(w, `{"items":[]}`)
+					return
+				}
+				if !created {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				_, _ = fmt.Fprintf(w, `{"metadata":{"name":"gitea","namespace":"alice-dev","labels":{%q:%q},"annotations":{%q:"gitea"}}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+			case http.MethodPost:
+				var body struct {
+					Metadata struct {
+						Name        string            `json:"name"`
+						Namespace   string            `json:"namespace"`
+						Labels      map[string]string `json:"labels"`
+						Annotations map[string]string `json:"annotations"`
+					} `json:"metadata"`
+				}
+				if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&body)) {
+					http.Error(w, "invalid SpaceRequest JSON", http.StatusBadRequest)
+					return
+				}
+				assert.Equal(t, "gitea", body.Metadata.Name)
+				assert.Equal(t, "alice-dev", body.Metadata.Namespace)
+				assert.Equal(t, label, body.Metadata.Labels[CatalogRefLabelKey])
+				assert.Equal(t, "gitea", body.Metadata.Annotations[BindingKeyAnnotation])
+				created = true
+				w.WriteHeader(http.StatusCreated)
+			default:
+				t.Errorf("unexpected SR request %s", r.Method)
+			}
+		}))
+		defer server.Close()
+		_, _, err := startWithBindings(t, newManager(server, &managerTestHelm{}), ctx, "alice", "user-token", ref, bindings)
+		require.Error(t, err, "new SR without UID cannot be handed to background worker")
+		assert.True(t, created)
+	})
+
+	t.Run("stale generation blocks cleanup; valid generation uninstalls Helm before deleting SR", func(t *testing.T) {
+		steps := []string{}
+		sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+			switch r.Method {
+			case http.MethodGet:
+				if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+					_, _ = fmt.Fprintf(w, `{"items":[%s]}`, sr)
+				} else {
+					_, _ = fmt.Fprint(w, sr)
+				}
+			case http.MethodDelete:
+				var options struct {
+					Preconditions struct {
+						UID string `json:"uid"`
+					} `json:"preconditions"`
+				}
+				if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&options)) {
+					http.Error(w, "invalid delete options JSON", http.StatusBadRequest)
+					return
+				}
+				assert.Equal(t, "sr-uid", options.Preconditions.UID)
+				steps = append(steps, "delete:gitea")
+			default:
+				t.Errorf("unexpected SR request %s", r.Method)
+			}
+		}))
+		defer server.Close()
+		helm := &managerTestHelm{steps: &steps, releases: []LabRelease{{Name: "il-first", Namespace: "alice-dev", CatalogRef: ref, Status: "deployed", UID: "helm-uid", Revision: 1}}}
+		manager := newManager(server, helm)
+		items, err := manager.List(ctx, "alice", "user-token")
+		require.NoError(t, err)
+		require.Len(t, items, 1)
+		listed, err := json.Marshal(items[0])
+		require.NoError(t, err)
+		var confirmation struct {
+			CatalogRef string `json:"catalogRef"`
+			Generation string `json:"generation"`
+		}
+		require.NoError(t, json.Unmarshal(listed, &confirmation))
+		assert.Equal(t, ref, confirmation.CatalogRef)
+		require.NotEmpty(t, confirmation.Generation)
+		require.Error(t, awaitTeardown(ctx, t, manager, ref, "stale"))
+		assert.Empty(t, steps)
+		require.NoError(t, awaitTeardown(ctx, t, manager, ref, confirmation.Generation))
+		assert.Equal(t, []string{"uninstall:il-first", "delete:gitea"}, steps)
+	})
+
+	t.Run("status exposes ready namespaces and deployed Helm with attributes", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+			_, _ = fmt.Fprintf(w, `{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+		}))
+		defer server.Close()
+		helm := &managerTestHelm{status: "deployed", releases: []LabRelease{{Name: HelmReleaseName("alice", ref, "setup/helm", bindings), Namespace: "alice-dev", CatalogRef: ref, UID: "helm-uid", Status: "deployed"}}}
+		status, err := statusWithBindings(t, newManager(server, helm), ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err)
+		payload, err := json.Marshal(status)
+		require.NoError(t, err)
+		var actual struct {
+			SpaceRequests struct {
+				Status     string `json:"status"`
+				Namespaces map[string]struct {
+					Status string `json:"status"`
+					Name   string `json:"name"`
+				} `json:"namespaces"`
+			} `json:"spaceRequests"`
+			Helm struct {
+				Status      string `json:"status"`
+				ReleaseName string `json:"releaseName"`
+			} `json:"helm"`
+			Attributes map[string]string `json:"attributes"`
+		}
+		require.NoError(t, json.Unmarshal(payload, &actual))
+		assert.Equal(t, "ready", actual.SpaceRequests.Status)
+		assert.Equal(t, "ready", actual.SpaceRequests.Namespaces["gitea"].Status)
+		assert.Equal(t, "alice-gitea", actual.SpaceRequests.Namespaces["gitea"].Name)
+		assert.Equal(t, "deployed", actual.Helm.Status)
+		assert.Equal(t, HelmReleaseName("alice", ref, "setup/helm", bindings), actual.Helm.ReleaseName)
+		assert.Equal(t, "alice-gitea", actual.Attributes["namespaces-gitea"])
+	})
+
+	t.Run("status read errors", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			srStatus  int
+			listErr   error
+			wantError bool
+		}{
+			{name: "SR NotFound remains pending", srStatus: http.StatusNotFound},
+			{name: "SR forbidden surfaces error", srStatus: http.StatusForbidden, wantError: true},
+			{name: "Helm snapshot discovery failure surfaces error", srStatus: http.StatusOK, listErr: errors.New("snapshot read failed user-token"), wantError: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, http.MethodGet, r.Method)
+					assert.Equal(t, "/apis/toolchain.dev.openshift.com/v1alpha1/namespaces/alice-dev/spacerequests/gitea", r.URL.Path)
+					assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+					w.WriteHeader(tc.srStatus)
+					if tc.srStatus == http.StatusOK {
+						_, _ = fmt.Fprintf(w, `{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+					}
+				}))
+				defer server.Close()
+				helm := &managerTestHelm{list: func(context.Context, []SpaceRequestResult) ([]LabRelease, error) {
+					return nil, tc.listErr
+				}}
+				statusBindings := append(append([]SchemaBinding(nil), bindings...), SchemaBinding{Key: "gitea.password", Path: "gitea.adminPassword", Kind: KindGeneratedPassword})
+				status, err := statusWithBindings(t, newManager(server, helm), ctx, "alice", "user-token", ref, statusBindings)
+				if tc.wantError {
+					require.Error(t, err, "read failure must not be reported as pending or as a usable deployment")
+					var managerErr *ManagerError
+					require.ErrorAs(t, err, &managerErr)
+					assert.Equal(t, ManagerBadGateway, managerErr.Kind)
+					assert.NotContains(t, err.Error(), "user-token")
+					assert.Empty(t, status.Attributes, "failed reads must not expose incomplete launch attributes")
+					return
+				}
+				require.NoError(t, err)
+				assert.Equal(t, "provisioning", status.SpaceRequests.Status)
+				assert.Equal(t, NamespaceStatus{Status: "pending", Name: "gitea"}, status.SpaceRequests.Namespaces["gitea"])
+				assert.Equal(t, "pending", status.Helm.Status)
+				assert.Empty(t, status.Attributes)
+			})
+		}
+	})
+
+	t.Run("status rejects unverified binding identity", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			change func(map[string]any)
+		}{
+			{"wrong name", func(meta map[string]any) { meta["name"] = "other" }},
+			{"wrong home namespace", func(meta map[string]any) { meta["namespace"] = "bob-dev" }},
+			{"missing UID", func(meta map[string]any) { delete(meta, "uid") }},
+			{"missing catalog label", func(meta map[string]any) { delete(meta, "labels") }},
+			{"unencoded catalog ref", func(meta map[string]any) { meta["labels"] = map[string]string{CatalogRefLabelKey: ref} }},
+			{"missing binding annotation", func(meta map[string]any) { delete(meta, "annotations") }},
+		} {
+			t.Run("given "+tc.name+" when polling then identity conflict exposes no attributes", func(t *testing.T) {
+				// Given a ready-looking but unverified binding.
+				meta := map[string]any{"name": "gitea", "namespace": "alice-dev", "uid": "sr-uid", "labels": map[string]string{CatalogRefLabelKey: label}, "annotations": map[string]string{BindingKeyAnnotation: "gitea"}}
+				tc.change(meta)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, http.MethodGet, r.Method)
+					_ = json.NewEncoder(w).Encode(map[string]any{"metadata": meta, "status": map[string]any{"conditions": []SpaceRequestCondition{{Type: "Ready", Status: "True"}}, "namespaceAccess": []SpaceRequestNamespaceAccess{{Name: "alice-gitea"}}}})
+				}))
+				defer server.Close()
+
+				// When polling the public status API.
+				status, err := statusWithBindings(t, newManager(server, nil), ctx, "alice", "user-token", ref, bindings)
+
+				// Then status preserves its exact conflict without releasing attributes.
+				var managerErr *ManagerError
+				require.ErrorAs(t, err, &managerErr)
+				assert.Equal(t, ManagerConflict, managerErr.Kind)
+				assert.Equal(t, "SpaceRequest identity changed; refresh before retrying.", managerErr.Message)
+				assert.Empty(t, status.Attributes)
+			})
+		}
+	})
+
+	t.Run("status works without Helm manager", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+			_, _ = fmt.Fprintf(w, `{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+		}))
+		defer server.Close()
+		status, err := statusWithBindings(t, newManager(server, nil), ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err)
+		assert.Equal(t, "ready", status.SpaceRequests.Status)
+		assert.Equal(t, NamespaceStatus{Status: "ready", Name: "alice-gitea"}, status.SpaceRequests.Namespaces["gitea"])
+		assert.Equal(t, "pending", status.Helm.Status)
+		assert.Equal(t, HelmReleaseName("alice", ref, "setup/helm", bindings), status.Helm.ReleaseName)
+	})
+}
+
+type slowTeardownHelm struct {
+	HelmManager
+	release LabRelease
+	started chan struct{}
+	proceed chan struct{}
+	fail    bool
+}
+
+func (h *slowTeardownHelm) ListLabReleases(_ context.Context, _, token string, _ []SpaceRequestResult) ([]LabRelease, error) {
+	if token != "user-token" {
+		return nil, fmt.Errorf("missing user token")
+	}
+	return []LabRelease{h.release}, nil
+}
+
+func (h *slowTeardownHelm) UninstallLabRelease(_ context.Context, _, _ string, _ LabRelease, _ []SpaceRequestResult) error {
+	close(h.started)
+	<-h.proceed
+	if h.fail {
+		return fmt.Errorf("uninstall failed")
+	}
+	return nil
+}
+
+func TestManagerAsyncTeardown(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		fail       bool
+	}{
+		{name: "completed", want: "succeeded"},
+		{name: "failed uninstall", want: "failed", fail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := strings.Repeat("ab", 32)
+			label, err := CatalogRefLabel(ref)
+			require.NoError(t, err)
+			sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+			deleted := make(chan struct{}, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+				switch r.Method {
+				case http.MethodGet:
+					if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+						_, _ = fmt.Fprintf(w, `{"items":[%s]}`, sr)
+					} else {
+						_, _ = fmt.Fprint(w, sr)
+					}
+				case http.MethodDelete:
+					deleted <- struct{}{}
+				default:
+					t.Errorf("unexpected SR request %s", r.Method)
+				}
+			}))
+			t.Cleanup(server.Close)
+			helm := &slowTeardownHelm{
+				release: LabRelease{Name: "il-lab", Namespace: "alice-dev", CatalogRef: ref, Status: "deployed", UID: "helm-uid", Revision: 1},
+				started: make(chan struct{}), proceed: make(chan struct{}), fail: tc.fail,
+			}
+			coord := NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns")
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, Coordinator: coord})
+			items, err := manager.List(context.Background(), "alice", "user-token")
+			require.NoError(t, err)
+			require.Len(t, items, 1)
+			_, err = manager.BeginTeardown(context.Background(), "alice", "user-token", ref, "stale")
+			require.Error(t, err)
+			assert.Empty(t, deleted)
+			requestCtx, cancel := context.WithCancel(context.Background())
+			status, err := manager.BeginTeardown(requestCtx, "alice", "user-token", ref, items[0].Generation)
+			require.NoError(t, err)
+			cancel()
+			assert.Equal(t, "running", status.Status)
+			require.Len(t, status.OperationID, 32)
+			select {
+			case <-helm.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("background uninstall did not start")
+			}
+			otherPod := NewManager(ManagerConfig{Coordinator: NewOperationCoordinator(coord.client, "plugin-ns")})
+			observed, err := otherPod.TeardownStatus(context.Background(), "alice", ref, status.OperationID)
+			require.NoError(t, err)
+			assert.Equal(t, "running", observed.Status)
+			discovered, err := otherPod.TeardownStatus(context.Background(), "alice", ref, "")
+			require.NoError(t, err)
+			assert.Equal(t, status.OperationID, discovered.OperationID)
+			assert.Equal(t, "running", discovered.Status)
+			assert.Empty(t, deleted, "SRs must not be deleted while Helm is running")
+			_, err = manager.BeginTeardown(context.Background(), "alice", "user-token", ref, items[0].Generation)
+			require.Error(t, err, "same lab may not overlap")
+			close(helm.proceed)
+			require.Eventually(t, func() bool {
+				observed, err = otherPod.TeardownStatus(context.Background(), "alice", ref, status.OperationID)
+				return err == nil && observed.Status == tc.want
+			}, 3*time.Second, 10*time.Millisecond)
+			if tc.fail {
+				assert.Empty(t, deleted)
+			} else {
+				assert.Len(t, deleted, 1)
+			}
+			_, err = manager.BeginTeardown(context.Background(), "alice", "user-token", ref, "stale")
+			require.Error(t, err)
+			observed, err = otherPod.TeardownStatus(context.Background(), "alice", ref, status.OperationID)
+			require.NoError(t, err, "rejected request must not replace previous receipt")
+			assert.Equal(t, tc.want, observed.Status)
+		})
+	}
+}
+
+func TestManagerHookInventory(t *testing.T) {
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	for _, tc := range []struct{ name, namespace, reason string }{
+		{"dedicated Job allowed", "alice-gitea", ""},
+		{"home Job blocked", "alice-dev", "helm-hook"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+				_, _ = fmt.Fprintf(w, `{"items":[{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"conditions":[{"type":"Ready","status":"True"}],"namespaceAccess":[{"name":"alice-gitea"}]}}]}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+			}))
+			t.Cleanup(srs.Close)
+			helm, mutations := cleanupTestHelm(t, &release.Release{
+				Name: "il-lab", Namespace: "alice-dev", Version: 1,
+				Labels: map[string]string{CatalogRefLabelKey: label}, Info: &release.Info{Status: release.StatusDeployed},
+				Hooks: []*release.Hook{{Kind: "Job", Manifest: fmt.Sprintf("apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: hook\n  namespace: %s\n", tc.namespace)}},
+			}, "helm-uid")
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: srs.URL, HTTPClient: srs.Client()}, Coordinator: NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns")})
+			items, err := manager.List(context.Background(), "alice", "user-token")
+			require.NoError(t, err)
+			require.Len(t, items, 1)
+			assert.Equal(t, tc.reason != "", items[0].Blocked)
+			assert.EqualValues(t, tc.reason, items[0].BlockedReason)
+			payload, err := json.Marshal(items[0])
+			require.NoError(t, err)
+			assert.NotContains(t, string(payload), "user-token")
+			assert.NotContains(t, string(payload), "apiVersion")
+			assert.NotContains(t, string(payload), "alice-gitea")
+			assert.Empty(t, *mutations)
+		})
+	}
+}
+
+func TestManagerHookTeardownRechecksSpaceRequests(t *testing.T) {
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	for _, tc := range []struct{ name, ready, target string }{
+		{"readiness lost before uninstall", "False", "alice-gitea"},
+		{"target changed before uninstall", "True", "replacement"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srJSON := func(ready, target string) string {
+				return fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"conditions":[{"type":"Ready","status":%q}],"namespaceAccess":[{"name":%q}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation, ready, target)
+			}
+			var srLists atomic.Int32
+			srs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method, "blocked Helm must not delete SRs")
+				assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+				if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+					current := srJSON("True", "alice-gitea")
+					if srLists.Add(1) > 3 {
+						current = srJSON(tc.ready, tc.target)
+					}
+					_, _ = fmt.Fprintf(w, `{"items":[%s]}`, current)
+				} else {
+					_, _ = fmt.Fprint(w, srJSON(tc.ready, tc.target))
+				}
+			}))
+			t.Cleanup(srs.Close)
+			helm, mutations := cleanupTestHelm(t, &release.Release{
+				Name: "il-lab", Namespace: "alice-dev", Version: 1,
+				Labels: map[string]string{CatalogRefLabelKey: label}, Info: &release.Info{Status: release.StatusDeployed},
+				Hooks: []*release.Hook{{Kind: "Job", Manifest: "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: hook\n  namespace: alice-gitea\n"}},
+			}, "helm-uid")
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: srs.URL, HTTPClient: srs.Client()}, Coordinator: NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns")})
+			items, err := manager.List(ctx, "alice", "user-token")
+			require.NoError(t, err)
+			require.Len(t, items, 1)
+			require.False(t, items[0].Blocked)
+			err = awaitTeardown(ctx, t, manager, ref, items[0].Generation)
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "user-token")
+			assert.Empty(t, *mutations)
+		})
+	}
+}
+
+func TestManagerCleanupReasonCodes(t *testing.T) {
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	for _, tc := range []struct {
+		name, status  string
+		reason        BlockedReason
+		blocked, held bool
+		want          BlockedReason
+	}{
+		{name: "eligible omits reason", status: "deployed"},
+		{name: "hook", status: "deployed", blocked: true, reason: BlockedHelmHook, want: BlockedHelmHook},
+		{name: "retained", status: "failed", blocked: true, reason: BlockedHelmRetained, want: BlockedHelmRetained},
+		{name: "manifest", status: "deployed", blocked: true, reason: BlockedHelmManifest, want: BlockedHelmManifest},
+		{name: "unknown", status: "deployed", blocked: true, want: BlockedUnknown},
+		{name: "raw reason suppressed", status: "deployed", blocked: true, reason: "raw Helm user-token", want: BlockedUnknown},
+		{name: "unheld pending install permits confirmed cleanup", status: "pending-install"},
+		{name: "pending install with unsafe hook blocked", status: "pending-install", blocked: true, reason: BlockedHelmHook, want: BlockedHelmState},
+		{name: "pending upgrade", status: "pending-upgrade", want: BlockedHelmState},
+		{name: "pending rollback", status: "pending-rollback", want: BlockedHelmState},
+		{name: "unknown Helm state", status: "unknown", want: BlockedHelmState},
+		{name: "operation overrides hook", status: "deployed", blocked: true, reason: BlockedHelmHook, held: true, want: BlockedOperation},
+		{name: "operation overrides Helm state", status: "pending-install", held: true, want: BlockedOperation},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				_, _ = fmt.Fprint(w, `{"items":[]}`)
+			}))
+			t.Cleanup(server.Close)
+			coord := NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns")
+			if tc.held {
+				_, release, err := coord.Acquire(ctx, "alice", ref)
+				require.NoError(t, err)
+				t.Cleanup(release)
+			}
+			helm := &managerTestHelm{}
+			if tc.status != "" {
+				helm.releases = []LabRelease{{Name: "il-lab", Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: tc.status, CleanupBlocked: tc.blocked, BlockedReason: tc.reason}}
+			}
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: coord})
+			items, err := manager.List(ctx, "alice", "user-token")
+			require.NoError(t, err)
+			require.Len(t, items, 1)
+			assert.Equal(t, tc.want != "", items[0].Blocked)
+			assert.Equal(t, tc.want, items[0].BlockedReason)
+			payload, err := json.Marshal(items[0])
+			require.NoError(t, err)
+			assert.NotContains(t, string(payload), "user-token")
+			if tc.want == "" {
+				assert.NotContains(t, string(payload), "blockedReason")
+			}
+		})
+	}
+}
+
+// Recovery must use the new request's token for discovery and worker handoff.
+type managerRecoveryHelm struct {
+	HelmManager
+	t        *testing.T
+	status   string
+	releases []LabRelease
+	install  func(HelmInstallOpts) error
+}
+
+func (h *managerRecoveryHelm) ListLabReleases(_ context.Context, namespace, token string, _ []SpaceRequestResult) ([]LabRelease, error) {
+	assert.Equal(h.t, "alice-dev", namespace)
+	assert.Equal(h.t, "fresh-token", token)
+	return h.releases, nil
+}
+
+func (h *managerRecoveryHelm) ReleaseStatus(_ context.Context, _, namespace, token string) (string, error) {
+	assert.Equal(h.t, "alice-dev", namespace)
+	assert.Equal(h.t, "fresh-token", token)
+	return h.status, nil
+}
+
+func (h *managerRecoveryHelm) Install(_ context.Context, opts HelmInstallOpts) error {
+	assert.Equal(h.t, "fresh-token", opts.Token)
+	if h.install == nil {
+		assert.Fail(h.t, "unexpected Helm install")
+		return fmt.Errorf("unexpected Helm install")
+	}
+	return h.install(opts)
+}
+
+type managerRecoveryCleanupHelm struct {
+	HelmManager
+	t       *testing.T
+	release LabRelease
+	steps   *[]string
+}
+
+func (h *managerRecoveryCleanupHelm) ListLabReleases(_ context.Context, _, token string, _ []SpaceRequestResult) ([]LabRelease, error) {
+	assert.Equal(h.t, "fresh-token", token)
+	return []LabRelease{h.release}, nil
+}
+
+func (h *managerRecoveryCleanupHelm) UninstallLabRelease(_ context.Context, _, token string, target LabRelease, _ []SpaceRequestResult) error {
+	assert.Equal(h.t, "fresh-token", token)
+	*h.steps = append(*h.steps, "uninstall:"+target.Name)
+	return nil
+}
+
+type managerRecoveryLossHelm struct {
+	HelmManager
+	coordinator *OperationCoordinator
+	cancelled   chan bool
+}
+
+func (h *managerRecoveryLossHelm) ListLabReleases(ctx context.Context, _, _ string, _ []SpaceRequestResult) ([]LabRelease, error) {
+	leases := h.coordinator.client.CoordinationV1().Leases("plugin-ns")
+	current, err := leases.Get(ctx, operationLeaseName("alice", strings.Repeat("ab", 32)), metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	successor := strings.Repeat("f", 32)
+	current.Spec.HolderIdentity = &successor
+	if _, err = leases.Update(ctx, current, metav1.UpdateOptions{}); err != nil {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		h.cancelled <- true
+		return nil, ctx.Err()
+	case <-time.After(22 * time.Second):
+		h.cancelled <- false
+		return nil, fmt.Errorf("preflight ignored lost ownership")
+	}
+}
+
+func TestManagerRestartRecovery(t *testing.T) {
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
+	stale := metav1.NewMicroTime(time.Now().Add(-201 * time.Second))
+	fresh := metav1.NewMicroTime(time.Now())
+	newManager := func(t *testing.T, helm HelmManager, renewed *metav1.MicroTime) *Manager {
+		t.Helper()
+		client := coordinatorTestClient(coordinatorHeldLease(t, ref, renewed))
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer fresh-token", r.Header.Get("Authorization"))
+			if !assert.Equal(t, http.MethodGet, r.Method, "recovery must reuse existing SRs without mutation") {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+			if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+				assert.Equal(t, CatalogRefLabelKey+"="+label, r.URL.Query().Get("labelSelector"))
+				_, _ = fmt.Fprintf(w, `{"items":[%s]}`, sr)
+			} else {
+				assert.True(t, strings.HasSuffix(r.URL.Path, "/spacerequests/gitea"))
+				_, _ = fmt.Fprint(w, sr)
+			}
+		}))
+		t.Cleanup(server.Close)
+		return NewManager(ManagerConfig{
+			Helm: helm, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL},
+			Coordinator: NewOperationCoordinator(client, "plugin-ns"),
+		})
+	}
+
+	t.Run("status offers retry only for expired reservation without Helm release", func(t *testing.T) {
+		for _, tc := range []struct {
+			name       string
+			renewed    *metav1.MicroTime
+			helmStatus string
+			wantRetry  bool
+		}{
+			{"stale without release", &stale, "", true},
+			{"live without release", &fresh, "", false},
+			{"deployed release", &stale, "deployed", false},
+			{"pending release", &stale, "pending-install", false},
+			{"failed release", &stale, "failed", false},
+		} {
+			helm := &managerRecoveryHelm{t: t, status: tc.helmStatus}
+			if tc.helmStatus != "" {
+				helm.releases = []LabRelease{{Name: "il-recovered", Namespace: "alice-dev", CatalogRef: ref, UID: "helm-uid", Status: tc.helmStatus}}
+			}
+			manager := newManager(t, helm, tc.renewed)
+			status, err := statusWithBindings(t, manager, ctx, "alice", "fresh-token", ref, bindings)
+			require.NoError(t, err, tc.name)
+			assert.Equal(t, "ready", status.SpaceRequests.Status, tc.name)
+			// Specify RetrySetup's json:"retrySetup,omitempty" contract while
+			// keeping the red test runnable before the field is implemented.
+			payload, err := json.Marshal(status)
+			require.NoError(t, err)
+			var wire map[string]any
+			require.NoError(t, json.Unmarshal(payload, &wire))
+			if tc.wantRetry {
+				assert.Equal(t, true, wire["retrySetup"], tc.name)
+			} else {
+				assert.NotContains(t, wire, "retrySetup", tc.name)
+			}
+			if tc.helmStatus == "pending-install" {
+				assert.Equal(t, "failed", status.Helm.Status, "an orphaned Helm install must not spin forever")
+				assert.NotEmpty(t, status.Helm.Message)
+			}
+			assert.NotContains(t, string(payload), "fresh-token")
+		}
+	})
+
+	t.Run("given expired Lease and terminal SR failure without release when polling then setup retry stays disabled", func(t *testing.T) {
+		// Given a terminal binding failure after the setup reservation expired.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodGet, r.Method)
+			assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+			_, _ = fmt.Fprintf(w, `{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"conditions":[{"type":"Ready","status":"False","reason":"UnableToCreateSpace"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+		}))
+		t.Cleanup(server.Close)
+		client := coordinatorTestClient(coordinatorHeldLease(t, ref, &stale))
+		leaseReads := 0
+		client.PrependReactor("get", "leases", func(ktesting.Action) (bool, runtime.Object, error) {
+			leaseReads++
+			return false, nil, nil
+		})
+		manager := NewManager(ManagerConfig{Helm: &managerTestHelm{}, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, Coordinator: NewOperationCoordinator(client, "plugin-ns")})
+
+		// When polling through the public status API.
+		status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+
+		// Then the terminal SR failure suppresses retry and receipt lookup.
+		require.NoError(t, err)
+		assert.Equal(t, "failed", status.SpaceRequests.Status)
+		assert.Equal(t, NamespaceStatus{Status: "failed", Name: "gitea"}, status.SpaceRequests.Namespaces["gitea"])
+		assert.Equal(t, "pending", status.Helm.Status)
+		assert.False(t, status.RetrySetup)
+		assert.Empty(t, status.Attributes)
+		assert.Equal(t, 1, leaseReads, "check current holder, but never offer recovery for a terminal SR failure")
+	})
+
+	t.Run("interrupted pending install can be explicitly torn down without administrator", func(t *testing.T) {
+		steps := []string{}
+		release := LabRelease{Name: "il-lab", Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: "pending-install", Revision: 1}
+		helm := &managerRecoveryCleanupHelm{t: t, release: release, steps: &steps}
+		sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer fresh-token", r.Header.Get("Authorization"))
+			switch r.Method {
+			case http.MethodGet:
+				if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+					_, _ = fmt.Fprintf(w, `{"items":[%s]}`, sr)
+				} else {
+					_, _ = fmt.Fprint(w, sr)
+				}
+			case http.MethodDelete:
+				steps = append(steps, "delete:gitea")
+			default:
+				t.Errorf("unexpected SpaceRequest call %s", r.Method)
+			}
+		}))
+		t.Cleanup(server.Close)
+		manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, Coordinator: NewOperationCoordinator(coordinatorTestClient(coordinatorHeldLease(t, ref, &stale)), "plugin-ns")})
+		items, err := manager.List(ctx, "alice", "fresh-token")
+		require.NoError(t, err)
+		require.Len(t, items, 1)
+		assert.Equal(t, "failed", items[0].Status)
+		assert.False(t, items[0].Blocked)
+		started, err := manager.BeginTeardown(ctx, "alice", "fresh-token", ref, items[0].Generation)
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			status, err := manager.TeardownStatus(ctx, "alice", ref, started.OperationID)
+			return err == nil && status.Status == "succeeded"
+		}, time.Second, time.Millisecond)
+		assert.Equal(t, []string{"uninstall:il-lab", "delete:gitea"}, steps)
+	})
+
+	t.Run("teardown receipt stops old setup polling from recreating lab", func(t *testing.T) {
+		manager := newManager(t, &managerRecoveryHelm{t: t}, &stale)
+		leases := manager.config.Coordinator.client.CoordinationV1().Leases("plugin-ns")
+		lease, err := leases.Get(ctx, operationLeaseName("alice", ref), metav1.GetOptions{})
+		require.NoError(t, err)
+		empty := ""
+		lease.Spec.HolderIdentity = &empty
+		lease.Annotations[teardownIDAnnotation] = strings.Repeat("f", 32)
+		lease.Annotations[teardownStatusAnnotation] = "succeeded"
+		_, err = leases.Update(ctx, lease, metav1.UpdateOptions{})
+		require.NoError(t, err)
+		status, err := statusWithBindings(t, manager, ctx, "alice", "fresh-token", ref, bindings)
+		require.NoError(t, err)
+		assert.False(t, status.RetrySetup)
+		assert.Equal(t, "failed", status.Helm.Status, "old polling tab must stop after teardown")
+		assert.Contains(t, status.Helm.Message, "torn down")
+	})
+
+	t.Run("lost Lease cancels preflight before further SR mutations", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			coord := NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")
+			helm := &managerRecoveryLossHelm{coordinator: coord, cancelled: make(chan bool, 1)}
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{}, Coordinator: coord})
+			_, _, err := startWithBindings(t, manager, ctx, "alice", "fresh-token", ref, bindings)
+			require.Error(t, err)
+			assert.True(t, <-helm.cancelled, "preflight must inherit operation cancellation")
+		})
+	})
+
+	t.Run("stale takeover uses fresh token and verified SRs but refuses pending Helm", func(t *testing.T) {
+		started, finish := make(chan HelmInstallOpts, 1), make(chan struct{})
+		helm := &managerRecoveryHelm{t: t, install: func(opts HelmInstallOpts) error {
+			started <- opts
+			<-finish
+			return nil
+		}}
+		manager := newManager(t, helm, &stale)
+		defer func() {
+			close(finish)
+			require.Eventually(t, func() bool { return !manager.config.Coordinator.IsHeld(ctx, "alice", ref) }, time.Second, time.Millisecond)
+		}()
+		status, ready, err := startWithBindings(t, manager, ctx, "alice", "fresh-token", ref, bindings)
+		require.NoError(t, err)
+		assert.False(t, ready)
+		assert.Equal(t, "provisioning", status.SpaceRequests.Status)
+		var opts HelmInstallOpts
+		select {
+		case opts = <-started:
+		case <-time.After(time.Second):
+			require.FailNow(t, "recovery did not start Helm worker")
+		}
+		assert.Equal(t, "fresh-token", opts.Token)
+		assert.True(t, filepath.IsAbs(opts.ChartDir))
+		assert.Equal(t, "helm", filepath.Base(opts.ChartDir))
+		assert.Equal(t, "alice-dev", opts.Namespace)
+		assert.Equal(t, HelmReleaseName("alice", ref, "setup/helm", bindings), opts.ReleaseName)
+		assert.Equal(t, map[string]string{"namespaces.gitea": "alice-gitea"}, opts.Values)
+		assert.Equal(t, map[string]string{CatalogRefLabelKey: label}, opts.Labels)
+		assert.True(t, manager.config.Coordinator.IsHeld(ctx, "alice", ref))
+
+		// A restarted manager must inspect Helm even when inventory misses
+		// its pending release; an expired reservation alone permits no install.
+		pending := newManager(t, &managerRecoveryHelm{t: t, status: "pending-install"}, &stale)
+		_, ready, err = startWithBindings(t, pending, ctx, "alice", "fresh-token", ref, bindings)
+		var managerErr *ManagerError
+		require.ErrorAs(t, err, &managerErr)
+		assert.Equal(t, ManagerConflict, managerErr.Kind)
+		assert.False(t, ready)
+		assert.False(t, pending.config.Coordinator.IsHeld(ctx, "alice", ref))
+	})
+}
+
+type managerRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f managerRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestManagerWorkerValues(t *testing.T) {
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"conditions":[{"type":"Ready","status":"True"}],"namespaceAccess":[{"name":"alice-gitea"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+	t.Run("given mixed kinds with overlapping keys when worker runs then only namespace bindings identify the release", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// Given namespace and password bindings share a key alongside root URL and plain values.
+			ctx := context.Background()
+			workerFinished := false
+			client := managerWorkerValuesClient(t, sr, "", 0, &workerFinished)
+			var installed []HelmInstallOpts
+			manager, helm := managerWorkerValuesManager(client, "apps.example.com", &installed)
+			bindings := []SchemaBinding{
+				{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName},
+				{Path: "gitea.rootUrl", Kind: KindRootURL, RouteName: "gitea", NamespaceRef: "gitea"},
+				{Key: "gitea", Path: "admin.password", Kind: KindGeneratedPassword},
+				{Key: "username", Path: "admin.username", Kind: "value"},
+			}
+
+			// When setup hands off to the worker.
+			status, ready, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+			require.NoError(t, err)
+			assert.False(t, ready)
+			synctest.Wait()
+			workerFinished = true
+
+			// Then only namespace bindings drive SR reads and release identity.
+			assert.False(t, manager.config.Coordinator.IsHeld(ctx, "alice", ref))
+			require.Len(t, installed, 1)
+			assert.Equal(t, "alice-gitea", installed[0].Values["namespaces.gitea"])
+			assert.Equal(t, "gitea-alice-gitea.apps.example.com", installed[0].Values["gitea.rootUrl"])
+			assert.Equal(t, map[string]string{CatalogRefLabelKey: label}, installed[0].Labels)
+			wantName := HelmReleaseName("alice", ref, "setup/helm", []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}})
+			assert.Equal(t, wantName, status.Helm.ReleaseName)
+			assert.Equal(t, []string{wantName}, helm.statusNames)
+			assert.Equal(t, wantName, installed[0].ReleaseName)
+			assert.Len(t, installed[0].Values["admin.password"], passwordLength)
+			assert.NotContains(t, installed[0].Values, "admin.username")
+
+			// Non-namespace bindings must not make a deployed lab's SRs drift when reopening.
+			helm.releases = []LabRelease{{Name: wantName, Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: "deployed"}}
+			opened, ready, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+			require.NoError(t, err)
+			assert.True(t, ready)
+			assert.Equal(t, wantName, opened.Helm.ReleaseName)
+		})
+	})
+
+	for _, tc := range []struct {
+		name, ingress, rootRef, message string
+		workerBody                      string
+		workerCode                      int
+	}{
+		{name: "ready namespace and root URL map to Helm values", ingress: "apps.example.com", rootRef: "gitea"},
+		{name: "root URL without ingress fails safely", rootRef: "gitea", message: "cluster ingress domain not configured"},
+		{name: "root URL with unknown namespace fails safely", ingress: "apps.example.com", rootRef: "unknown", message: "root-url references unknown namespace binding"},
+		{name: "SR not ready after handoff", workerBody: strings.ReplaceAll(sr, `"status":"True"`, `"status":"False"`)},
+		{name: "SR missing after handoff", workerCode: http.StatusNotFound},
+		{name: "SR read denied after handoff", workerCode: http.StatusForbidden},
+		{name: "SR UID replaced after handoff", workerBody: strings.ReplaceAll(sr, "sr-uid", "replacement")},
+		{name: "SR UID missing after handoff", workerBody: strings.ReplaceAll(sr, "sr-uid", "")},
+		{name: "SR name changed after handoff", workerBody: strings.ReplaceAll(sr, `"name":"gitea"`, `"name":"other"`)},
+		{name: "SR home namespace changed after handoff", workerBody: strings.ReplaceAll(sr, "alice-dev", "bob-dev")},
+		{name: "SR foreign label after handoff", workerBody: strings.ReplaceAll(sr, label, "foreign")},
+		{name: "SR binding mark changed after handoff", workerBody: strings.ReplaceAll(sr, `:"gitea"}`, `:"other"}`)},
+		{name: "SR terminating after handoff", workerBody: strings.ReplaceAll(sr, `"uid":"sr-uid"`, `"uid":"sr-uid","deletionTimestamp":"2026-10-01T00:00:00Z"`)},
+		{name: "SR ready without target after handoff", workerBody: strings.ReplaceAll(sr, "alice-gitea", "")},
+	} {
+		t.Run("given "+tc.name+" when worker runs then only verified values install", func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				// Given a ready preflight SR and the configured worker response.
+				ctx := context.Background()
+				workerFinished := false
+				client := managerWorkerValuesClient(t, sr, tc.workerBody, tc.workerCode, &workerFinished)
+				var installed []HelmInstallOpts
+				manager, _ := managerWorkerValuesManager(client, tc.ingress, &installed)
+				bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
+				if tc.rootRef != "" {
+					bindings = append(bindings, SchemaBinding{Path: "gitea.rootUrl", Kind: KindRootURL, RouteName: "gitea", NamespaceRef: tc.rootRef})
+				}
+
+				// When setup hands off to the worker.
+				_, ready, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+				require.NoError(t, err)
+				assert.False(t, ready)
+				synctest.Wait()
+				if tc.workerBody != "" || tc.workerCode != 0 {
+					assert.Empty(t, installed, "post-handoff read must not install stale preflight values")
+					time.Sleep(31 * time.Minute) // Virtual polling timeout, not wall-clock delay.
+					synctest.Wait()
+				}
+				workerFinished = true
+
+				// Then only verified values install, or a safe failure is reported.
+				assert.False(t, manager.config.Coordinator.IsHeld(ctx, "alice", ref))
+				if tc.message == "" && tc.workerBody == "" && tc.workerCode == 0 {
+					require.Len(t, installed, 1)
+					assert.Equal(t, "alice-gitea", installed[0].Values["namespaces.gitea"])
+					assert.Equal(t, "gitea-alice-gitea.apps.example.com", installed[0].Values["gitea.rootUrl"])
+					assert.Equal(t, map[string]string{CatalogRefLabelKey: label}, installed[0].Labels)
+				} else {
+					assert.Empty(t, installed)
+					status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+					require.NoError(t, err)
+					assert.Equal(t, "failed", status.Helm.Status)
+					message := tc.message
+					if message == "" {
+						message = "timed out waiting for SpaceRequests"
+					}
+					assert.Equal(t, message, status.Helm.Message)
+					assert.NotContains(t, status.Helm.Message, "user-token")
+				}
+			})
+		})
+	}
+}
+
+func managerWorkerValuesClient(t *testing.T, sr, workerBody string, workerCode int, workerFinished *bool) *http.Client {
+	t.Helper()
+	namedGets := 0
+	return &http.Client{Transport: managerRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+		body, code := sr, http.StatusOK
+		if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+			body = `{"items":[` + sr + `]}`
+		} else {
+			assert.True(t, strings.HasSuffix(r.URL.Path, "/spacerequests/gitea"), "only namespace bindings may read SRs")
+			namedGets++
+			if namedGets > 2 && !*workerFinished {
+				if workerBody != "" {
+					body = workerBody
+				}
+				if workerCode != 0 {
+					code = workerCode
+				}
+			}
+		}
+		return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+}
+
+func managerWorkerValuesManager(client *http.Client, ingress string, installed *[]HelmInstallOpts) (*Manager, *managerTestHelm) {
+	helm := &managerTestHelm{installOpts: func(_ context.Context, opts HelmInstallOpts) error {
+		*installed = append(*installed, opts)
+		return nil
+	}}
+	coord := NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")
+	manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: "https://cluster.test", HTTPClient: client}, Coordinator: coord, ClusterIngressDomain: ingress})
+	return manager, helm
+}
+
+func TestManagerLabBindingReadback(t *testing.T) {
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"conditions":[{"type":"Ready","status":"True"}],"namespaceAccess":[{"name":"alice-gitea"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+	for _, tc := range []struct {
+		name, body, tier string
+		code             int
+		create           bool
+		wantReady        bool
+	}{
+		{name: "replacement UID before final readback", body: strings.ReplaceAll(sr, "sr-uid", "readback-uid"), wantReady: true},
+		{name: "new binding uses default tier", body: sr, create: true, wantReady: true},
+		{name: "new binding uses configured tier", body: sr, tier: "custom-tier", create: true, wantReady: true},
+		{name: "missing final readback", code: http.StatusNotFound},
+		{name: "denied final readback", code: http.StatusForbidden},
+		{name: "malformed final readback", body: "user-token"},
+		{name: "wrong resource name", body: strings.ReplaceAll(sr, `"name":"gitea"`, `"name":"other"`)},
+		{name: "wrong home namespace", body: strings.ReplaceAll(sr, "alice-dev", "bob-dev")},
+		{name: "missing UID", body: strings.ReplaceAll(sr, "sr-uid", "")},
+		{name: "unencoded catalog ref", body: strings.ReplaceAll(sr, label, ref)},
+		{name: "wrong binding annotation", body: strings.ReplaceAll(sr, `:"gitea"}`, `:"other"}`)},
+		{name: "terminating final readback", body: strings.ReplaceAll(sr, `"uid":"sr-uid"`, `"uid":"sr-uid","deletionTimestamp":"2026-10-01T00:00:00Z"`)},
+	} {
+		t.Run("given "+tc.name+" when starting then final fresh identity gates worker handoff", func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				// Given Ensure observes an earlier snapshot than the final GET.
+				namedGets := 0
+				steps := []string{}
+				client := &http.Client{Transport: managerRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+					assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+					body, code := sr, http.StatusOK
+					if r.Method == http.MethodPost {
+						steps = append(steps, "create")
+						var posted struct {
+							Spec struct {
+								TierName string `json:"tierName"`
+							} `json:"spec"`
+						}
+						require.NoError(t, json.NewDecoder(r.Body).Decode(&posted))
+						wantTier := tc.tier
+						if wantTier == "" {
+							wantTier = "base1ns"
+						}
+						assert.Equal(t, wantTier, posted.Spec.TierName)
+						code = http.StatusCreated
+					} else if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+						steps = append(steps, "list")
+						body = `{"items":[]}`
+					} else {
+						assert.Equal(t, http.MethodGet, r.Method)
+						namedGets++
+						steps = append(steps, fmt.Sprintf("get:%d", namedGets))
+						if namedGets == 1 && tc.create {
+							code = http.StatusNotFound
+						} else if namedGets > 1 {
+							body = tc.body
+							if tc.code != 0 {
+								code = tc.code
+							}
+						}
+					}
+					return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+				})}
+				helm := &managerTestHelm{installOpts: func(ctx context.Context, opts HelmInstallOpts) error {
+					require.NoError(t, ctx.Err())
+					assert.Equal(t, "alice-gitea", opts.Values["namespaces.gitea"])
+					steps = append(steps, "install")
+					return nil
+				}}
+				coord := NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")
+				manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: "https://cluster.test", HTTPClient: client}, Coordinator: coord, TierName: tc.tier})
+				bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}}
+
+				// When Start ensures and rereads the binding before launching the worker.
+				status, ready, err := startWithBindings(t, manager, context.Background(), "alice", "user-token", ref, bindings)
+				synctest.Wait()
+
+				// Then only the fresh GET's UID is pinned for worker verification.
+				assert.False(t, ready)
+				wantSteps := []string{"list", "get:1"}
+				if tc.create {
+					wantSteps = append(wantSteps, "create")
+				}
+				wantSteps = append(wantSteps, "get:2")
+				if tc.wantReady {
+					require.NoError(t, err)
+					assert.Equal(t, "provisioning", status.SpaceRequests.Status)
+					wantSteps = append(wantSteps, "get:3", "install")
+				} else {
+					var managerErr *ManagerError
+					require.ErrorAs(t, err, &managerErr)
+					assert.Equal(t, ManagerConflict, managerErr.Kind)
+					assert.Equal(t, "SpaceRequest identity changed; refresh before retrying.", managerErr.Message)
+					assert.NotContains(t, err.Error(), "user-token")
+				}
+				assert.Equal(t, wantSteps, steps)
+				assert.False(t, coord.IsHeld(context.Background(), "alice", ref))
+			})
+		})
+	}
+}
+
+func TestManagerTeardownHandoff(t *testing.T) {
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	foreignLabel, err := CatalogRefLabel(strings.Repeat("cd", 32))
+	require.NoError(t, err)
+	sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+	for _, tc := range []struct {
+		name, current string
+		wantSuccess   bool
+	}{
+		{"confirmed release avoids worker Helm inventory", sr, true},
+		{"SR missing after reservation", "", false},
+		{"foreign label after reservation", strings.ReplaceAll(sr, label, foreignLabel), false},
+		{"UID replaced after reservation", strings.ReplaceAll(sr, "sr-uid", "replacement"), false},
+		{"UID missing after reservation", strings.ReplaceAll(sr, "sr-uid", ""), false},
+		{"identity mark removed after reservation", strings.ReplaceAll(sr, label, ""), false},
+		{"binding changed after reservation", strings.ReplaceAll(sr, `:"gitea"}`, `:"other"}`), false},
+	} {
+		t.Run("given "+tc.name+" when teardown starts then mutation rechecks identity", func(t *testing.T) {
+			var srLists, helmLists atomic.Int32
+			steps := []string{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+				switch r.Method {
+				case http.MethodGet:
+					if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+						current := sr
+						if srLists.Add(1) > 3 {
+							current = tc.current
+						}
+						_, _ = fmt.Fprintf(w, `{"items":[%s]}`, current)
+					} else if tc.current == "" {
+						w.WriteHeader(http.StatusNotFound)
+					} else {
+						_, _ = fmt.Fprint(w, tc.current)
+					}
+				case http.MethodDelete:
+					steps = append(steps, "delete:gitea")
+				default:
+					t.Errorf("unexpected request %s", r.Method)
+				}
+			}))
+			t.Cleanup(server.Close)
+			helm := &managerTestHelm{steps: &steps, list: func(_ context.Context, _ []SpaceRequestResult) ([]LabRelease, error) {
+				helmLists.Add(1)
+				return []LabRelease{{Name: "il-lab", Namespace: "alice-dev", CatalogRef: ref, UID: "helm-uid", Revision: 1, Status: "deployed"}}, nil
+			}}
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")})
+			items, err := manager.List(ctx, "alice", "user-token")
+			require.NoError(t, err)
+			require.Len(t, items, 1)
+			err = awaitTeardown(ctx, t, manager, ref, items[0].Generation)
+			if tc.wantSuccess {
+				require.NoError(t, err)
+				assert.Equal(t, []string{"uninstall:il-lab", "delete:gitea"}, steps)
+			} else {
+				require.Error(t, err)
+				assert.Empty(t, steps)
+			}
+			assert.EqualValues(t, 4, srLists.Load(), "list, pre-acquire confirmation, post-acquire confirmation, fresh worker SR-only inventory")
+			assert.EqualValues(t, 3, helmLists.Load())
+		})
+	}
+
+	for _, created := range []bool{false, true} {
+		t.Run(fmt.Sprintf("given another lab shares hook namespace after reservation created=%t then real Helm rejects uninstall", created), func(t *testing.T) {
+			otherLabel, err := CatalogRefLabel(strings.Repeat("cd", 32))
+			require.NoError(t, err)
+			srJSON := func(name, identity, target string) string {
+				return fmt.Sprintf(`{"metadata":{"name":%q,"namespace":"alice-dev","uid":%q,"labels":{%q:%q},"annotations":{%q:%q}},"status":{"conditions":[{"type":"Ready","status":"True"}],"namespaceAccess":[{"name":%q}]}}`, name, name+"-uid", CatalogRefLabelKey, identity, BindingKeyAnnotation, name, target)
+			}
+			var srLists atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method, "shared hooks must not mutate SRs")
+				assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+				if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+					count := srLists.Add(1)
+					other := ""
+					if !created || count > 3 {
+						target := "alice-other"
+						if count > 3 {
+							target = "alice-gitea"
+						}
+						other = "," + srJSON("other", otherLabel, target)
+					}
+					_, _ = fmt.Fprintf(w, `{"items":[%s%s]}`, srJSON("gitea", label, "alice-gitea"), other)
+				} else if strings.HasSuffix(r.URL.Path, "/other") {
+					_, _ = fmt.Fprint(w, srJSON("other", otherLabel, "alice-gitea"))
+				} else {
+					_, _ = fmt.Fprint(w, srJSON("gitea", label, "alice-gitea"))
+				}
+			}))
+			t.Cleanup(server.Close)
+			helm, mutations := cleanupTestHelm(t, &release.Release{
+				Name: "il-lab", Namespace: "alice-dev", Version: 1,
+				Labels: map[string]string{CatalogRefLabelKey: label}, Info: &release.Info{Status: release.StatusDeployed},
+				Hooks: []*release.Hook{{Manifest: "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: hook\n  namespace: alice-gitea\n"}},
+			}, "helm-uid")
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")})
+			items, err := manager.List(ctx, "alice", "user-token")
+			require.NoError(t, err)
+			if created {
+				require.Len(t, items, 1)
+			} else {
+				require.Len(t, items, 2)
+			}
+			require.False(t, items[0].Blocked)
+			require.Error(t, awaitTeardown(ctx, t, manager, ref, items[0].Generation))
+			assert.Empty(t, *mutations, "worker must discover current cross-ref SR namespace sharing")
+		})
+	}
+
+	for _, withRelease := range []bool{false, true} {
+		for _, replaced := range []bool{false, true} {
+			t.Run(fmt.Sprintf("given unrelated SR changes after reservation release=%t replaced=%t when teardown runs then own setup is cleaned", withRelease, replaced), func(t *testing.T) {
+				otherLabel, err := CatalogRefLabel(strings.Repeat("cd", 32))
+				require.NoError(t, err)
+				other := strings.ReplaceAll(strings.ReplaceAll(sr, "gitea", "other"), label, otherLabel)
+				var srLists atomic.Int32
+				steps := []string{}
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+					switch r.Method {
+					case http.MethodGet:
+						if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+							currentOther := other
+							if srLists.Add(1) > 3 {
+								currentOther = ""
+								if replaced {
+									currentOther = strings.ReplaceAll(other, "sr-uid", "replacement")
+								}
+							}
+							if currentOther != "" {
+								currentOther = "," + currentOther
+							}
+							_, _ = fmt.Fprintf(w, `{"items":[%s%s]}`, sr, currentOther)
+						} else if strings.HasSuffix(r.URL.Path, "/other") {
+							if replaced {
+								_, _ = fmt.Fprint(w, strings.ReplaceAll(other, "sr-uid", "replacement"))
+							} else {
+								w.WriteHeader(http.StatusNotFound)
+							}
+						} else {
+							_, _ = fmt.Fprint(w, sr)
+						}
+					case http.MethodDelete:
+						assert.True(t, strings.HasSuffix(r.URL.Path, "/gitea"))
+						steps = append(steps, "delete:gitea")
+					default:
+						t.Errorf("unexpected request %s", r.Method)
+					}
+				}))
+				t.Cleanup(server.Close)
+				helm := &managerTestHelm{steps: &steps}
+				wantSteps := []string{"delete:gitea"}
+				if withRelease {
+					helm.releases = []LabRelease{{Name: "il-lab", Namespace: "alice-dev", CatalogRef: ref, UID: "helm-uid", Revision: 1, Status: "deployed"}}
+					wantSteps = []string{"uninstall:il-lab", "delete:gitea"}
+				}
+				manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")})
+				items, err := manager.List(ctx, "alice", "user-token")
+				require.NoError(t, err)
+				require.Len(t, items, 2)
+				require.NoError(t, awaitTeardown(ctx, t, manager, ref, items[0].Generation))
+				assert.Equal(t, wantSteps, steps)
+			})
+		}
+	}
+}
+
+// Name-based reads must never participate in a setup status snapshot.
+type managerSnapshotOnlyHelm struct {
+	HelmManager
+	lists, statusReads int
+}
+
+func (h *managerSnapshotOnlyHelm) ListLabReleases(ctx context.Context, namespace, token string, srs []SpaceRequestResult) ([]LabRelease, error) {
+	h.lists++
+	return h.HelmManager.ListLabReleases(ctx, namespace, token, srs)
+}
+
+func (h *managerSnapshotOnlyHelm) ReleaseStatus(context.Context, string, string, string) (string, error) {
+	h.statusReads++
+	return "", errors.New("unexpected name-based status read")
+}
+
+func TestManagerVerifiedRelease(t *testing.T) {
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	bindings := []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}, {Path: "admin.password", Kind: KindGeneratedPassword}}
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+		if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+			_, _ = fmt.Fprintf(w, `{"items":[%s]}`, sr)
+		} else {
+			_, _ = fmt.Fprint(w, sr)
+		}
+	}))
+	t.Cleanup(server.Close)
+	newManager := func(helm HelmManager) *Manager {
+		return NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")})
+	}
+	verified := LabRelease{Name: "il-original-schema", Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: "deployed", Revision: 1, CleanupBlocked: true}
+
+	t.Run("given a marked snapshot when polling then no name-based rereads supply status or values", func(t *testing.T) {
+		label, err := CatalogRefLabel(ref)
+		require.NoError(t, err)
+		client, mutations := cleanupTestHelm(t, &release.Release{
+			Name: verified.Name, Namespace: "alice-dev", Version: 1,
+			Labels: map[string]string{CatalogRefLabelKey: label}, Info: &release.Info{Status: release.StatusDeployed},
+			Config: map[string]interface{}{
+				"admin": map[string]interface{}{"password": "snapshot-password", "unrequested": "private-secret"},
+				"token": "private-token",
+			},
+		}, "helm-uid")
+		helm := &managerSnapshotOnlyHelm{HelmManager: client}
+		status, err := statusWithBindings(t, newManager(helm), ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err)
+		assert.Equal(t, 1, helm.lists)
+		assert.Zero(t, helm.statusReads)
+		assert.Equal(t, verified.Name, status.Helm.ReleaseName, "schema-derived name must not replace discovered name")
+		assert.Equal(t, "deployed", status.Helm.Status)
+		assert.Empty(t, status.Helm.Message)
+		assert.Equal(t, map[string]string{"admin-password": "snapshot-password", "namespaces-gitea": "alice-gitea"}, status.Attributes)
+		payload, err := json.Marshal(status)
+		require.NoError(t, err)
+		assert.NotContains(t, string(payload), "private-secret")
+		assert.NotContains(t, string(payload), "private-token")
+		assert.NotContains(t, string(payload), "generatedValues")
+		items, err := newManager(helm).List(ctx, "alice", "user-token")
+		require.NoError(t, err)
+		require.Len(t, items, 1)
+		require.NotNil(t, items[0].Release)
+		assert.Nil(t, items[0].Release.Config, "inventory must not retain full Config, even internally")
+		payload, err = json.Marshal(items)
+		require.NoError(t, err)
+		assert.NotContains(t, string(payload), "snapshot-password")
+		assert.NotContains(t, string(payload), "private-secret")
+		assert.NotContains(t, string(payload), "private-token")
+		assert.Empty(t, *mutations)
+	})
+
+	t.Run("given invalid chart values when polling then safe error leaves cleanup independent", func(t *testing.T) {
+		// Given a real coalescing failure in the verified release snapshot.
+		ch := &chart.Chart{Metadata: &chart.Metadata{Name: "lab", Version: "1.0.0"}}
+		ch.AddDependency(&chart.Chart{Metadata: &chart.Metadata{Name: "child", Version: "1.0.0"}})
+		config := map[string]interface{}{"child": "private-invalid-value"}
+		_, err := chartutil.CoalesceValues(ch, config)
+		require.Error(t, err)
+		label, err := CatalogRefLabel(ref)
+		require.NoError(t, err)
+		client, mutations := cleanupTestHelm(t, &release.Release{
+			Name: verified.Name, Namespace: "alice-dev", Version: 1,
+			Labels: map[string]string{CatalogRefLabelKey: label}, Info: &release.Info{Status: release.StatusDeployed}, Chart: ch, Config: config,
+		}, "helm-uid")
+		// Helm storage JSON drops private chart dependencies; keep them in memory.
+		snapshot := verified
+		snapshot.CleanupBlocked, snapshot.Chart, snapshot.Config = false, ch, config
+		helm := &managerTestHelm{
+			releases: []LabRelease{snapshot},
+			uninstall: func(ctx context.Context, target LabRelease, srs []SpaceRequestResult) error {
+				return client.UninstallLabRelease(ctx, "alice-dev", "user-token", target, srs)
+			},
+		}
+		manager := newManager(helm)
+
+		// When polling a deployed setup that needs annotated values.
+		status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+
+		// Then coalescing fails safely, without blocking inventory or SDK uninstall.
+		var managerErr *ManagerError
+		require.ErrorAs(t, err, &managerErr)
+		assert.Equal(t, ManagerBadGateway, managerErr.Kind)
+		assert.NotContains(t, err.Error(), "private-invalid-value")
+		assert.Empty(t, status.Attributes)
+		for _, tc := range []struct{ name, helmStatus string }{
+			{"pending Helm", "pending-install"},
+			{"failed Helm", "failed"},
+			{"pending namespace", "deployed"},
+		} {
+			t.Run("given "+tc.name+" when polling then invalid values do not replace lifecycle status", func(t *testing.T) {
+				pending := snapshot
+				pending.Status = tc.helmStatus
+				cfg := manager.config
+				cfg.Helm = &managerTestHelm{releases: []LabRelease{pending}}
+				pendingBindings := bindings
+				if tc.name == "pending namespace" {
+					pendingBindings = bindings
+					cfg.SpaceRequests = &SpaceRequestClient{APIHost: "https://cluster.test", HTTPClient: &http.Client{Transport: managerRoundTripFunc(func(_ *http.Request) (*http.Response, error) {
+						body := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"conditions":[{"type":"Ready","status":"False"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+						return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+					})}}
+				}
+				pendingStatus, statusErr := statusWithBindings(t, NewManager(cfg), ctx, "alice", "user-token", ref, pendingBindings)
+				require.NoError(t, statusErr)
+				assert.Empty(t, pendingStatus.Attributes)
+			})
+		}
+		items, err := manager.List(ctx, "alice", "user-token")
+		require.NoError(t, err)
+		require.Len(t, items, 1)
+		assert.False(t, items[0].Blocked)
+		require.Error(t, awaitTeardown(ctx, t, manager, ref, items[0].Generation), "local Helm fixture forbids mutations")
+		assert.NotEmpty(t, *mutations, "coalescing must not gate SDK uninstall")
+	})
+
+	t.Run("given same revision lifecycle transition when polling then no release-change conflict", func(t *testing.T) {
+		reads := 0
+		helm := &managerTestHelm{status: "deployed", list: func(context.Context, []SpaceRequestResult) ([]LabRelease, error) {
+			reads++
+			snapshot := verified
+			password := "deployed-password"
+			if reads == 1 {
+				snapshot.Status = "pending-install"
+				password = "not-yet-ready-password"
+			}
+			snapshot.Config = map[string]interface{}{"admin": map[string]interface{}{"password": password}}
+			return []LabRelease{snapshot}, nil
+		}}
+		manager := newManager(helm)
+		_, finish, err := manager.config.Coordinator.Acquire(ctx, "alice", ref)
+		require.NoError(t, err)
+		t.Cleanup(finish)
+		pending, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err)
+		assert.Equal(t, "installing", pending.Helm.Status)
+		assert.Empty(t, pending.Helm.Message)
+		assert.Empty(t, pending.Attributes)
+		deployed, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err)
+		assert.Equal(t, "deployed", deployed.Helm.Status)
+		assert.Empty(t, deployed.Helm.Message)
+		assert.Equal(t, "deployed-password", deployed.Attributes["admin-password"])
+		assert.Equal(t, 2, reads, "one discovery per poll")
+		assert.Empty(t, helm.statusNames)
+	})
+
+	t.Run("given verified failed release when polling then actionable teardown guidance without values", func(t *testing.T) {
+		failed := verified
+		failed.Status = "failed"
+		helm := &managerTestHelm{releases: []LabRelease{failed}, status: "failed"}
+		status, err := statusWithBindings(t, newManager(helm), ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err)
+		assert.Equal(t, "failed", status.Helm.Status)
+		assert.Equal(t, "Lab setup failed. Tear down this lab before launching again. If teardown is unavailable, contact an administrator.", status.Helm.Message)
+		assert.Empty(t, status.Attributes)
+		assert.False(t, status.RetrySetup)
+	})
+
+	t.Run("given schema drift when polling then discovered name serves status and values", func(t *testing.T) {
+		helm := &managerTestHelm{releases: []LabRelease{verified}, status: "deployed"}
+		manager := newManager(helm)
+		opened, ready, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err)
+		assert.True(t, ready, "cleanup eligibility must not restrict opening")
+		status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err)
+		assert.Equal(t, opened.Helm.ReleaseName, status.Helm.ReleaseName)
+		assert.Equal(t, verified.Name, status.Helm.ReleaseName)
+		assert.Empty(t, helm.statusNames, "status comes from discovered snapshot")
+	})
+
+	for _, tc := range []struct {
+		name   string
+		change func(*managerTestHelm)
+	}{
+		{"missing release name", func(h *managerTestHelm) { h.releases[0].Name = "" }},
+		{"missing storage UID", func(h *managerTestHelm) { h.releases[0].UID = "" }},
+		{"wrong namespace", func(h *managerTestHelm) { h.releases[0].Namespace = "bob-dev" }},
+		{"duplicate marked releases", func(h *managerTestHelm) { h.releases = append(h.releases, h.releases[0]) }},
+	} {
+		t.Run("given "+tc.name+" when polling then no launch attributes escape", func(t *testing.T) {
+			snapshot := verified
+			snapshot.Config = map[string]interface{}{"admin": map[string]interface{}{"password": "unverified-secret"}} // #nosec G101 -- Fake credential sentinel used to verify untrusted values never escape.
+			helm := &managerTestHelm{releases: []LabRelease{snapshot}, status: "deployed"}
+			tc.change(helm)
+			status, err := statusWithBindings(t, newManager(helm), ctx, "alice", "user-token", ref, bindings)
+			var managerErr *ManagerError
+			require.ErrorAs(t, err, &managerErr)
+			assert.Equal(t, ManagerConflict, managerErr.Kind)
+			assert.Empty(t, status.Attributes)
+			assert.NotContains(t, err.Error(), "user-token")
+		})
+	}
+
+	for _, tc := range []struct {
+		name string
+		ref  string
+	}{
+		{"unmarked same-name release", ""},
+		{"foreign same-name release", strings.Repeat("cd", 32)},
+	} {
+		t.Run("given "+tc.name+" when polling then no name-based values escape", func(t *testing.T) {
+			helm := &managerTestHelm{status: "deployed"}
+			if tc.ref != "" {
+				other := verified
+				other.Name = HelmReleaseName("alice", ref, "setup/helm", nil)
+				other.CatalogRef = tc.ref
+				other.Config = map[string]interface{}{"admin": map[string]interface{}{"password": "foreign-secret"}}
+				helm.releases = []LabRelease{other}
+			}
+			status, err := statusWithBindings(t, newManager(helm), ctx, "alice", "user-token", ref, bindings)
+			require.NoError(t, err, "only marked releases for this catalogRef participate in status")
+			assert.Equal(t, "pending", status.Helm.Status)
+			assert.Empty(t, status.Attributes)
+			assert.Empty(t, helm.statusNames, "never inspect unmarked/foreign same-name releases")
+		})
+	}
+
+	t.Run("given release replacement during namespace preflight when opening then reject stale deployment", func(t *testing.T) {
+		label, err := CatalogRefLabel(ref)
+		require.NoError(t, err)
+		helm := &managerTestHelm{releases: []LabRelease{verified}}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodGet, r.Method)
+			helm.releases[0].UID = "replacement"
+			_, _ = fmt.Fprintf(w, `{"items":[{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"conditions":[{"type":"Ready","status":"True"}],"namespaceAccess":[{"name":"alice-gitea"}]}}]}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+		}))
+		t.Cleanup(server.Close)
+		manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")})
+		_, ready, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, []SchemaBinding{{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName}})
+		var managerErr *ManagerError
+		require.ErrorAs(t, err, &managerErr)
+		assert.Equal(t, ManagerConflict, managerErr.Kind)
+		assert.False(t, ready)
+	})
+
+	t.Run("given real Helm marked unsafe deployment when polling then discovered release stays openable", func(t *testing.T) {
+		label, err := CatalogRefLabel(ref)
+		require.NoError(t, err)
+		helm, mutations := cleanupTestHelm(t, &release.Release{
+			Name: verified.Name, Namespace: "alice-dev", Version: 1,
+			Labels: map[string]string{CatalogRefLabelKey: label}, Info: &release.Info{Status: release.StatusDeployed},
+			Config: map[string]interface{}{"admin": map[string]interface{}{"password": "generated-value"}},
+			Hooks:  []*release.Hook{{Manifest: "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: unsafe\n  namespace: alice-dev\n"}},
+		}, "helm-uid")
+		manager := newManager(helm)
+		opened, ready, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err, "separate SDK Config maps must not break Start's identity guard")
+		assert.True(t, ready)
+		assert.Equal(t, verified.Name, opened.Helm.ReleaseName)
+		status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+		require.NoError(t, err)
+		assert.Equal(t, verified.Name, status.Helm.ReleaseName)
+		assert.Equal(t, "deployed", status.Helm.Status)
+		assert.Equal(t, "generated-value", status.Attributes["admin-password"])
+		assert.Empty(t, *mutations)
+	})
+}
+
+func TestManagerNamespaceReadiness(t *testing.T) {
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	bindings := []SchemaBinding{
+		{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName},
+		{Path: "admin.password", Kind: KindGeneratedPassword},
+	}
+	for _, tc := range []struct {
+		name, target, wantSR, wantNamespace string
+		failed                              bool
+	}{
+		{name: "ready without target", wantSR: "provisioning", wantNamespace: "pending"},
+		{name: "contradictory ready and failed without target", failed: true, wantSR: "failed", wantNamespace: "failed"},
+		{name: "contradictory ready and failed with target", target: "alice-gitea", failed: true, wantSR: "ready", wantNamespace: "ready"},
+	} {
+		t.Run("given "+tc.name+" when polling and reopening then ready target takes precedence", func(t *testing.T) {
+			// Given a verified deployed release and a Ready=True binding.
+			conditions := `{"type":"Ready","status":"True"}`
+			if tc.failed {
+				conditions += `,{"type":"Ready","status":"False","reason":"UnableToCreateSpace"}`
+			}
+			sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":%q}],"conditions":[%s]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation, tc.target, conditions)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+				if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+					_, _ = fmt.Fprintf(w, `{"items":[%s]}`, sr)
+				} else {
+					_, _ = fmt.Fprint(w, sr)
+				}
+			}))
+			t.Cleanup(server.Close)
+			helm := &managerTestHelm{releases: []LabRelease{{
+				Name: "il-original", Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: "deployed",
+				Config: map[string]interface{}{"admin": map[string]interface{}{"password": "generated-value"}},
+			}}}
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, Coordinator: NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")})
+
+			// When observing status and reopening through the public APIs.
+			status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+			require.NoError(t, err)
+			opened, ready, openErr := startWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+
+			// Then only ready-with-target permits launch attributes and reopening.
+			assert.Equal(t, tc.wantSR, status.SpaceRequests.Status)
+			wantName := "gitea"
+			if tc.target != "" {
+				wantName = tc.target
+			}
+			assert.Equal(t, NamespaceStatus{Status: tc.wantNamespace, Name: wantName}, status.SpaceRequests.Namespaces["gitea"])
+			assert.Equal(t, "deployed", status.Helm.Status)
+			assert.Equal(t, "il-original", status.Helm.ReleaseName)
+			assert.False(t, status.RetrySetup)
+			assert.Equal(t, tc.target != "", ready)
+			if tc.target != "" {
+				require.NoError(t, openErr)
+				assert.Equal(t, "il-original", opened.Helm.ReleaseName)
+				assert.Equal(t, map[string]string{"namespaces-gitea": tc.target, "admin-password": "generated-value"}, status.Attributes)
+			} else {
+				var managerErr *ManagerError
+				require.ErrorAs(t, openErr, &managerErr)
+				assert.Equal(t, ManagerConflict, managerErr.Kind)
+				assert.Equal(t, "Existing lab namespaces are not ready or bindings changed. Refresh or clean up before relaunch.", managerErr.Message)
+				assert.Empty(t, status.Attributes)
+			}
+			assert.Empty(t, helm.statusNames, "verified snapshots need no name-based rereads")
+		})
+	}
+}
+
+func TestManagerSnapshotValues(t *testing.T) {
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name, srReady, srReason string
+		status                  release.Status
+		passwords, wantValues   bool
+	}{
+		{name: "deployed only requested string paths", status: release.StatusDeployed, srReady: "True", passwords: true, wantValues: true},
+		{name: "deployed without requested passwords", status: release.StatusDeployed, srReady: "True"},
+		{name: "failed Helm never reveals values", status: release.StatusFailed, srReady: "True", passwords: true},
+		{name: "pending install never reveals values", status: release.StatusPendingInstall, srReady: "True", passwords: true},
+		{name: "failed SpaceRequest never reveals values", status: release.StatusDeployed, srReady: "False", srReason: "UnableToCreateSpace", passwords: true},
+		{name: "pending SpaceRequest never reveals values", status: release.StatusDeployed, srReady: "False", passwords: true},
+	} {
+		t.Run("given "+tc.name+" when polling then snapshot values stay filtered", func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.Equal(t, "Bearer user-token", r.Header.Get("Authorization"))
+				sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":%q,"reason":%q}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation, tc.srReady, tc.srReason)
+				if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+					_, _ = fmt.Fprintf(w, `{"items":[%s]}`, sr)
+				} else {
+					_, _ = fmt.Fprint(w, sr)
+				}
+			}))
+			t.Cleanup(server.Close)
+			client, mutations := cleanupTestHelm(t, &release.Release{
+				Name: "il-original-schema", Namespace: "alice-dev", Version: 1,
+				Labels: map[string]string{CatalogRefLabelKey: label}, Info: &release.Info{Status: tc.status},
+				Chart: &chart.Chart{Metadata: &chart.Metadata{Name: "lab", Version: "1.0.0"}, Values: map[string]interface{}{
+					"admin":      map[string]interface{}{"username": "default-user", "password": "default-password", "hidden": "hidden-default"},
+					"namespaces": map[string]interface{}{"gitea": "stale-default-namespace"},
+					"gitea":      map[string]interface{}{"rootUrl": "stale-default-url"},
+				}},
+				Config: map[string]interface{}{
+					"admin":  map[string]interface{}{"password": "snapshot-password", "other": "unrequested-secret"},
+					"number": 42, "list": []string{"private-item"}, "token": "private-token",
+				},
+			}, "helm-uid")
+			helm := &managerSnapshotOnlyHelm{HelmManager: client}
+			coord := NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")
+			_, finish, err := coord.Acquire(ctx, "alice", ref)
+			require.NoError(t, err)
+			t.Cleanup(finish)
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: coord, ClusterIngressDomain: "apps.example.com"})
+			bindings := []SchemaBinding{
+				{Key: "gitea", Path: "namespaces.gitea", Kind: KindNamespaceName},
+				{Path: "gitea.rootUrl", Kind: KindRootURL, RouteName: "gitea", NamespaceRef: "gitea"},
+			}
+			if tc.passwords {
+				bindings = append(bindings, SchemaBinding{Path: "admin.username", Kind: "value"})
+				for _, path := range []string{"admin.password", "admin.missing", "number", "list", "admin.password.child"} {
+					bindings = append(bindings, SchemaBinding{Path: path, Kind: KindGeneratedPassword})
+				}
+			}
+			status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, bindings)
+			require.NoError(t, err)
+			if tc.wantValues {
+				assert.Equal(t, map[string]string{
+					"namespaces-gitea": "alice-gitea", "gitea-rootUrl": "gitea-alice-gitea.apps.example.com",
+					"admin-password": "snapshot-password", "admin-username": "default-user",
+				}, status.Attributes)
+			} else {
+				assert.NotContains(t, status.Attributes, "admin-password")
+				if tc.status != release.StatusDeployed || tc.srReady != "True" {
+					assert.Empty(t, status.Attributes)
+				}
+			}
+			payload, err := json.Marshal(status)
+			require.NoError(t, err)
+			for _, secret := range []string{"unrequested-secret", "private-item", "private-token", "user-token", "hidden-default", "default-password", "stale-default-namespace", "stale-default-url"} {
+				assert.NotContains(t, string(payload), secret)
+			}
+			if !tc.wantValues {
+				assert.NotContains(t, string(payload), "snapshot-password")
+			}
+			assert.Equal(t, 1, helm.lists)
+			assert.Zero(t, helm.statusReads)
+			assert.Empty(t, *mutations)
+			if tc.wantValues {
+				items, err := manager.List(ctx, "alice", "user-token")
+				require.NoError(t, err)
+				require.Len(t, items, 1)
+				require.NotNil(t, items[0].Release)
+				assert.Nil(t, items[0].Release.Config)
+				assert.Nil(t, items[0].Release.Chart)
+				payload, err := json.Marshal(items)
+				require.NoError(t, err)
+				assert.NotContains(t, string(payload), "default-user")
+				assert.NotContains(t, string(payload), "snapshot-password")
+			}
+		})
+	}
+}
+
+func TestManagerWorkerOwnership(t *testing.T) {
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	label, err := CatalogRefLabel(ref)
+	require.NoError(t, err)
+	sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"alice-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"alice-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, CatalogRefLabelKey, label, BindingKeyAnnotation)
+	bodyFor := func(r *http.Request) string {
+		if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+			return fmt.Sprintf(`{"items":[%s]}`, sr)
+		}
+		return sr
+	}
+	t.Run("given old local failure when another pod deploys then cluster outcome wins", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = fmt.Fprint(w, bodyFor(r))
+		}))
+		t.Cleanup(server.Close)
+		var deployed atomic.Bool
+		helm := &managerTestHelm{list: func(context.Context, []SpaceRequestResult) ([]LabRelease, error) {
+			if deployed.Load() {
+				return []LabRelease{{Name: "il-recovered", Namespace: "alice-dev", UID: "new-uid", CatalogRef: ref, Status: "deployed"}}, nil
+			}
+			return nil, nil
+		}}
+		client := coordinatorTestClient()
+		var unknownHolder atomic.Bool
+		client.PrependReactor("get", "leases", func(ktesting.Action) (bool, runtime.Object, error) {
+			if unknownHolder.Load() {
+				return true, nil, errors.New("reservation read unavailable user-token")
+			}
+			return false, nil, nil
+		})
+		coord := NewOperationCoordinator(client, "plugin-ns")
+		manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: coord})
+		_, _, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, nil)
+		require.NoError(t, err)
+		require.Eventually(t, func() bool { return !coord.IsHeld(ctx, "alice", ref) }, time.Second, time.Millisecond)
+		status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "failed", status.Helm.Status)
+		assert.Equal(t, "Helm install failed", status.Helm.Message, "retain safe failure detail when cluster has no outcome")
+		assert.False(t, status.RetrySetup, "actual local failures need explicit relaunch, not automatic retry")
+		t.Run("given unknown holder when polling then stale local failure is suppressed", func(t *testing.T) {
+			// Given coordination can no longer verify the failed worker's ownership.
+			unknownHolder.Store(true)
+			defer unknownHolder.Store(false)
+
+			// When observing public status and inventory.
+			pending, statusErr := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, nil)
+			require.NoError(t, statusErr)
+			pendingItems, listErr := manager.List(ctx, "alice", "user-token")
+
+			// Then fail closed without exposing stale failure details or permitting retry.
+			require.NoError(t, listErr)
+			assert.Equal(t, "pending", pending.Helm.Status)
+			assert.Empty(t, pending.Helm.Message)
+			assert.False(t, pending.RetrySetup)
+			require.Len(t, pendingItems, 1)
+			assert.Equal(t, "pending", pendingItems[0].Status)
+			assert.Equal(t, BlockedOperation, pendingItems[0].BlockedReason)
+			assert.True(t, pendingItems[0].Blocked)
+		})
+		// Another pod's live reservation is authoritative even before Helm exists.
+		started, finish := make(chan struct{}), make(chan struct{})
+		otherHelm := &managerTestHelm{install: func() error {
+			close(started)
+			<-finish
+			return nil
+		}}
+		otherPod := NewManager(ManagerConfig{Helm: otherHelm, SpaceRequests: manager.config.SpaceRequests, Coordinator: NewOperationCoordinator(coord.client, "plugin-ns")})
+		_, _, err = startWithBindings(t, otherPod, ctx, "alice", "user-token", ref, nil)
+		require.NoError(t, err)
+		<-started
+		status, err = statusWithBindings(t, manager, ctx, "alice", "user-token", ref, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "pending", status.Helm.Status, "old failure must not override another pod's live operation")
+		assert.False(t, status.RetrySetup)
+		items, err := manager.List(ctx, "alice", "user-token")
+		require.NoError(t, err)
+		require.Len(t, items, 1)
+		assert.Equal(t, "pending", items[0].Status)
+		assert.Equal(t, BlockedOperation, items[0].BlockedReason)
+		close(finish)
+		require.Eventually(t, func() bool { return !coord.IsHeld(ctx, "alice", ref) }, time.Second, time.Millisecond)
+		deployed.Store(true)
+		items, err = manager.List(ctx, "alice", "user-token")
+		require.NoError(t, err)
+		require.Len(t, items, 1)
+		assert.Equal(t, "deployed", items[0].Status)
+		assert.False(t, items[0].Blocked)
+	})
+
+	t.Run("given expired teardown when successor starts then old cleanup cannot remove successor record", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			client := &http.Client{Transport: managerRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(bodyFor(r))), Header: make(http.Header)}, nil
+			})}
+			oldStarted := make(chan context.Context, 1)
+			oldFinish, successorFinish := make(chan struct{}), make(chan struct{})
+			successorStarted := make(chan struct{})
+			deployed := true
+			helm := &managerTestHelm{
+				list: func(context.Context, []SpaceRequestResult) ([]LabRelease, error) {
+					if deployed {
+						return []LabRelease{{Name: "il-old", Namespace: "alice-dev", UID: "helm-uid", CatalogRef: ref, Status: "deployed"}}, nil
+					}
+					return nil, nil
+				},
+				uninstall: func(ctx context.Context, _ LabRelease, _ []SpaceRequestResult) error {
+					oldStarted <- ctx
+					<-oldFinish
+					return nil
+				},
+				installOpts: func(context.Context, HelmInstallOpts) error {
+					close(successorStarted)
+					<-successorFinish
+					return errors.New("successor failure")
+				},
+			}
+			coord := NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: "https://cluster.test", HTTPClient: client}, Coordinator: coord})
+			items, err := manager.List(ctx, "alice", "user-token")
+			require.NoError(t, err)
+			require.Len(t, items, 1)
+			oldOperation, err := manager.BeginTeardown(ctx, "alice", "user-token", ref, items[0].Generation)
+			require.NoError(t, err)
+			oldCtx := <-oldStarted
+			leases := coord.client.CoordinationV1().Leases("plugin-ns")
+			lease, err := leases.Get(ctx, operationLeaseName("alice", ref), metav1.GetOptions{})
+			require.NoError(t, err)
+			stale := metav1.NewMicroTime(time.Now().Add(-201 * time.Second))
+			lease.Spec.RenewTime = &stale
+			_, err = leases.Update(ctx, lease, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			deployed = false // Old in-flight Helm can outlive the reservation.
+			_, _, err = startWithBindings(t, manager, ctx, "alice", "user-token", ref, nil)
+			require.NoError(t, err)
+			<-successorStarted
+			close(oldFinish)
+			synctest.Wait()
+			require.ErrorIs(t, oldCtx.Err(), context.Canceled)
+			status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, nil)
+			require.NoError(t, err)
+			assert.Equal(t, "installing", status.Helm.Status)
+			assert.True(t, coord.IsHeld(ctx, "alice", ref))
+			_, err = manager.TeardownStatus(ctx, "alice", ref, oldOperation.OperationID)
+			var managerErr *ManagerError
+			require.ErrorAs(t, err, &managerErr)
+			assert.Equal(t, ManagerNotFound, managerErr.Kind, "old completion must not resurrect superseded receipt")
+			close(successorFinish)
+			synctest.Wait()
+			assert.False(t, coord.IsHeld(ctx, "alice", ref))
+		})
+	})
+
+	for _, oldFails := range []bool{true, false} {
+		t.Run(fmt.Sprintf("given expired installer when successor starts then old completion cannot overwrite it failure=%t", oldFails), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = fmt.Fprint(w, bodyFor(r))
+			}))
+			t.Cleanup(server.Close)
+			started := make(chan context.Context, 2)
+			oldFinish, successorFinish := make(chan struct{}), make(chan struct{})
+			var installs atomic.Int32
+			helm := &managerTestHelm{installOpts: func(ctx context.Context, _ HelmInstallOpts) error {
+				call := installs.Add(1)
+				started <- ctx
+				if call == 1 {
+					<-oldFinish
+					if oldFails {
+						return errors.New("old install failed user-token")
+					}
+					return nil
+				}
+				<-successorFinish
+				return errors.New("successor install failed user-token")
+			}}
+			coord := NewOperationCoordinator(coordinatorTestClient(), "plugin-ns")
+			manager := NewManager(ManagerConfig{Helm: helm, SpaceRequests: &SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, Coordinator: coord})
+			_, _, err := startWithBindings(t, manager, ctx, "alice", "user-token", ref, nil)
+			require.NoError(t, err)
+			oldCtx := <-started
+			t.Cleanup(func() {
+				close(successorFinish)
+				require.Eventually(t, func() bool { return !coord.IsHeld(ctx, "alice", ref) }, time.Second, time.Millisecond)
+			})
+			leases := coord.client.CoordinationV1().Leases("plugin-ns")
+			lease, err := leases.Get(ctx, operationLeaseName("alice", ref), metav1.GetOptions{})
+			require.NoError(t, err)
+			stale := metav1.NewMicroTime(time.Now().Add(-201 * time.Second))
+			lease.Spec.RenewTime = &stale
+			_, err = leases.Update(ctx, lease, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			items, err := manager.List(ctx, "alice", "user-token")
+			require.NoError(t, err)
+			require.Len(t, items, 1)
+			assert.Equal(t, "failed", items[0].Status, "expired local installer must not permanently block recovery")
+			assert.False(t, items[0].Blocked)
+			status, err := statusWithBindings(t, manager, ctx, "alice", "user-token", ref, nil)
+			require.NoError(t, err)
+			assert.True(t, status.RetrySetup)
+			_, _, err = startWithBindings(t, manager, ctx, "alice", "user-token", ref, nil)
+			require.NoError(t, err)
+			<-started
+			close(oldFinish)
+			require.Eventually(t, func() bool { return oldCtx.Err() != nil }, time.Second, time.Millisecond)
+			status, err = statusWithBindings(t, manager, ctx, "alice", "user-token", ref, nil)
+			require.NoError(t, err)
+			assert.Equal(t, "installing", status.Helm.Status, "old success/failure must not replace successor's record")
+			assert.True(t, coord.IsHeld(ctx, "alice", ref), "old completion must not release successor")
+		})
+	}
+}

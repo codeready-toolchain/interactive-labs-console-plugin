@@ -14,8 +14,6 @@ import (
 	"path"
 	"slices"
 	"strings"
-	"sync"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -26,22 +24,12 @@ import (
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/setup"
 )
 
-var activeSetups sync.Map
-
-type workerState struct {
-	phase string // "polling", "installing", "done", "failed"
-	err   string
-}
-
 // Config holds injectable dependencies for the router.
 type Config struct {
 	// CatalogSource returns the live catalog ConfigMap; nil uses an empty ConfigMap.
 	CatalogSource func(context.Context) (*corev1.ConfigMap, error)
 	// BundleLoader loads a bundle from the configured repo; nil means bundles are unavailable.
 	BundleLoader func(context.Context, string, string, string) (*bundle.Result, error)
-	// SetupPreparer prepares filesystem-only provisioning data from the approved source.
-	// The final two arguments are the authenticated subject and catalog ref.
-	SetupPreparer func(context.Context, string, string, string, string, string) (*setup.Plan, error)
 	// ResourceLoader reads an approved resource from the configured source snapshot.
 	ResourceLoader func(context.Context, string, string, string) (*bundle.Resource, error)
 	// CatalogLabOmitted receives validated catalog entry omission notifications.
@@ -54,18 +42,11 @@ type Config struct {
 	// nil means no runtime attrs. The subject is the authenticated user identifier.
 	// Production default may be nil while the key list is TBD.
 	RuntimeAttributes func(r *http.Request, subject string) (map[string]string, error)
-	// SetupClient handles SpaceRequest operations for lab setup.
-	// nil means setup is unavailable.
-	SetupClient *setup.SpaceRequestClient
-	// SpaceRequestTierName is the tier used when creating SpaceRequests.
-	SpaceRequestTierName string
-	// HelmManager handles Helm release operations. nil means Helm is unavailable.
-	HelmManager setup.HelmManager
-	// HelmTimeout is the timeout for Helm install operations. Zero uses 300s default.
-	HelmTimeout time.Duration
-	// ClusterIngressDomain is the cluster's ingress domain (e.g. "apps.cluster.example.com"),
-	// injected as a Helm value for properties with x-interactive-labs.kind "cluster-ingress-domain".
-	ClusterIngressDomain string
+	// SetupManager owns the setup, status, inventory, and teardown lifecycle.
+	SetupManager *setup.Manager
+	// ReadinessCheck reports whether the server is ready to handle traffic.
+	// nil means always ready.
+	ReadinessCheck func() bool
 }
 
 // NewRouter returns an http.Handler with all three MVP routes registered.
@@ -89,6 +70,26 @@ func NewRouter(cfg Config) http.Handler {
 	})
 	mux.HandleFunc("GET /api/v1alpha1/labs/{catalogRef}/setup/status", func(w http.ResponseWriter, r *http.Request) {
 		handleSetupStatus(w, r, cfg)
+	})
+	mux.HandleFunc("GET /api/v1alpha1/setups", func(w http.ResponseWriter, r *http.Request) {
+		handleSetups(w, r, cfg)
+	})
+	mux.HandleFunc("POST /api/v1alpha1/labs/{catalogRef}/teardown", func(w http.ResponseWriter, r *http.Request) {
+		handleTeardown(w, r, cfg)
+	})
+	mux.HandleFunc("GET /api/v1alpha1/labs/{catalogRef}/teardown/status", func(w http.ResponseWriter, r *http.Request) {
+		handleTeardownStatus(w, r, cfg)
+	})
+
+	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /api/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if cfg.ReadinessCheck != nil && !cfg.ReadinessCheck() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	})
 
 	return mux
@@ -157,63 +158,6 @@ func catalogEntryByCatalogRef(ctx context.Context, cfg Config, catalogRef string
 		}
 	}
 	return nil, laberr.New(laberr.TypeLabNotFound, "lab not found in catalog", nil)
-}
-
-type setupContext struct {
-	token   string
-	subject string
-	plan    *setup.Plan
-}
-
-func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*setupContext, bool) {
-	token := bearerToken(r)
-	if token == "" || cfg.Authenticate == nil {
-		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication required", nil))
-		return nil, false
-	}
-	subject, err := cfg.Authenticate(r.Context(), r.Header.Get("Impersonate-User"), token)
-	if err != nil || subject == "" {
-		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication failed", nil))
-		return nil, false
-	}
-
-	catalogRef := r.PathValue("catalogRef")
-	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, catalogRef)
-	if labError != nil {
-		writeError(w, http.StatusNotFound, labError)
-		return nil, false
-	}
-
-	prepare := cfg.SetupPreparer
-	if prepare == nil {
-		writeError(w, http.StatusServiceUnavailable,
-			laberr.New(laberr.TypeRepositoryError, "setup preparer not configured", nil))
-		return nil, false
-	}
-	plan, err := prepare(r.Context(), entry.Repository, entry.Branch, entry.LabPath, subject, entry.CatalogRef)
-	if errors.Is(err, setup.ErrChartNotFound) {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeChartNotFound, "lab has no values schema", nil))
-		return nil, false
-	}
-	if (err != nil && !errors.Is(err, setup.ErrNamespaceBindingsMissing)) || (err == nil && plan == nil) {
-		writeError(w, http.StatusBadGateway,
-			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
-		return nil, false
-	}
-	if cfg.SetupClient == nil {
-		writeError(w, http.StatusServiceUnavailable,
-			laberr.New(laberr.TypeConfigurationError, "setup client not configured", nil))
-		return nil, false
-	}
-	if errors.Is(err, setup.ErrNamespaceBindingsMissing) {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeConfigurationError, "values schema declares no namespace bindings", nil))
-		return nil, false
-
-	}
-
-	return &setupContext{token: token, subject: subject, plan: plan}, true
 }
 
 // --- handler functions ---
@@ -309,6 +253,7 @@ func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {
 			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
 		return
 	}
+	cfg.Logger.Info("bundle loaded", "repository", entry.Repository, "branch", entry.Branch, "commit", result.Revision)
 
 	type page struct {
 		Path string `json:"path"`
@@ -441,335 +386,6 @@ func isSafeResourceContentType(contentType string) bool {
 	default:
 		return false
 	}
-}
-
-func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
-	cfg.Logger.Info("setup request received", "catalogRef", r.PathValue("catalogRef"))
-
-	sctx, ok := resolveSetupContext(w, r, cfg)
-	if !ok {
-		return
-	}
-
-	if cfg.HelmManager == nil {
-		writeError(w, http.StatusServiceUnavailable,
-			laberr.New(laberr.TypeConfigurationError, "Helm manager not configured", nil))
-		return
-	}
-
-	userNamespace := sctx.subject + "-dev"
-	tierName := cfg.SpaceRequestTierName
-	if tierName == "" {
-		tierName = "base1ns"
-	}
-
-	for _, b := range sctx.plan.Bindings.Namespaces {
-		if err := cfg.SetupClient.EnsureSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key, tierName); err != nil {
-			cfg.Logger.Error("create SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
-			writeError(w, http.StatusBadGateway,
-				laberr.New(laberr.TypeConfigurationError, "failed to create SpaceRequest", nil))
-			return
-		}
-	}
-
-	releaseName := sctx.plan.ReleaseName
-
-	// If Helm is available, check if already deployed (re-launch no-op).
-	if cfg.HelmManager != nil {
-		status, err := cfg.HelmManager.ReleaseStatus(r.Context(), releaseName, userNamespace, sctx.token)
-		if err == nil && status == "deployed" {
-			writeJSON(w, http.StatusOK, buildSetupStatusResponse(
-				"ready", nil, // SpaceRequests assumed ready if Helm is deployed
-				"deployed", releaseName, "", nil, nil,
-			))
-			return
-		}
-
-		// Start background goroutine if not already running.
-		helmTimeout := cfg.HelmTimeout
-		if helmTimeout == 0 {
-			helmTimeout = 300 * time.Second
-		}
-		newState := &workerState{phase: "polling"}
-		startWorker := false
-		if val, loaded := activeSetups.LoadOrStore(releaseName, newState); loaded {
-			state := val.(*workerState)
-			if state.phase == "done" || state.phase == "failed" {
-				startWorker = activeSetups.CompareAndSwap(releaseName, val, newState)
-			}
-		} else {
-			startWorker = true
-		}
-		if startWorker {
-			go runSetupWorker(cfg, sctx.token, userNamespace, *sctx.plan, helmTimeout) //nolint:gosec
-		}
-	}
-
-	writeJSON(w, http.StatusAccepted, buildSetupStatusResponse(
-		"provisioning", nil,
-		"pending", releaseName, "", nil, nil,
-	))
-}
-
-const (
-	setupWorkerPollInterval = 5 * time.Second
-	setupWorkerPollTimeout  = 30 * time.Minute
-)
-
-func runSetupWorker(cfg Config, token, namespace string, plan setup.Plan, helmTimeout time.Duration) {
-	releaseName, bindings := plan.ReleaseName, plan.Bindings
-	setState := func(phase, errMsg string) {
-		activeSetups.Store(releaseName, &workerState{phase: phase, err: errMsg})
-	}
-
-	// Phase 1: wait for all SpaceRequests to become ready.
-	pollCtx, pollCancel := context.WithTimeout(context.Background(), setupWorkerPollTimeout)
-	defer pollCancel()
-
-	var nsValues map[string]string
-	for {
-		var err error
-		nsValues, err = setup.MapBindingsToValues(pollCtx, cfg.SetupClient, token, namespace, bindings.Namespaces)
-		if err == nil {
-			for path, nsName := range nsValues {
-				cfg.Logger.Info("namespace ready", "release", releaseName, "binding", path, "namespace", nsName)
-			}
-			break
-		}
-
-		cfg.Logger.Info("SpaceRequests not ready, retrying", "release", releaseName)
-
-		select {
-		case <-pollCtx.Done():
-			cfg.Logger.Error("setup worker timed out waiting for SpaceRequests", "release", releaseName)
-			setState("failed", "timed out waiting for SpaceRequests")
-			return
-		case <-time.After(setupWorkerPollInterval):
-		}
-	}
-
-	// Generate password values into a separate map to avoid mutating nsValues.
-	values := make(map[string]string, len(nsValues))
-	for k, v := range nsValues {
-		values[k] = v
-	}
-	if len(bindings.Passwords) > 0 {
-		pwPaths := make([]string, len(bindings.Passwords))
-		for i, b := range bindings.Passwords {
-			pwPaths[i] = b.Path
-		}
-		cfg.Logger.Info("generating passwords", "release", releaseName, "paths", pwPaths)
-		pwValues, err := setup.GeneratePasswordValues(bindings.Passwords)
-		if err != nil {
-			cfg.Logger.Error("password generation failed", "release", releaseName, "err", err)
-			setState("failed", "password generation failed")
-			return
-		}
-		for k, v := range pwValues {
-			values[k] = v
-		}
-		cfg.Logger.Info("passwords generated", "release", releaseName, "count", len(pwValues))
-	}
-
-	for _, b := range bindings.RootURLs {
-		if cfg.ClusterIngressDomain == "" {
-			cfg.Logger.Error("cluster ingress domain not configured but required by schema", "release", releaseName, "path", b.Path)
-			setState("failed", "cluster ingress domain not configured")
-			return
-		}
-		nsPath := setup.NamespaceBindingPath(bindings.Namespaces, b.NamespaceRef)
-		nsName := nsValues[nsPath]
-		if nsName == "" {
-			availableKeys := make([]string, len(bindings.Namespaces))
-			for i, nb := range bindings.Namespaces {
-				availableKeys[i] = nb.Key
-			}
-			cfg.Logger.Error("root-url references unknown namespace binding", "release", releaseName, "namespaceRef", b.NamespaceRef, "nsPath", nsPath, "availableKeys", availableKeys, "nsValues", nsValues)
-			setState("failed", "root-url references unknown namespace binding: "+b.NamespaceRef)
-			return
-		}
-		values[b.Path] = fmt.Sprintf("%s-%s.%s", b.RouteName, nsName, cfg.ClusterIngressDomain)
-	}
-
-	// Phase 2: install Helm chart with its own timeout.
-	valueKeys := make([]string, 0, len(values))
-	for k := range values {
-		valueKeys = append(valueKeys, k)
-	}
-	cfg.Logger.Info("all SpaceRequests ready, installing Helm chart", "release", releaseName, "valueKeys", valueKeys)
-	setState("installing", "")
-
-	// Give the context extra margin so Helm's own --wait timeout fires first
-	// with a detailed message (e.g., which Deployment was not ready).
-	installCtx, installCancel := context.WithTimeout(context.Background(), helmTimeout+30*time.Second)
-	defer installCancel()
-
-	if err := cfg.HelmManager.Install(installCtx, setup.HelmInstallOpts{
-		ChartDir:    plan.ChartDir,
-		ReleaseName: releaseName,
-		Namespace:   namespace,
-		Token:       token,
-		Values:      values,
-		Timeout:     helmTimeout,
-	}); err != nil {
-		cfg.Logger.Error("Helm install failed", "release", releaseName, "err", err)
-		logPodDiagnostics(cfg, token, nsValues)
-		setState("failed", err.Error())
-	} else {
-		cfg.Logger.Info("Helm install completed", "release", releaseName)
-		setState("done", "")
-	}
-}
-
-func logPodDiagnostics(cfg Config, token string, nsValues map[string]string) {
-	if cfg.HelmManager == nil {
-		return
-	}
-	for binding, nsName := range nsValues {
-		pods, err := cfg.HelmManager.ListPods(context.Background(), token, nsName)
-		if err != nil {
-			cfg.Logger.Warn("failed to list pods for diagnostics", "namespace", nsName, "err", err)
-			continue
-		}
-		for _, p := range pods {
-			cfg.Logger.Info("pod status", "binding", binding, "namespace", nsName, "pod", p.Name, "phase", p.Phase, "ready", p.Ready, "reason", p.Reason)
-		}
-	}
-}
-
-func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
-	sctx, ok := resolveSetupContext(w, r, cfg)
-	if !ok {
-		return
-	}
-
-	userNamespace := sctx.subject + "-dev"
-
-	type namespaceStatus struct {
-		Status string `json:"status"`
-		Name   string `json:"name"`
-	}
-	bindings := sctx.plan.Bindings
-	namespaces := make(map[string]namespaceStatus, len(bindings.Namespaces))
-	allReady := true
-	anyFailed := false
-
-	for _, b := range bindings.Namespaces {
-		sr, err := cfg.SetupClient.GetSpaceRequest(r.Context(), sctx.token, userNamespace, b.Key)
-		if err != nil {
-			cfg.Logger.Warn("get SpaceRequest failed", "name", b.Key, "namespace", userNamespace, "err", err)
-			namespaces[b.Key] = namespaceStatus{Status: "pending", Name: b.Key}
-			allReady = false
-			continue
-		}
-		if sr == nil {
-			namespaces[b.Key] = namespaceStatus{Status: "pending", Name: b.Key}
-			allReady = false
-			continue
-		}
-		if sr.IsReady() && sr.TargetNamespace() != "" {
-			cfg.Logger.Info("SpaceRequest ready", "name", b.Key, "namespace", sr.TargetNamespace())
-			namespaces[b.Key] = namespaceStatus{Status: "ready", Name: sr.TargetNamespace()}
-		} else if sr.IsFailed() {
-			namespaces[b.Key] = namespaceStatus{Status: "failed", Name: b.Key}
-			anyFailed = true
-			allReady = false
-		} else {
-			namespaces[b.Key] = namespaceStatus{Status: "pending", Name: b.Key}
-			allReady = false
-		}
-	}
-
-	srStatus := "provisioning"
-	if anyFailed {
-		srStatus = "failed"
-	} else if allReady {
-		srStatus = "ready"
-	}
-
-	releaseName := sctx.plan.ReleaseName
-	helmStatus := "pending"
-	helmMessage := ""
-	var generatedValues map[string]string
-
-	if cfg.HelmManager != nil {
-		releaseStatus, err := cfg.HelmManager.ReleaseStatus(r.Context(), releaseName, userNamespace, sctx.token)
-		if err == nil && releaseStatus != "" {
-			helmStatus = setup.HelmStatusLabel(releaseStatus)
-			if helmStatus == "deployed" && len(bindings.Passwords) > 0 {
-				paths := make([]string, len(bindings.Passwords))
-				for i, b := range bindings.Passwords {
-					paths[i] = b.Path
-				}
-				generatedValues, _ = cfg.HelmManager.ReleaseValues(r.Context(), releaseName, userNamespace, sctx.token, paths)
-			}
-		} else if val, loaded := activeSetups.Load(releaseName); loaded {
-			state := val.(*workerState)
-			switch state.phase {
-			case "installing":
-				helmStatus = "installing"
-			case "failed":
-				helmStatus = "failed"
-				helmMessage = state.err
-			case "polling":
-				helmStatus = "pending"
-			}
-		}
-	}
-
-	var attributes map[string]string
-	if allReady && helmStatus == "deployed" {
-		attributes = make(map[string]string, len(bindings.Namespaces)+len(bindings.Passwords)+len(bindings.RootURLs))
-		for _, b := range bindings.Namespaces {
-			attributes[strings.ReplaceAll(b.Path, ".", "-")] = namespaces[b.Key].Name
-		}
-		for _, b := range bindings.Passwords {
-			if v, ok := generatedValues[b.Path]; ok {
-				attributes[strings.ReplaceAll(b.Path, ".", "-")] = v
-			}
-		}
-		for _, b := range bindings.RootURLs {
-			if cfg.ClusterIngressDomain == "" {
-				continue
-			}
-			ns, ok := namespaces[b.NamespaceRef]
-			if !ok {
-				continue
-			}
-			attributes[strings.ReplaceAll(b.Path, ".", "-")] = fmt.Sprintf("%s-%s.%s", b.RouteName, ns.Name, cfg.ClusterIngressDomain)
-		}
-	}
-
-	if len(attributes) > 0 {
-		cfg.Logger.Info("setup status attributes", "keys", slices.Sorted(maps.Keys(attributes)))
-	}
-	writeJSON(w, http.StatusOK, buildSetupStatusResponse(srStatus, namespaces, helmStatus, releaseName, helmMessage, generatedValues, attributes))
-}
-
-func buildSetupStatusResponse(srStatus string, namespaces any, helmStatus, releaseName, helmMessage string, generatedValues, attributes map[string]string) map[string]any {
-	helm := map[string]any{
-		"status":      helmStatus,
-		"releaseName": releaseName,
-	}
-	if helmMessage != "" {
-		helm["message"] = helmMessage
-	}
-	if len(generatedValues) > 0 {
-		helm["generatedValues"] = generatedValues
-	}
-	resp := map[string]any{
-		"apiVersion": "v1alpha1",
-		"kind":       "SetupStatus",
-		"spaceRequests": map[string]any{
-			"status":     srStatus,
-			"namespaces": namespaces,
-		},
-		"helm": helm,
-	}
-	if len(attributes) > 0 {
-		resp["attributes"] = attributes
-	}
-	return resp
 }
 
 func omittedLabReason(err error) string {

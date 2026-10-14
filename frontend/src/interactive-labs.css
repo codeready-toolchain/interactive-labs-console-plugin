@@ -781,6 +781,12 @@
   word-break: break-word;
 }
 
+.pfext-lab-catalog-actions > button {
+  inline-size: 9rem;
+  max-inline-size: 100%;
+  margin-inline-start: auto;
+}
+
 .pfext-lab-panel-content {
   background-color: var(--pf-t--global--color--brand--default, #06c);
   color: var(--pf-t--global--text--color--inverse, #fff);

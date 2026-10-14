@@ -231,7 +231,12 @@ func (c *Cache) LoadBundle(_ context.Context, repository, branch, labPath string
 	if entry.revision == nil {
 		return nil, ErrRepositoryUnavailable
 	}
-	return LoadFromSnapshot(entry.checkoutDirectory, labPath)
+	result, err := LoadFromSnapshot(entry.checkoutDirectory, labPath)
+	if err != nil {
+		return nil, err
+	}
+	result.Revision = *entry.revision
+	return result, nil
 }
 
 // WithSnapshot runs a filesystem consumer under the existing source read lock.

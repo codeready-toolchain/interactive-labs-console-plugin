@@ -45,8 +45,9 @@ import type { CatalogEntry } from "./types/catalog";
 import type { LabError } from "./types/errors";
 import type { PersistedSession } from "./types/session";
 import type { LabModule, LabPage } from "./types/manifest";
-import type { SetupStatus } from "./types/setup";
+import type { LabSetup, SetupStatus } from "./types/setup";
 import { sanitizeTitle } from "./sanitizer";
+import { LabSetups } from "./LabSetups";
 
 type PageState =
   | { status: "loading" }
@@ -84,9 +85,11 @@ type GuidanceRequest = {
 type GuidanceState = GuidanceRequest | { phase: "notice"; message: string };
 
 type InteractiveLabsContextValue = {
-  launch: (catalogRef: string, labPath: string, trigger: HTMLElement, requestedPageURL?: string) => Promise<void>;
+  launch: (catalogRef: string, labPath: string, trigger: HTMLElement, requestedPageURL?: string, resumeSetup?: boolean) => Promise<void>;
+  setupsVersion: number;
   loadingCatalogRef?: string;
   launchError?: string;
+  setupError?: { catalogRef: string; message: string };
   defaultNamespace?: string;
 };
 
@@ -132,7 +135,7 @@ const handleCopyButton = (event: { target: EventTarget | null; preventDefault: (
     const savedHTML = copyButton.innerHTML;
     const hadAriaLabel = copyButton.hasAttribute("aria-label");
     const savedAriaLabel = copyButton.getAttribute("aria-label");
-    navigator.clipboard?.writeText(code.textContent ?? "").catch(() => {});
+    navigator.clipboard?.writeText(code.textContent ?? "").catch(() => { });
     copyButton.classList.add("copied");
     copyButton.setAttribute("aria-label", "Copied to clipboard");
     copyButton.innerHTML =
@@ -230,12 +233,16 @@ const SETUP_POLL_INTERVAL_MS = 3000;
 
 const pollSetupUntilReady = async (catalogRef: string, signal: AbortSignal): Promise<SetupStatus> => {
   while (!signal.aborted) {
-    const status = await getSetupStatus(catalogRef);
+    const status = await getSetupStatus(catalogRef, signal);
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
     if (status.spaceRequests.status === "failed") {
       throw new Error("Namespace provisioning failed.");
     }
     if (status.helm.status === "failed") {
       throw new Error(status.helm.message || "Lab setup failed.");
+    }
+    if (status.retrySetup && status.helm.status === "pending") {
+      await setupLab(catalogRef, signal); // Fresh user token; GET status never mutates the lab.
     }
     if (status.spaceRequests.status === "ready" && status.helm.status === "deployed") {
       return status;
@@ -266,6 +273,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const [activePanel, setActivePanel] = React.useState<ActivePanel | null>(null);
   const [loadingCatalogRef, setLoadingCatalogRef] = React.useState<string>();
   const [launchError, setLaunchError] = React.useState<string>();
+  const [setupsVersion, setSetupsVersion] = React.useState(0);
   const [setupState, setSetupState] = React.useState<SetupState>();
   const [renderState, setRenderState] = React.useState<RenderState>({ status: "loading" });
   const [renderRetry, setRenderRetry] = React.useState(0);
@@ -279,6 +287,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const guidanceControllerRef = React.useRef<AbortController>();
   const guidanceAnimationKeyRef = React.useRef(0);
   const launchAbortRef = React.useRef<AbortController>();
+  const inFlightCatalogRef = React.useRef<string>();
   const mountedRef = React.useRef(true);
   const [guidance, setGuidance] = React.useState<GuidanceState>();
   const [navigationWarning, setNavigationWarning] = React.useState<string>();
@@ -301,13 +310,26 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
     labPath: string,
     trigger: HTMLElement,
     requestedPageURL?: string,
+    resumeSetup = false,
   ): Promise<void> => {
+    if (!mountedRef.current) return;
     launchTriggerRef.current = trigger;
+    if (inFlightCatalogRef.current === catalogRef && !launchAbortRef.current?.signal.aborted) {
+      setModuleSelectOpen(false);
+      setActivePanel((current) => {
+        if (!current || current.catalogRef !== catalogRef) return current;
+        const panel = { ...current, panelMode: "open" as const };
+        saveSession(panel);
+        return panel;
+      });
+      return;
+    }
     launchAbortRef.current?.abort();
     setModuleTitles({});
     setModuleSelectOpen(false);
     const controller = new AbortController();
     launchAbortRef.current = controller;
+    inFlightCatalogRef.current = catalogRef;
     const isCurrentLaunch = (): boolean => mountedRef.current && launchAbortRef.current === controller && !controller.signal.aborted;
     let openedPanel = false;
     setActivePanel(null);
@@ -335,7 +357,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       pendingFragmentRef.current = requestedPageURL
         ? new URL(requestedPageURL, window.location.origin).hash.slice(1) || undefined
         : undefined;
-      const needsSetup = bundle.runtimeContext.helmChartAvailable;
+      const needsSetup = bundle.runtimeContext.helmChartAvailable || resumeSetup;
       const panel: ActivePanel = {
         catalogRef,
         title: bundle.manifest.metadata.title,
@@ -352,7 +374,11 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       saveSession(panel);
 
       if (needsSetup) {
-        await setupLab(catalogRef, controller.signal);
+        if (!resumeSetup) {
+          await setupLab(catalogRef, controller.signal);
+          if (!isCurrentLaunch()) return;
+          setSetupsVersion((version) => version + 1);
+        }
         const finalStatus = await pollSetupUntilReady(catalogRef, controller.signal);
         if (!isCurrentLaunch()) return;
         if (finalStatus.attributes) {
@@ -369,7 +395,11 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       if (openedPanel) setSetupState({ status: "error", message });
       else setLaunchError(message);
     } finally {
-      if (isCurrentLaunch()) setLoadingCatalogRef(undefined);
+      if (launchAbortRef.current === controller) inFlightCatalogRef.current = undefined;
+      if (isCurrentLaunch()) {
+        setLoadingCatalogRef(undefined);
+        if (openedPanel) setSetupsVersion((version) => version + 1);
+      }
     }
   }, []);
 
@@ -402,10 +432,13 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const closePanel = React.useCallback(() => {
     setModuleSelectOpen(false);
     launchAbortRef.current?.abort();
+    inFlightCatalogRef.current = undefined;
     clearGuidance();
+    setLoadingCatalogRef(undefined);
+    if (setupState) setSetupsVersion((version) => version + 1);
     setSetupState(undefined);
     setActivePanel(null);
-  }, [clearGuidance]);
+  }, [clearGuidance, setupState]);
 
   const selectPage = React.useCallback((path: string): void => {
     setNavigationWarning(undefined);
@@ -683,8 +716,12 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   }, [renderState]);
 
   const value = React.useMemo(
-    () => ({ launch, loadingCatalogRef, launchError, defaultNamespace }),
-    [launch, launchError, loadingCatalogRef, defaultNamespace],
+    () => ({
+      launch, loadingCatalogRef, launchError, setupsVersion,
+      setupError: setupState?.status === "error" && activePanel ? { catalogRef: activePanel.catalogRef, message: setupState.message } : undefined,
+      defaultNamespace,
+    }),
+    [launch, launchError, loadingCatalogRef, setupsVersion, setupState, activePanel?.catalogRef, defaultNamespace],
   );
   const spotlightRect = guidance?.phase === "spotlight" && guidance.target
     ? guidance.target.getBoundingClientRect()
@@ -897,19 +934,28 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
 const useInteractiveLabs = (): InteractiveLabsContextValue | undefined =>
   React.useContext(InteractiveLabsContext);
 
-const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
+const LabItem: React.FC<{
+  catalogRef: string;
+  item?: CatalogEntry;
+  setup?: LabSetup;
+  disabled: boolean;
+  teardown?: React.ReactNode;
+}> = ({ catalogRef, item, setup, disabled, teardown }) => {
   const [state, setState] = React.useState<RenderState>({ status: "loading" });
   const [isExpanded, setIsExpanded] = React.useState(false);
   const [linkWarning, setLinkWarning] = React.useState<string>();
   const interactiveLabs = useInteractiveLabs();
+  const title = item?.title ?? setup?.release?.name ?? catalogRef;
   const defaultNamespace = interactiveLabs?.defaultNamespace;
-  const resourceRoot = `${PROXY_BASE}/api/v1alpha1/labs/${item.catalogRef}/resources/${item.labPath === "." ? "" : `${item.labPath.split("/").map(encodeURIComponent).join("/")}/`}`;
+  const resourceRoot = item ? `${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/resources/${item.labPath === "." ? "" : `${item.labPath.split("/").map(encodeURIComponent).join("/")}/`}` : "";
   const sourceURL = `${resourceRoot}lab.yaml`;
-  const itemId = `lab-${item.catalogRef}`;
+  const itemId = `lab-${catalogRef}`;
   const descriptionId = `${itemId}-description`;
+  const setupPending = setup?.status === "pending" && !disabled;
+  const actionDisabled = !interactiveLabs || disabled || (!setup && interactiveLabs?.loadingCatalogRef === catalogRef);
 
   const handleLink = React.useCallback((event: React.MouseEvent<HTMLDivElement>): void => {
-    if (event.defaultPrevented || event.button !== 0) return;
+    if (event.defaultPrevented || event.button !== 0 || !item) return;
     const link = (event.target as Element).closest("a[href]") as HTMLAnchorElement | null;
     const href = link?.getAttribute("href");
     if (!link || !href) return;
@@ -924,7 +970,11 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
     const pageRoot = `${resourceRoot}modules/`;
     if (target.origin === window.location.origin && target.pathname.startsWith(pageRoot)) {
       event.preventDefault();
-      void interactiveLabs?.launch(item.catalogRef, item.labPath, link, target.href);
+      if (actionDisabled) {
+        setLinkWarning("Lab cannot be opened until its setup is available.");
+        return;
+      }
+      void interactiveLabs?.launch(catalogRef, item.labPath, link, target.href, !!setup);
       return;
     }
     if ((target.protocol === "http:" || target.protocol === "https:") && target.origin !== window.location.origin) {
@@ -935,10 +985,10 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
     if (target.origin === window.location.origin && !target.pathname.startsWith(PROXY_BASE)) return;
     event.preventDefault();
     setLinkWarning(LINK_WARNING);
-  }, [interactiveLabs, item.catalogRef, item.labPath, resourceRoot, sourceURL]);
+  }, [actionDisabled, interactiveLabs, catalogRef, item, resourceRoot, setup, sourceURL]);
 
   React.useEffect(() => {
-    if (!item.description) return undefined;
+    if (!item?.description) return undefined;
     const controller = new AbortController();
     void renderAsciiDoc({
       source: item.description,
@@ -961,7 +1011,7 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
   }, [item, defaultNamespace]);
 
   const template = document.createElement("template");
-  if (state.status === "success") {
+  if (item?.description && state.status === "success") {
     template.innerHTML = state.result.html;
     template.content.querySelectorAll("button.copy-to-clipboard").forEach((button) => button.remove());
   }
@@ -982,11 +1032,15 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
       <DataListItemRow style={{ paddingBlockStart: "var(--pf-t--global--spacer--md)" }}>
         <DataListItemCells dataListCells={[
           <DataListCell key="name" width={5}>
-            <Title headingLevel="h2" size="lg" id={itemId}>{item.title}</Title>
-            {linkWarning && <Alert variant="warning" title={linkWarning} isInline />}
-            {item.description && state.status === "loading" && <Spinner aria-label={`Loading description for ${item.title}`} />}
-            {state.status === "error" && <Alert variant="warning" title={state.message} isInline />}
-            {state.status === "success" && state.result.warnings.map((warning, index) => (
+            <Title headingLevel="h2" size="lg" id={itemId}>{title}</Title>
+            {!item && setup && <>
+              {setup.release && <p>Helm release: {setup.release.name}</p>}
+              <p>SpaceRequests: {setup.spaceRequests.join(', ') || 'none'}</p>
+            </>}
+            {item && linkWarning && <Alert variant="warning" title={linkWarning} isInline />}
+            {item?.description && state.status === "loading" && <Spinner aria-label={`Loading description for ${title}`} />}
+            {item?.description && state.status === "error" && <Alert variant="warning" title={state.message} isInline />}
+            {item?.description && state.status === "success" && state.result.warnings.map((warning, index) => (
               <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
             ))}
             {previewHTML && (
@@ -1004,18 +1058,23 @@ const CatalogItem: React.FC<{ item: CatalogEntry }> = ({ item }) => {
             )}
           </DataListCell>,
         ]} />
-        <DataListAction id={`${itemId}-actions`} aria-labelledby={itemId} aria-label={`Actions for ${item.title}`}>
-          <Button
-            isLoading={interactiveLabs?.loadingCatalogRef === item.catalogRef}
-            isDisabled={!interactiveLabs}
-            onClick={(event) => void interactiveLabs?.launch(item.catalogRef, item.labPath, event.currentTarget)}
-          >
-            Launch
-          </Button>
+        <DataListAction id={`${itemId}-actions`} aria-labelledby={itemId} aria-label={`Actions for ${title}`}>
+          <div className="pfext-lab-catalog-actions" style={{ display: "flex", flexDirection: "column", gap: "var(--pf-t--global--spacer--sm)" }}>
+            {item && <Button
+              isLoading={!disabled && (setupPending || interactiveLabs?.loadingCatalogRef === catalogRef)}
+              isDisabled={actionDisabled}
+              spinnerAriaLabel={setupPending ? "Lab setup pending" : "Loading lab"}
+              onClick={(event) => void interactiveLabs?.launch(catalogRef, item.labPath, event.currentTarget, undefined, !!setup)}
+            >
+              {setup ? "Open" : "Launch"}
+            </Button>}
+            {teardown}
+            {interactiveLabs?.setupError?.catalogRef === catalogRef && <p role="alert">{interactiveLabs.setupError.message}</p>}
+          </div>
         </DataListAction>
       </DataListItemRow>
       {remainingHTML && (
-        <DataListContent id={descriptionId} aria-label={`Description for ${item.title}`} isHidden={!isExpanded}>
+        <DataListContent id={descriptionId} aria-label={`Description for ${title}`} isHidden={!isExpanded}>
           <div className="interactive-labs-content doc catalog-description" onClick={handleLink} dangerouslySetInnerHTML={{ __html: remainingHTML }} />
         </DataListContent>
       )}
@@ -1031,10 +1090,10 @@ const InteractiveLabsPage: React.FC = () => {
   const filteredItems =
     state.status === "success"
       ? state.items.filter((item) =>
-          `${item.title} ${item.description ?? ""}`
-            .toLowerCase()
-            .includes(filter.toLowerCase()),
-        )
+        `${item.title} ${item.description ?? ""}`
+          .toLowerCase()
+          .includes(filter.toLowerCase()),
+      )
       : [];
 
   React.useEffect(() => {
@@ -1060,49 +1119,74 @@ const InteractiveLabsPage: React.FC = () => {
   return (
     <PageSection>
       <Title headingLevel="h1">Interactive Labs</Title>
-
-      {state.status === "loading" && <Spinner aria-label="Loading labs" />}
-
-      {state.status === "error" && (
-        <>
-          <Alert variant="danger" title={state.message} isInline isLiveRegion />
-          <Button variant="link" onClick={() => setRetry((count) => count + 1)}>
-            Retry
-          </Button>
-        </>
-      )}
-
-      {interactiveLabs?.launchError && (
-        <Alert variant="danger" title={interactiveLabs.launchError} isInline isLiveRegion />
-      )}
-      {state.status === "success" && state.items.length === 0 && (
-        <EmptyState titleText="No labs available">
-          <EmptyStateBody>No labs are currently configured.</EmptyStateBody>
-        </EmptyState>
-      )}
-
-      {state.status === "success" && state.items.length > 0 && (
-        <>
-          <div style={{ marginBlockStart: "var(--pf-t--global--spacer--lg)", marginBottom: "var(--pf-t--global--spacer--md)" }}>
-            <TextInput
-              aria-label="Filter labs"
-              type="search"
-              value={filter}
-              onChange={(_event, value) => setFilter(value)}
-              placeholder="Filter by name or description"
-            />
-          </div>
-          {filteredItems.length === 0 ? (
-            <EmptyState titleText="No labs match your filter.">
-              <EmptyStateBody>Try a different name or description.</EmptyStateBody>
-            </EmptyState>
-          ) : (
-            <DataList aria-label="Available labs" isCompact isPlain>
-              {filteredItems.map((item) => <CatalogItem key={item.catalogRef} item={item} />)}
-            </DataList>
-          )}
-        </>
-      )}
+      <LabSetups
+        catalog={state.status === "loading" ? undefined : state.status === "success" ? state.items : []}
+        refreshVersion={interactiveLabs?.setupsVersion}
+      >
+        {({ items, existingCatalogRefs, disabledFor, teardown }) => {
+          const catalog = state.status === "success" ? state.items : [];
+          const existing = new Set(existingCatalogRefs);
+          const orphans = existingCatalogRefs.filter((catalogRef) => !catalog.some((item) => item.catalogRef === catalogRef));
+          const visibleRefs = [
+            ...filteredItems.filter((item) => existing.has(item.catalogRef)).map((item) => item.catalogRef),
+            ...orphans,
+            ...filteredItems.filter((item) => !existing.has(item.catalogRef)).map((item) => item.catalogRef),
+          ];
+          return (
+            <>
+              {state.status === "loading" && <Spinner aria-label="Loading labs" />}
+              {state.status === "error" && (
+                <>
+                  <Alert variant="danger" title={state.message} isInline isLiveRegion />
+                  <Button variant="link" onClick={() => setRetry((count) => count + 1)}>
+                    Retry
+                  </Button>
+                </>
+              )}
+              {interactiveLabs?.launchError && (
+                <Alert variant="danger" title={interactiveLabs.launchError} isInline isLiveRegion />
+              )}
+              {state.status === "success" && state.items.length === 0 && visibleRefs.length === 0 && (
+                <EmptyState titleText="No labs available">
+                  <EmptyStateBody>No labs are currently configured.</EmptyStateBody>
+                </EmptyState>
+              )}
+              {state.status === "success" && state.items.length > 0 && (
+                <>
+                  <div style={{ marginBlockStart: "var(--pf-t--global--spacer--lg)", marginBottom: "var(--pf-t--global--spacer--md)" }}>
+                    <TextInput
+                      aria-label="Filter labs"
+                      type="search"
+                      value={filter}
+                      onChange={(_event, value) => setFilter(value)}
+                      placeholder="Filter by name or description"
+                    />
+                  </div>
+                  {visibleRefs.length === 0 && (
+                    <EmptyState titleText="No labs match your filter.">
+                      <EmptyStateBody>Try a different name or description.</EmptyStateBody>
+                    </EmptyState>
+                  )}
+                </>
+              )}
+              {visibleRefs.length > 0 && (
+                <DataList aria-label="Available labs" isCompact isPlain>
+                  {visibleRefs.map((catalogRef) => (
+                    <LabItem
+                      key={catalogRef}
+                      catalogRef={catalogRef}
+                      item={catalog.find((item) => item.catalogRef === catalogRef)}
+                      setup={items.find((item) => item.catalogRef === catalogRef)}
+                      disabled={disabledFor(catalogRef)}
+                      teardown={teardown(catalogRef)}
+                    />
+                  ))}
+                </DataList>
+              )}
+            </>
+          );
+        }}
+      </LabSetups>
     </PageSection>
   );
 };

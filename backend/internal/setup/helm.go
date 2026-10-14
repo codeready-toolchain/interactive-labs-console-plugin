@@ -3,34 +3,58 @@ package setup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
-	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
 	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
+	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/release"
+	"helm.sh/helm/v3/pkg/storage/driver"
 	"helm.sh/helm/v3/pkg/strvals"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/client-go/kubernetes"
 )
 
 // HelmManager abstracts Helm operations for testability.
 type HelmManager interface {
 	ReleaseStatus(ctx context.Context, releaseName, namespace, token string) (string, error)
 	Install(ctx context.Context, opts HelmInstallOpts) error
-	ReleaseValues(ctx context.Context, releaseName, namespace, token string, paths []string) (map[string]string, error)
-	ListPods(ctx context.Context, token, namespace string) ([]PodSummary, error)
+	ListLabReleases(ctx context.Context, namespace, token string, srs []SpaceRequestResult) ([]LabRelease, error)
+	UninstallLabRelease(ctx context.Context, namespace, token string, target LabRelease, srs []SpaceRequestResult) error
 }
 
-// PodSummary holds the fields needed for post-failure diagnostics.
-type PodSummary struct {
-	Name   string
-	Phase  string
-	Ready  bool
-	Reason string
+// LabRelease carries a discovered snapshot. Chart and Config are request-local,
+// excluded from JSON, and removed from inventory; only annotated string paths may leave setup.
+type LabRelease struct {
+	Name           string                 `json:"name"`
+	Namespace      string                 `json:"-"`
+	CatalogRef     string                 `json:"catalogRef"`
+	Status         string                 `json:"status"`
+	Revision       int                    `json:"-"`
+	UID            string                 `json:"-"`
+	CleanupBlocked bool                   `json:"cleanupBlocked,omitempty"`
+	BlockedReason  BlockedReason          `json:"-"`
+	Config         map[string]interface{} `json:"-"`
+	Chart          *chart.Chart           `json:"-"`
+}
+
+func (r LabRelease) hasStorageIdentity(namespace string) bool {
+	return r.Name != "" && r.Namespace == namespace && r.UID != ""
+}
+
+// sameSummary preserves mutation/preflight guards without comparing secret values.
+func (r LabRelease) sameSummary(other LabRelease) bool {
+	return r.Name == other.Name && r.Namespace == other.Namespace && r.CatalogRef == other.CatalogRef &&
+		r.Status == other.Status && r.Revision == other.Revision && r.UID == other.UID &&
+		r.CleanupBlocked == other.CleanupBlocked && r.BlockedReason == other.BlockedReason
 }
 
 // HelmInstallOpts holds the parameters for a Helm install operation.
@@ -40,15 +64,15 @@ type HelmInstallOpts struct {
 	Namespace   string
 	Token       string
 	Values      map[string]string
+	Labels      map[string]string
 	Timeout     time.Duration
 }
 
 // HelmClient implements HelmManager using the Helm Go SDK.
 type HelmClient struct {
-	APIHost    string
-	CAFile     string
-	HTTPClient *http.Client
-	Logger     *slog.Logger
+	APIHost string
+	CAFile  string
+	Logger  *slog.Logger
 }
 
 func (c *HelmClient) newActionConfig(namespace, token string, debug bool) (*action.Configuration, error) {
@@ -62,6 +86,9 @@ func (c *HelmClient) newActionConfig(namespace, token string, debug bool) (*acti
 	configFlags.BearerToken = &tk
 	configFlags.CAFile = &caFile
 	configFlags.Namespace = &ns
+	// per-api-call timeout
+	timeout := "30s"
+	configFlags.Timeout = &timeout
 
 	debugFn := func(_ string, _ ...interface{}) {}
 	if debug && c.Logger != nil {
@@ -115,35 +142,48 @@ func (c *HelmClient) Install(ctx context.Context, opts HelmInstallOpts) error {
 
 	installAction := action.NewInstall(actionConfig)
 	installAction.ReleaseName = opts.ReleaseName
+	installAction.Labels = opts.Labels
 	installAction.Namespace = opts.Namespace
 	installAction.Wait = true
 	installAction.Timeout = opts.Timeout
 
-	_, err = installAction.RunWithContext(ctx, chrt, vals)
+	// check for context timeout or cancel before we start the operation.
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	// RunWithContext can return while Helm's internal installer keeps mutating.
+	// Wait for the installer to finish before releasing the operation reservation.
+	_, err = installAction.Run(chrt, vals)
 	if err != nil {
 		return fmt.Errorf("helm install: %w", err)
 	}
 	return nil
 }
 
-// ReleaseValues retrieves the user-supplied values from a deployed Helm release
-// and returns only those matching the given dot-separated paths.
-func (c *HelmClient) ReleaseValues(_ context.Context, releaseName, namespace, token string, paths []string) (map[string]string, error) {
-	actionConfig, err := c.newActionConfig(namespace, token, false)
-	if err != nil {
-		return nil, err
+// bindingValues resolves only requested value attributes from the verified snapshot.
+// Cleanup never needs to coalesce values or depend on the current chart schema.
+func (r LabRelease) bindingValues(bindings []SchemaBinding) (map[string]string, error) {
+	var paths []string
+	for _, b := range bindings {
+		if b.Kind != KindNamespaceName && b.Kind != KindRootURL {
+			paths = append(paths, b.Path)
+		}
 	}
-
-	statusAction := action.NewStatus(actionConfig)
-	rel, err := statusAction.Run(releaseName)
-	if err != nil {
-		return nil, fmt.Errorf("helm status: %w", err)
+	if len(paths) == 0 {
+		return nil, nil
 	}
-
+	values := r.Config
+	if r.Chart != nil {
+		merged, err := chartutil.CoalesceValues(r.Chart, r.Config)
+		if err != nil {
+			return nil, errors.New("unable to coalesce Helm values")
+		}
+		values = merged
+	}
 	result := make(map[string]string, len(paths))
 	for _, path := range paths {
-		if val, ok := extractNestedValue(rel.Config, path); ok {
-			result[path] = val
+		if value, ok := extractNestedValue(values, path); ok {
+			result[path] = value
 		}
 	}
 	return result, nil
@@ -170,64 +210,173 @@ func extractNestedValue(m map[string]interface{}, dotPath string) (string, bool)
 	return "", false
 }
 
-// ListPods returns a summary of all pods in the given namespace for diagnostics.
-func (c *HelmClient) ListPods(ctx context.Context, token, namespace string) ([]PodSummary, error) {
-	listURL := fmt.Sprintf("%s/api/v1/namespaces/%s/pods", c.APIHost, url.PathEscape(namespace))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list pods in %q: status %d", namespace, resp.StatusCode)
-	}
-
-	var list struct {
-		Items []struct {
-			Metadata struct {
-				Name string `json:"name"`
-			} `json:"metadata"`
-			Status struct {
-				Phase             string `json:"phase"`
-				Reason            string `json:"reason,omitempty"`
-				ContainerStatuses []struct {
-					Ready bool `json:"ready"`
-				} `json:"containerStatuses"`
-			} `json:"status"`
-		} `json:"items"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, err
-	}
-
-	pods := make([]PodSummary, 0, len(list.Items))
-	for _, item := range list.Items {
-		allReady := len(item.Status.ContainerStatuses) > 0
-		for _, cs := range item.Status.ContainerStatuses {
-			if !cs.Ready {
-				allReady = false
-				break
-			}
-		}
-		pods = append(pods, PodSummary{
-			Name:   item.Metadata.Name,
-			Phase:  item.Status.Phase,
-			Ready:  allReady,
-			Reason: item.Status.Reason,
-		})
-	}
-	return pods, nil
+func isReleaseNotFound(err error) bool {
+	return errors.Is(err, driver.ErrReleaseNotFound)
 }
 
-func isReleaseNotFound(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "not found")
+func (c *HelmClient) ListLabReleases(ctx context.Context, namespace, token string, srs []SpaceRequestResult) ([]LabRelease, error) {
+	cfg, err := c.newActionConfig(namespace, token, false)
+	if err != nil {
+		return nil, err
+	}
+	list := action.NewList(cfg)
+	list.StateMask = action.ListAll
+	list.Limit = 0
+	list.Selector = CatalogRefLabelKey
+	releases, err := list.Run()
+	if err != nil {
+		return nil, fmt.Errorf("list lab releases: %w", err)
+	}
+	restConfig, err := cfg.RESTClientGetter.ToRESTConfig()
+	if err != nil {
+		return nil, err
+	}
+	client, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LabRelease, 0, len(releases))
+	for _, rel := range releases {
+		ref, err := CatalogRefFromLabel(rel.Labels[CatalogRefLabelKey])
+		if err != nil || rel.Name == "" || rel.Namespace != namespace || rel.Info == nil {
+			return nil, errors.New("invalid lab release identity")
+		}
+		secret, err := client.CoreV1().Secrets(namespace).Get(ctx, fmt.Sprintf("sh.helm.release.v1.%s.v%d", rel.Name, rel.Version), metav1.GetOptions{})
+		if err != nil || secret == nil || secret.UID == "" {
+			return nil, errors.New("lab release storage identity unavailable")
+		}
+		reason := releaseCleanupBlockedReason(rel, verifiedHookNamespaces(namespace, ref, srs))
+		out = append(out, LabRelease{
+			Name: rel.Name, Namespace: namespace, CatalogRef: ref,
+			Status: string(rel.Info.Status), Revision: rel.Version, UID: string(secret.UID),
+			CleanupBlocked: reason != "", BlockedReason: reason, Config: rel.Config, Chart: rel.Chart,
+		})
+	}
+	return out, nil
+}
+
+// Only identity-marked, ready, dedicated SR targets can contain cleanup hooks.
+func verifiedHookNamespaces(home, ref string, srs []SpaceRequestResult) map[string]bool {
+	label, err := CatalogRefLabel(ref)
+	allowed := map[string]bool{}
+	if err != nil {
+		return allowed
+	}
+	for _, sr := range srs {
+		namespace := sr.readyNamespace()
+		if sr.Name != "" && sr.Namespace == home && sr.UID != "" &&
+			sr.Labels[CatalogRefLabelKey] == label && sr.Annotations[BindingKeyAnnotation] != "" &&
+			!sr.IsFailed() && namespace != "" && namespace != home {
+			allowed[namespace] = true
+		}
+	}
+	// A target also referenced by another lab is not dedicated to this release.
+	for _, sr := range srs {
+		if sr.Labels[CatalogRefLabelKey] != label {
+			delete(allowed, sr.TargetNamespace())
+		}
+	}
+	return allowed
+}
+
+func releaseCleanupBlockedReason(rel *release.Release, namespaces map[string]bool) BlockedReason {
+	if reason := manifestCleanupBlockedReason(rel.Manifest, false, nil); reason != "" {
+		return reason
+	}
+	for _, hook := range rel.Hooks {
+		if hook == nil {
+			return BlockedHelmHook
+		}
+		if reason := manifestCleanupBlockedReason(hook.Manifest, true, namespaces); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+func manifestCleanupBlockedReason(manifest string, hook bool, namespaces map[string]bool) BlockedReason {
+	// yaml.v3 rejects duplicate keys; JSON decoding then enforces field types.
+	decoder := yaml.NewDecoder(strings.NewReader(manifest))
+	resources := 0
+	for {
+		var document map[string]any
+		err := decoder.Decode(&document)
+		if errors.Is(err, io.EOF) {
+			if hook && resources == 0 {
+				return BlockedHelmHook
+			}
+			return ""
+		}
+		if err != nil {
+			return BlockedHelmManifest
+		}
+		if document == nil {
+			continue // Empty YAML documents do not represent resources.
+		}
+		var object struct {
+			APIVersion string `json:"apiVersion"`
+			Kind       string `json:"kind"`
+			Metadata   struct {
+				Name        string            `json:"name"`
+				Namespace   string            `json:"namespace"`
+				Annotations map[string]string `json:"annotations"`
+			} `json:"metadata"`
+		}
+		payload, err := json.Marshal(document)
+		if err != nil || json.Unmarshal(payload, &object) != nil {
+			return BlockedHelmManifest
+		}
+		if strings.EqualFold(strings.TrimSpace(object.Metadata.Annotations["helm.sh/resource-policy"]), "keep") {
+			return BlockedHelmRetained
+		}
+		if hook && (object.APIVersion != "batch/v1" || object.Kind != "Job" ||
+			object.Metadata.Name == "" || !namespaces[object.Metadata.Namespace]) {
+			return BlockedHelmHook
+		}
+		if !hook && (object.APIVersion == "" || object.Kind == "" || object.Metadata.Name == "") {
+			return BlockedHelmManifest
+		}
+		resources++
+	}
+}
+
+func (c *HelmClient) UninstallLabRelease(ctx context.Context, namespace, token string, target LabRelease, srs []SpaceRequestResult) error {
+	current, err := c.ListLabReleases(ctx, namespace, token, srs)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, rel := range current {
+		if rel.Name != target.Name {
+			continue
+		}
+		if !rel.sameSummary(target) || rel.CleanupBlocked || (rel.Status != "deployed" && rel.Status != "failed" && rel.Status != "pending-install") {
+			return errors.New("lab release changed or requires manual recovery")
+		}
+		found = true
+	}
+	if !found {
+		return errors.New("lab release disappeared before uninstall")
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	cfg, err := c.newActionConfig(namespace, token, false)
+	if err != nil {
+		return err
+	}
+	uninstall := action.NewUninstall(cfg)
+	uninstall.Wait = true
+	uninstall.Timeout = 300 * time.Second
+	if _, uninstallErr := uninstall.Run(target.Name); uninstallErr != nil {
+		return fmt.Errorf("uninstall lab release: %w", uninstallErr)
+	}
+	status := action.NewStatus(cfg)
+	_, err = status.Run(target.Name)
+	if !isReleaseNotFound(err) {
+		return errors.New("lab release uninstall could not be verified")
+	}
+	return nil
 }
 
 // BuildValues converts a flat map of dot-separated keys to a nested map
@@ -243,14 +392,12 @@ func BuildValues(flat map[string]string) (map[string]interface{}, error) {
 	return vals, nil
 }
 
-// MapBindingsToValues collects provisioned namespace names from SpaceRequests
-// and maps them to Helm values paths.
-func MapBindingsToValues(
-	ctx context.Context,
-	client *SpaceRequestClient,
-	token, namespace string,
-	bindings []NamespaceBinding,
-) (map[string]string, error) {
+// mapVerifiedBindingsToValues maps namespaces only after checking lab identity and UID.
+func mapVerifiedBindingsToValues(ctx context.Context, client *SpaceRequestClient, token, namespace, catalogRef string, bindings []SchemaBinding, uids map[string]string) (map[string]string, error) {
+	label, err := CatalogRefLabel(catalogRef)
+	if err != nil {
+		return nil, err
+	}
 	values := make(map[string]string, len(bindings))
 	for _, b := range bindings {
 		sr, err := client.GetSpaceRequest(ctx, token, namespace, b.Key)
@@ -259,6 +406,9 @@ func MapBindingsToValues(
 		}
 		if sr == nil {
 			return nil, fmt.Errorf("SpaceRequest %q not found", b.Key)
+		}
+		if !sr.matchesLabBinding(namespace, b.Key, label, b.Key) || sr.UID != uids[b.Key] {
+			return nil, errors.New("SpaceRequest identity changed")
 		}
 		if !sr.IsReady() {
 			return nil, fmt.Errorf("SpaceRequest %q not ready", b.Key)

@@ -56,6 +56,7 @@ type Result struct {
 	Manifest           *manifest.LabManifest
 	Modules            []Module // sorted by literal module ID
 	HelmChartAvailable bool
+	Revision           string // git commit SHA of the source snapshot
 }
 
 // ValidateCloneArgs validates an approved repository URL and branch.

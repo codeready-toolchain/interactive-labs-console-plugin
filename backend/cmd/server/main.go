@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -60,32 +61,26 @@ func main() {
 	catalogEvents := inClusterCatalogEventPoster(log, serverConfig.Namespace)
 
 	cfg := handler.Config{
-		CatalogSource: catalogSource,
-		BundleLoader:  cache.LoadBundle,
-		SetupPreparer: func(_ context.Context, repository, branch, labPath, subject, catalogRef string) (*setup.Plan, error) {
-			var plan *setup.Plan
-			err := cache.WithSnapshot(repository, branch, func(root string) error {
-				var err error
-				plan, err = setup.Prepare(root, labPath, subject, catalogRef)
-				return err
-			})
-			return plan, err
-		},
-		ResourceLoader:       cache.ReadResource,
-		CatalogLabOmitted:    catalogEvents,
-		Logger:               log,
-		Authenticate:         inClusterIdentityResolver(),
-		RuntimeAttributes:    inClusterRuntimeAttributes(log),
-		SetupClient:          inClusterSetupClient(log),
-		SpaceRequestTierName: "base1ns",
-		HelmManager:          inClusterHelmClient(log),
-		HelmTimeout:          helmTimeout(),
-		ClusterIngressDomain: inClusterIngressDomain(log),
+		CatalogSource:     catalogSource,
+		BundleLoader:      cache.LoadBundle,
+		ResourceLoader:    cache.ReadResource,
+		CatalogLabOmitted: catalogEvents,
+		Logger:            log,
+		Authenticate:      inClusterIdentityResolver(),
+		RuntimeAttributes: inClusterRuntimeAttributes(log),
+		SetupManager: setup.NewManager(setup.ManagerConfig{
+			WithSnapshot:         cache.WithSnapshot,
+			SpaceRequests:        inClusterSetupClient(log),
+			TierName:             "base1ns",
+			Helm:                 inClusterHelmClient(log),
+			Coordinator:          inClusterOperationCoordinator(log, serverConfig.Namespace),
+			HelmTimeout:          helmTimeout(),
+			ClusterIngressDomain: inClusterIngressDomain(log),
+		}),
 	}
 
 	backend := &http.Server{
 		Addr:         backendAddr,
-		Handler:      combinedHandler(handler.NewRouter(cfg), pluginAssets),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 600 * time.Second, // Helm setup can be slow
 	}
@@ -93,6 +88,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	var shuttingDown atomic.Bool
 	refreshCoordinator := bundle.NewRefreshCoordinator(
 		loadCatalogEntries(catalogSource),
 		cache.Refresh,
@@ -102,6 +98,11 @@ func main() {
 		serverConfig.CacheRefreshInterval,
 		int(serverConfig.CacheConcurrentRefreshLimit),
 	)
+	cfg.ReadinessCheck = func() bool {
+		return refreshCoordinator.IsReady() && !shuttingDown.Load()
+	}
+	backend.Handler = combinedHandler(handler.NewRouter(cfg), pluginAssets)
+
 	watchDone := make(chan struct{})
 	go func() {
 		defer close(watchDone)
@@ -118,7 +119,15 @@ func main() {
 	go serveTLS(log, "backend", backend, backendTLSCert, backendTLSKey)
 
 	<-ctx.Done()
-	log.Info("shutting down")
+	// Signal not-ready before draining connections so Kubernetes removes the pod
+	// from Service endpoints while existing requests finish. The server keeps
+	// accepting in-flight requests during this window; Shutdown() follows once
+	// endpoint removal has propagated. The total (5s + 15s) fits within the
+	// default 30s terminationGracePeriodSeconds.
+	shuttingDown.Store(true)
+	log.Info("shutting down, waiting for endpoint removal")
+	time.Sleep(5 * time.Second)
+	log.Info("draining connections")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	backend.Shutdown(shutCtx) //nolint:errcheck
@@ -301,6 +310,20 @@ func newClusterCatalogSource(client kubernetes.Interface, namespace string) func
 	}
 }
 
+func inClusterOperationCoordinator(log *slog.Logger, namespace string) *setup.OperationCoordinator {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Warn("setup coordinator unavailable", "err", err)
+		return nil
+	}
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Warn("setup coordinator unavailable", "err", err)
+		return nil
+	}
+	return setup.NewOperationCoordinator(client, namespace)
+}
+
 func inClusterSetupClient(log *slog.Logger) *setup.SpaceRequestClient {
 	caPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	apiHost := fmt.Sprintf("https://%s", os.Getenv("KUBERNETES_SERVICE_HOST")+":"+os.Getenv("KUBERNETES_SERVICE_PORT"))
@@ -337,12 +360,7 @@ func inClusterHelmClient(log *slog.Logger) setup.HelmManager {
 		log.Warn("helm client unavailable: KUBERNETES_SERVICE_HOST not set")
 		return nil
 	}
-	client, err := tlsClientWithCA(caPath)
-	if err != nil {
-		log.Warn("helm client unavailable", "err", err)
-		return nil
-	}
-	return &setup.HelmClient{APIHost: apiHost, CAFile: caPath, HTTPClient: client, Logger: log}
+	return &setup.HelmClient{APIHost: apiHost, CAFile: caPath, Logger: log}
 }
 
 func helmTimeout() time.Duration {
