@@ -4,11 +4,11 @@ This guide is for authors who already know AsciiDoc, OpenShift, and Helm. It wal
 
 ## Choose how to catalog the sample
 
-You can catalog this repository directly with `labPath: examples/sample-lab` and launch its two content pages without setup. An administrator must approve the repository's HTTPS URL and branch in the catalog. See the [administrator guide](../../dev/docs/administrator-guide.md#configure-catalog) for details.
+You can catalog this repository directly with `labPath: examples/sample-lab` and launch its two content pages with the included illustrative chart. An administrator must approve the repository's HTTPS URL and branch in the catalog. See the [administrator guide](../../dev/docs/administrator-guide.md#configure-catalog) for details.
 
-### Use the sample chart from a standalone repository
+### Publish the sample in a standalone repository
 
-The sample chart is illustrative. To activate it, copy the sample's contents—not the enclosing directory—to the root of a new, standalone repository:
+The sample chart works in either repository layout. To publish the sample separately, copy the sample's contents—not the enclosing directory—to the root of a new, standalone repository:
 
 ```sh
 # From this plugin repository's root; choose a new, empty destination.
@@ -37,8 +37,6 @@ data:
 Apply the manifest with `oc apply -f catalog.yaml`. The `data.catalog.yaml` value is a YAML sequence stored as a multiline string. If the ConfigMap already lists other labs, keep those entries in the sequence; applying this manifest replaces the sequence.
 
 You can also catalog the sample directly from this plugin repository by using its published HTTPS URL and branch, with `labPath: examples/sample-lab`.
-
-Chart discovery uses the repository root, not the lab directory: only `<repository-root>/setup/helm/Chart.yaml` activates setup, and that chart is shared by every lab in the repository. Cataloging `examples/sample-lab` here does **not** activate its nested chart. Do not move the chart to this plugin repository's root. For a standalone lab with content only, omit `setup/`.
 
 ## Understand the file layout and navigation
 
@@ -74,12 +72,12 @@ Use source-relative paths for files. To refer to a page in another module, for e
 
 Use local PNG, JPEG, GIF, or WebP images. Remote images, remote includes, and author-provided SVG are not supported. Add meaningful alt text to images. Arbitrary scripts, selectors, and extensions are not allowed, and rendered output is sanitized. Include nesting is limited to 64 levels.
 
-Use page xrefs to navigate between pages and local fragments to move within a page. Jumping to a section in another document is currently not supported:
+Use page xrefs to navigate between known pages and fragments to scroll to sections inside the drawer, including sections on another page. Missing sections do not scroll:
 
 ```asciidoc
 xref:020-resources.adoc[]              // Open another page
 <<try-links,Try links>>                // Jump within the current page
-xref:020-resources.adoc#setup[Setup]   // Not supported: jump to a section in another document
+xref:010-start.adoc#try-links[Try links] // Jump to a section on another known page
 ```
 
 ### Lab attributes
@@ -97,7 +95,7 @@ spec:
 
 Administrators can override them per catalog entry under `attributeOverrides`, as in the full ConfigMap example above; this is not a top-level ConfigMap `data` key. In AsciiDoc, `{greeting}, welcome to {lab-title}.` uses the effective values. These substitutions affect rendered content only; `lab-title` does not replace `metadata.title` or change the catalog display title.
 
-Asciidoctor receives these as **soft settings** (`name@`), which means a header declaration such as `:local-note: ...` can override a supplied value. Avoid redefining runtime or setup attribute names. This sample uses `ifdef::namespaces-demo[]` and `ifndef::namespaces-demo[]` so it can render both layouts without unresolved setup placeholders.
+Asciidoctor receives these as **soft settings** (`name@`), which means a header declaration such as `:local-note: ...` can override a supplied value. Avoid redefining runtime or setup attribute names. This sample uses `ifdef::namespaces-demo[]` and `ifndef::namespaces-demo[]` so it can render with or without setup attributes without unresolved placeholders.
 
 ## Link to the OpenShift Console
 
@@ -114,11 +112,28 @@ The resource target is `version/Kind` or `group/version/Kind`. Put the label fir
 
 To open a specific namespaced resource's details, provide both its namespace and name. For example, `resource:v1/ConfigMap[Sample ConfigMap,namespace={namespaces-demo},name=sample-info]` opens the named ConfigMap. Providing only a name opens a filtered list, not the resource details page. Console handles resource existence and RBAC; these links do not create resources and leave the lab drawer open. See the [content contract](../../dev/docs/lab-content-contract.md#implemented-authoring-rules) for the full rules.
 
-## Add optional Helm setup
+## Understand the Helm setup
+
+Helm setup can be colocated with the lab: put the chart in `<labPath>/setup/helm`, beside `lab.yaml` and `modules/`. This sample already uses that layout, so its chart works both when cataloged here with `labPath: examples/sample-lab` and when copied into a standalone repository with `labPath: .`.
+
+Chart selection follows these rules:
+
+1. A nonempty `spec.setupDir` selects the chart directory itself, relative to the lab directory. It is authoritative: a missing or invalid chart fails validation without falling back.
+2. Otherwise, use `<labPath>/setup/helm` when that directory exists. An invalid lab-local chart does not trigger fallback.
+3. Only when the lab-local directory is absent, try `<repository-root>/setup/helm`.
+
+For example, a lab at `labs/intro` can select a shared chart at `<repository-root>/shared/chart`:
+
+```yaml
+spec:
+  setupDir: ../../shared/chart
+```
+
+The selected chart must remain within the approved repository; symlinks in the chart path or tree are rejected. Labs may share chart files, but never installed Helm releases or SpaceRequests. See the [chart-selection contract](../../dev/docs/lab-content-contract.md#prerequisite-chart-selection) for details. For a content-only lab, omit `spec.setupDir` and ensure neither default chart directory exists; in a standalone repository, omit `setup/`.
 
 The sample chart creates only a `sample-info` ConfigMap and a `sample-credentials` Secret in a provisioned demo namespace. It has no dependencies, Pods, application, Service, or Route.
 
-When root-level chart discovery is active, Launch starts asynchronous setup. It creates or reuses SpaceRequests in `<user>-dev`, waits for them to become ready, and installs Helm using the current user's credentials. The frontend polls until setup is ready and deployed before showing the pages. This requires CodeReady Toolchain SpaceRequests, the user's home namespace and permissions, and cluster ingress configuration; it is not a generic namespace selector.
+When a chart is available, Launch starts asynchronous setup. It creates or reuses SpaceRequests in `<user>-dev`, waits for them to become ready, and installs Helm using the current user's credentials. The frontend polls until setup is ready and deployed before showing the pages. This requires CodeReady Toolchain SpaceRequests, the user's home namespace and permissions, and cluster ingress configuration; it is not a generic namespace selector.
 
 Place annotations on the exact JSON Schema `properties` paths that match Helm values, not in a separate annotation tree. The sample's [values schema](setup/helm/values.schema.json) shows all three supported kinds, and its [resource templates](setup/helm/templates/resources.yaml) consume the values:
 

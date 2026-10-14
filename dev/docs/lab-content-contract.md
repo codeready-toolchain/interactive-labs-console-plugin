@@ -20,7 +20,7 @@ See [catalog ConfigMap contract](../efforts/interactive-labs/contract/catalog-co
 
 ## Implemented bundle format
 
-Backend expects this layout (`setup/helm/` belongs to repository root and is shared by its labs):
+Backend expects this layout (chart directories are optional):
 
 ```text
 <labPath>/
@@ -34,7 +34,9 @@ Backend expects this layout (`setup/helm/` belongs to repository root and is sha
     020-apply/
       content/
         010-apply.adoc
-<repository-root>/setup/helm/Chart.yaml  # optional chart
+  setup/helm/Chart.yaml           # optional lab-local default chart
+  setup/helm/values.schema.json   # optional schema beside chart
+<repository-root>/setup/helm/Chart.yaml  # optional fallback chart
 ```
 
 `lab.yaml` is strict YAML; only these fields are supported:
@@ -47,6 +49,7 @@ metadata:
   description: Optional catalog description
 spec:                              # optional
   attributes: {}                   # optional map of strings
+  setupDir: ../../shared/chart     # optional direct chart-directory override
 ```
 
 `metadata.title` must be nonempty. Unknown or old fields (including `metadata.name`, `metadata.displayName`, and root `spec.checkpoints`) are rejected, not ignored. The optional description is displayed in catalog, not as module/drawer metadata.
@@ -66,6 +69,22 @@ checkpoints:
 Each checkpoint needs nonempty string `id`, `type: manual`, `pagePath`, and `label`. Backend normalizes `pagePath` relative to **that module's** `content/` (`010-start.adoc` or `pages/010-start.adoc`); it must match a navigable page, never an include-only, missing, traversing, or other-module page. IDs must be unique per module; they may repeat in different modules. Checkpoints are validated authoring data only: no checkpoint UI, attestation, completion, persistence, or checkpoint field in bundle response. Evidence and manual-checkpoint semantics remain open.
 
 `GET /api/v1alpha1/labs/{catalogRef}/bundle` returns `apiVersion: v1alpha1`, `kind: LabBundle`, validated `manifest` (with effective attributes), `runtimeContext`, and **only** `modules: [{id, pages: [{path, url}]}]`, never flat `pages`. Each path is lab-relative, e.g. `modules/010-intro/content/010-start.adoc`; its backend-relative URL targets `.../resources/<labPath>/modules/010-intro/content/010-start.adoc` (omit `<labPath>/` when `labPath: .`). Backend does not extract page titles or process AsciiDoc includes. Browser validates modules, paths, and exact approved proxy URLs before launch.
+
+## Prerequisite chart selection
+
+`spec.setupDir` is an optional string naming the **chart directory itself**, relative to the lab directory, not a parent containing `helm/`. For `labPath: labs/intro`, `setupDir: ../../shared/chart` selects `<repository-root>/shared/chart`; `setupDir: setup/helm` selects the lab-local chart. An omitted or empty string uses defaults:
+
+1. Nonempty `spec.setupDir` is authoritative. A missing or invalid target invalidates the lab; no fallback occurs.
+2. Otherwise select `<labPath>/setup/helm` when that directory exists.
+3. Only when the lab-local directory is absent, try `<repository-root>/setup/helm`.
+
+Neither implicit directory present means a content-only lab. A present but invalid selected directory/chart is never treated as content-only and never triggers fallback. Backend validates the selected chart with its installed Helm loader; invalid chart configuration invalidates bundle loading and uses existing catalog omission/Warning Event handling.
+
+Parent traversal is allowed only inside the approved repository snapshot. Absolute paths, absolute URLs, backslashes, control characters, encoded-looking `%xx` text, repository escapes, and symlinks are rejected. Checks include every path segment before normalization and the entire selected chart tree, including chart metadata, schema, templates, subchart directories, dangling links, and files excluded by `.helmignore`. Browser content/resource path rules do not change.
+
+Chart and `values.schema.json` always come from the same selected directory. Shared `chart` owns selection, safe path/tree validation, Helm-loader validation, and optional schema decoding. Schema is optional for bundle loading; when present it must be a readable JSON object with correctly typed supported property-tree and annotation fields (for example, `x-interactive-labs.kind: 42` is rejected). This validates structure, not full JSON Schema semantics. Unknown fields/kinds remain allowed. Bundle validates this contract early without importing provisioning code; an absent schema or `{}` is valid bundle content. `setup` interprets decoded annotations and separately requires a schema declaring at least one `namespace-name` binding, preserving existing setup error mapping and namespace/reference policy.
+
+Helm release identity includes normalized repository-relative **effective chart path**, authenticated user, unchanged `catalogRef`, and sorted namespace binding keys. Equivalent relative spellings, absolute snapshot locations, revisions, and chart contents do not affect identity. Labs may share chart files but keep separate installed releases per user/catalog identity. Changing the effective chart path does not trigger automatic migration or cleanup. A compatible, verified existing same-lab release remains authoritative for reopening and polling; replacing it requires explicitly confirmed teardown.
 
 ## Attributes
 
@@ -106,7 +125,7 @@ Backend reads cluster configuration with its service account on each bundle requ
 - Navigable pages sort lexically; first is entry page; `_` paths remain include-only. Relative links resolve from active source and navigate drawer only when result matches known page descriptor; same-page fragments remain anchors. Absolute external HTTP(S) links open safe new tab. Same-origin non-plugin-proxy links use Console navigation while drawer stays open. Plugin backend resource URLs and unknown relative links warn. A validated description link to `modules/<id>/content/...` explicitly launches target after bundle validation and chart setup.
 - Render documented restricted AsciiDoc subset with exact pinned dependencies. Bundle attributes, overlaid by successful setup attributes, are supplied as Asciidoctor soft settings (`name@`); document header declarations can override them. DOMPurify's final AsciiDoc pass uses its default allowlist (HTML, SVG, SVG filters, and MathML) and forbids `style`/`form` elements and `style` attributes; it runs before Mermaid insertion. No custom allowlist or hook is configured. Highlight source from text content; Mermaid runs strict with no auto-start or click/callback binding and native SVG labels (`htmlLabels: false`). Its separate DOMPurify SVG/SVG-filter-profile pass forbids `form` and retains allowed `style` elements, `style` attributes, and SVG filter elements. Renderer enforces include depth 64; it adds no include-count or aggregate-content limit.
 - Recoverable rejected content/resources and Mermaid/highlighter failures render explicit inline warnings. Page fetch, conversion, or sanitizer failures render safe actionable page error. Remote includes, arbitrary executable extensions, arbitrary filesystem access, unsupported raw HTML or author-supplied SVG, and arbitrary DOM selectors never execute.
-- `console:<quickstart-data-id>[label]` accepts only fixed 25-ID Console registry entries; authors supply no route or selector. Route-backed IDs navigate once, then wait up to 10 seconds for their exact visible `data-quickstart-id`; visible-only IDs never navigate. Found targets receive non-modal, dismissible spotlight; route-backed misses remain at fixed route and visible-only misses announce unavailable.
+- `console:<quickstart-data-id>[label]` accepts only fixed 25-ID Console registry entries; authors supply no route or selector. Guidance spotlights already-visible `data-quickstart-id` targets without navigating. The two Topology IDs (`qs-nav-topology`, `qs-admin-nav-topology`) also accept the other marker, preferring the requested visible marker. For hidden targets inside collapsed Console PatternFly nav sections, guidance clicks only their validated ancestor disclosure buttons, outermost-first; it waits up to 10 seconds for expansion commits and leaves sections open, never activating the destination target or opening the whole sidebar. If no visible or expandable target exists, route-backed IDs navigate once and wait up to 10 seconds, attempting ancestor expansion again when targets appear; visible-only IDs never navigate. Found targets receive non-modal, dismissible spotlight. Failed expansion announces unavailable without fallback navigation; route-backed misses after navigation remain at the fixed route.
 - `resource:<apiVersion>/<Kind>[label,scope=namespaced|cluster,name=...,namespace=...]` requires two or three GVK components (`version/kind` or `group/version/kind`) and enforces scope and the attribute schema, with the label as the first list item and optional named fields following it. `name` and `namespace` accept processor-supplied selector values, for example `resource:project.openshift.io/v1/Project[View *{user}* project,scope=cluster,name={user}-datasphere]`. Cluster scope rejects `namespace`. Every GVK component and nonempty supplied value, including unresolved or malformed attribute text, is URI-encoded; empty supplied selector values are rejected. For namespaced resources, omitted namespace defaults to the active Console project; All Projects or an empty selection keeps the all-namespaces route, while authored namespace takes precedence. A name without authored namespace remains a `?name=`-filtered kind list, scoped to the active project when selected, not a detail page; authored namespace plus name opens namespaced details. Cluster scope is unaffected by project selection. Active-project changes rerender resource links in both drawer content and catalog descriptions. Console resolves resource existence. The label uses supported restricted AsciiDoc inline formatting and runtime attribute substitution. No author-controlled plural, route, selector, scope path, filter syntax, or URL is accepted; interpolation or passthrough never applies to author-controlled URLs. Resource links use normal same-origin navigation and retain drawer.
 - Module-local `type: manual` checkpoints are inert authoring data. Browser-local attestation remains a provisional idea; no checkpoint UI or completion claim exists. Evidence/checkpoint rules and section-solver behavior remain open.
 

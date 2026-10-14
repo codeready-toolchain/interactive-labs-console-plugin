@@ -8,18 +8,15 @@ import (
 	"net/http"
 	"slices"
 
-	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/bundle"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/catalog"
 	laberr "github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/errors"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/setup"
 )
 
 type setupContext struct {
-	token    string
-	subject  string
-	entry    *catalog.Entry
-	result   *bundle.Result
-	bindings []setup.SchemaBinding
+	token   string
+	subject string
+	entry   *catalog.Entry
 }
 
 func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*setupContext, bool) {
@@ -41,49 +38,16 @@ func resolveSetupContext(w http.ResponseWriter, r *http.Request, cfg Config) (*s
 		return nil, false
 	}
 
-	loader := cfg.BundleLoader
-	if loader == nil {
-		writeError(w, http.StatusServiceUnavailable,
-			laberr.New(laberr.TypeRepositoryError, "bundle loader not configured", nil))
-		return nil, false
-	}
-	result, err := loader(r.Context(), entry.Repository, entry.Branch, entry.LabPath)
-	if err != nil {
-		writeError(w, http.StatusBadGateway,
-			laberr.New(laberr.TypeRepositoryError, "failed to load lab bundle", nil))
-		return nil, false
-	}
-
-	if result.ValuesSchema == nil {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeChartNotFound, "lab has no values schema", nil))
-		return nil, false
-	}
-
 	if cfg.SetupManager == nil {
 		writeError(w, http.StatusServiceUnavailable,
 			laberr.New(laberr.TypeConfigurationError, "setup client not configured", nil))
 		return nil, false
 	}
 
-	bindings, err := setup.ParseSchemaBindings(result.ValuesSchema)
-	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeConfigurationError, "invalid values schema", nil))
-		return nil, false
-	}
-	if len(setup.BindingsByKind(bindings, setup.KindNamespaceName)) == 0 {
-		writeError(w, http.StatusUnprocessableEntity,
-			laberr.New(laberr.TypeConfigurationError, "values schema declares no namespace bindings", nil))
-		return nil, false
-	}
-
 	return &setupContext{
-		token:    token,
-		subject:  subject,
-		entry:    entry,
-		result:   result,
-		bindings: bindings,
+		token:   token,
+		subject: subject,
+		entry:   entry,
 	}, true
 }
 
@@ -93,7 +57,7 @@ func handleSetup(w http.ResponseWriter, r *http.Request, cfg Config) {
 	if !ok {
 		return
 	}
-	status, ready, err := cfg.SetupManager.Start(r.Context(), sctx.subject, sctx.token, sctx.entry.CatalogRef, sctx.result.HelmChartDir, sctx.bindings)
+	status, ready, err := cfg.SetupManager.Start(r.Context(), sctx.subject, sctx.token, *sctx.entry)
 	if err != nil {
 		writeSetupManagerError(w, err)
 		return
@@ -110,7 +74,7 @@ func handleSetupStatus(w http.ResponseWriter, r *http.Request, cfg Config) {
 	if !ok {
 		return
 	}
-	status, err := cfg.SetupManager.Status(r.Context(), sctx.subject, sctx.token, sctx.entry.CatalogRef, sctx.bindings)
+	status, err := cfg.SetupManager.Status(r.Context(), sctx.subject, sctx.token, *sctx.entry)
 	if err != nil {
 		writeSetupManagerError(w, err)
 		return
@@ -129,6 +93,7 @@ func writeSetupManagerError(w http.ResponseWriter, err error) {
 		return
 	}
 	status := http.StatusServiceUnavailable
+	errorType := laberr.TypeConfigurationError
 	switch managerErr.Kind {
 	case setup.ManagerConflict:
 		status = http.StatusConflict
@@ -140,8 +105,16 @@ func writeSetupManagerError(w http.ResponseWriter, err error) {
 		status = http.StatusNotFound
 	case setup.ManagerUnavailable:
 		status = http.StatusServiceUnavailable
+	case setup.ManagerPreparationUnavailable:
+		errorType = laberr.TypeRepositoryError
+	case setup.ManagerPreparationFailed:
+		status, errorType = http.StatusBadGateway, laberr.TypeRepositoryError
+	case setup.ManagerChartNotFound:
+		status, errorType = http.StatusUnprocessableEntity, laberr.TypeChartNotFound
+	case setup.ManagerSchemaInvalid:
+		status = http.StatusUnprocessableEntity
 	}
-	writeError(w, status, laberr.New(laberr.TypeConfigurationError, managerErr.Message, nil))
+	writeError(w, status, laberr.New(errorType, managerErr.Message, nil))
 }
 
 func setupIdentity(w http.ResponseWriter, r *http.Request, cfg Config) (string, string, bool) {

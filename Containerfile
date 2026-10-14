@@ -6,15 +6,16 @@ COPY frontend/ ./
 RUN npm run build
 
 FROM --platform=${BUILDPLATFORM} golang:1.27-alpine AS backend
-ARG TARGETOS
-ARG TARGETARCH
-ARG COMMIT=unknown
-ARG BUILDTIME=unknown
 
 WORKDIR /src
 COPY backend/go.mod backend/go.sum ./backend/
 RUN cd backend && go mod download
 COPY backend/ ./backend/
+ARG TARGETOS
+ARG TARGETARCH
+ARG COMMIT=unknown
+ARG BUILDTIME=unknown
+
 RUN echo "Building the binary for $TARGETOS/$TARGETARCH with commit $COMMIT and buildtime $BUILDTIME"
 RUN cd backend && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags "-X main.commit=${COMMIT} -X main.buildtime=${BUILDTIME}" -o /out/interactive-labs ./cmd/server
 

@@ -69,6 +69,7 @@ func main() {
 		Authenticate:      inClusterIdentityResolver(),
 		RuntimeAttributes: inClusterRuntimeAttributes(log),
 		SetupManager: setup.NewManager(setup.ManagerConfig{
+			WithSnapshot:         cache.WithSnapshot,
 			SpaceRequests:        inClusterSetupClient(log),
 			TierName:             "base1ns",
 			Helm:                 inClusterHelmClient(log),

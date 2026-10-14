@@ -4,10 +4,12 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { TextEncoder } from 'node:util';
 import * as React from 'react';
 import * as ReactDOM from 'react-dom';
 import { act } from 'react-dom/test-utils';
 import { useActiveNamespace } from '@openshift-console/dynamic-plugin-sdk';
+import { Nav, NavExpandable, NavList } from '@patternfly/react-core';
 import { InteractiveLabsPage, InteractiveLabsProvider } from './InteractiveLabsPage';
 import type { CatalogList } from './types/catalog';
 import type { LabError } from './types/errors';
@@ -18,6 +20,18 @@ import { extractAsciiDocTitle, renderAsciiDoc } from './renderer';
 
 jest.mock('./api/client');
 jest.mock('./renderer', () => ({ renderAsciiDoc: jest.fn(), extractAsciiDocTitle: jest.fn() }));
+// Real processor for fragment regressions; other component tests keep their renderer mock.
+jest.mock('@asciidoctor/core', () => {
+  const script = document.createElement('script');
+  script.src = `file://${__dirname}/../node_modules/@asciidoctor/core/build/node/index.cjs`;
+  const currentScript = jest.spyOn(document, 'currentScript', 'get').mockReturnValue(script);
+  try {
+    return jest.requireActual('../node_modules/@asciidoctor/core/build/node/index.cjs');
+  } finally {
+    currentScript.mockRestore();
+  }
+});
+Object.assign(globalThis, { TextEncoder });
 const mockNavigate = jest.fn();
 let mockLocation = { pathname: '/interactive-labs', search: '' };
 jest.mock('react-router-dom-v5-compat', () => ({
@@ -1759,30 +1773,126 @@ describe('InteractiveLabsPage', () => {
     expect(pageTitle.querySelector('em')?.textContent).toBe('running');
   });
 
-  test('navigates relative known pages and preserves same-page and cross-page fragments', async () => {
-    mockLoadLabBundle.mockResolvedValue(noChartBundle);
-    mockRenderAsciiDoc.mockImplementation(({ sourceURL }) => Promise.resolve({
-      html: sourceURL.endsWith('a-first.adoc')
-        ? '<a href="#local">Local fragment</a><a href="z-last.adoc#target">Linked page</a>'
-        : '<h2 id="target">Target</h2>',
-      warnings: [],
-    }));
-    await renderCatalog();
+  describe('rendered fragment navigation', () => {
+    const realRenderer = jest.requireActual<typeof import('./renderer')>('./renderer');
+    const scroll = jest.fn();
+    const hostClick = jest.fn();
+    const originalScroll = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollIntoView');
+    let host: HTMLDivElement;
+    let open: jest.SpyInstance;
 
-    await act(async () => { getButton(/^Launch$/).click(); });
-    const local = Array.from(container.querySelectorAll('a')).find((link) => link.textContent === 'Local fragment')!;
-    const localEvent = new MouseEvent('click', { bubbles: true, cancelable: true });
-    local.dispatchEvent(localEvent);
-    expect(localEvent.defaultPrevented).toBe(false);
-    expect(container.textContent).toContain('pages/a-first.adoc');
-
-    await act(async () => {
-      Array.from(container.querySelectorAll('a')).find((link) => link.textContent === 'Linked page')!.dispatchEvent(
-        new MouseEvent('click', { bubbles: true, cancelable: true }),
-      );
+    beforeEach(async () => {
+      // Given real AsciiDoc with overlapping ID suffixes and per-render namespacing.
+      Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scroll });
+      scroll.mockClear();
+      hostClick.mockClear();
+      host = document.createElement('div');
+      document.body.prepend(host);
+      open = jest.spyOn(window, 'open').mockImplementation(() => null);
+      mockLoadLabBundle.mockResolvedValue(noChartBundle);
+      mockRenderAsciiDoc.mockImplementation(realRenderer.renderAsciiDoc);
+      mockFetchResourceText.mockImplementation(async (url) => url === firstPage.url ? [
+        '= First page', '',
+        '[[other-try-links]]', '== Similar section', '',
+        '[[try-links]]', '== Try links', '',
+        '<<try-links,Return *here*>>', '',
+        'xref:z-last.adoc#try-links[Linked page]', '',
+        'xref:z-last.adoc#caf%C3%A9[Encoded section]', '',
+        '<<missing,Missing local section>>', '',
+        'xref:z-last.adoc#missing[Missing linked section]',
+      ].join('\n') : [
+        '= Last page', '',
+        '[[other-try-links]]', '== Similar target', '',
+        '[[try-links]]', '== Target section', '',
+        '[[café]]', '== Encoded target', '',
+        '[[other-missing]]', '== Not the missing target',
+      ].join('\n'));
+      await renderCatalog({ ...sampleCatalog, items: [{
+        ...sampleCatalog.items[0],
+        description: 'xref:modules/010-intro/content/pages/z-last.adoc#caf%C3%A9[Open section]',
+      }] });
+      await act(async () => { getButton(/^Launch$/).click(); });
+      document.addEventListener('click', hostClick);
     });
-    expect(container.textContent).toContain('pages/z-last.adoc');
-    expect(mockFetchResourceText).toHaveBeenCalledWith(lastPage.url, expect.any(AbortSignal));
+
+    afterEach(() => {
+      document.removeEventListener('click', hostClick);
+      host.remove();
+      open.mockRestore();
+      if (originalScroll) Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', originalScroll);
+      else delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
+    });
+
+    test.each([
+      ['plain', {}], ['Ctrl', { ctrlKey: true }], ['Meta', { metaKey: true }],
+      ['Shift', { shiftKey: true }], ['Alt', { altKey: true }],
+    ])('given a same-page fragment, when %s-clicked, then scroll only drawer target and suppress browser and host handling', async (_name, modifiers) => {
+      const content = container.querySelector('.interactive-labs-content:not(.catalog-description)')!;
+      const target = Array.from(content.querySelectorAll('h2')).find((heading) => heading.textContent === 'Try links')!;
+      const link = content.querySelector<HTMLAnchorElement>('a[href^="#interactive-labs-"]')!;
+      expect(target.id).toMatch(/^interactive-labs-.+-try-links$/);
+      expect(link.getAttribute('href')).toBe(`#${target.id}`);
+      host.innerHTML = `<h2 id="${target.id}">Host duplicate</h2>`;
+      const renderCount = mockRenderAsciiDoc.mock.calls.length;
+
+      // When clicking nested inline markup, not merely the anchor itself.
+      const click = new MouseEvent('click', { bubbles: true, cancelable: true, ...modifiers });
+      await act(async () => { link.querySelector('strong')!.dispatchEvent(click); });
+
+      expect(click.defaultPrevented).toBe(true);
+      expect(hostClick).not.toHaveBeenCalled();
+      expect(scroll.mock.contexts).toEqual([target]);
+      expect(mockRenderAsciiDoc).toHaveBeenCalledTimes(renderCount);
+      expect(container.textContent).toContain('Page 1 of 2');
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(open).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      ['Linked page', 'Target section'], ['Encoded section', 'Encoded target'],
+    ])('given a cross-page fragment %s, when clicked, then resolve original ID to the new rendered drawer target', async (label, heading) => {
+      host.innerHTML = '<h2 id="try-links">Host target</h2><h2 id="café">Host encoded target</h2>';
+      const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === label)!;
+      const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+
+      await act(async () => { link.dispatchEvent(click); });
+
+      const target = Array.from(container.querySelectorAll('.interactive-labs-content h2')).find((candidate) => candidate.textContent === heading)!;
+      expect(target.id).toMatch(/^interactive-labs-/);
+      expect(scroll.mock.contexts).toEqual([target]);
+      expect(click.defaultPrevented).toBe(true);
+      expect(hostClick).not.toHaveBeenCalled();
+      expect(container.textContent).toContain('Page 2 of 2');
+      expect(mockFetchResourceText).toHaveBeenCalledWith(lastPage.url, expect.any(AbortSignal));
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(open).not.toHaveBeenCalled();
+    });
+
+    test.each(['Missing local section', 'Missing linked section'])('given %s, when clicked, then safely consume it without scrolling host or suffix lookalikes', async (label) => {
+      host.innerHTML = '<h2 id="missing">Host only</h2>';
+      const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === label)!;
+      const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+
+      await act(async () => { link.dispatchEvent(click); });
+
+      expect(click.defaultPrevented).toBe(true);
+      expect(hostClick).not.toHaveBeenCalled();
+      expect(scroll).not.toHaveBeenCalled();
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(open).not.toHaveBeenCalled();
+    });
+
+    test('given a description page fragment, when launched, then scroll to its namespaced target after rendering', async () => {
+      await act(async () => { getButton(/^Close lab$/i).click(); });
+      hostClick.mockClear();
+      const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Open section')!;
+
+      await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+
+      const target = Array.from(container.querySelectorAll('.interactive-labs-content h2')).find((candidate) => candidate.textContent === 'Encoded target')!;
+      expect(scroll.mock.contexts).toEqual([target]);
+      expect(container.textContent).toContain('Page 2 of 2');
+    });
   });
 
   test('opens external links safely, retains drawer for Console links, and warns for plugin or unknown links', async () => {
@@ -2243,6 +2353,324 @@ describe('InteractiveLabsPage', () => {
     expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
     expect(scrollIntoView).toHaveBeenCalled();
     expect(container.querySelector('[role="status"]')?.textContent).toMatch(/highlighted/i);
+  });
+
+  describe.each([
+    ['qs-nav-topology', 'qs-admin-nav-topology'],
+    ['qs-admin-nav-topology', 'qs-nav-topology'],
+  ])('topology guidance requested as %s with alternate %s', (requestedID, alternateID) => {
+    afterEach(() => { act(() => { ReactDOM.unmountComponentAtNode(container); }); });
+
+    test('given alternate marker already visible, when guidance activates, then spotlight without navigation', async () => {
+      const target = guidanceTarget(alternateID);
+      await launchGuidanceLab(`<a href="/topology" data-interactive-labs-guidance-id="${requestedID}">Topology</a>`);
+      const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Topology')!;
+      expect(link.getAttribute('href')).toBe('/topology');
+
+      await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+      expect(document.activeElement).toBe(target);
+    });
+
+    test('given no visible marker, when alternate appears after fallback navigation, then spotlight it', async () => {
+      mockNavigate.mockImplementation((route: string) => { mockLocation = { pathname: route, search: '' }; });
+      await launchGuidanceLab(`<a href="/topology" data-interactive-labs-guidance-id="${requestedID}">Topology</a>`);
+      const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Topology')!;
+
+      await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+      expect(mockNavigate).toHaveBeenCalledTimes(1);
+      expect(mockNavigate).toHaveBeenCalledWith('/topology');
+      expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+      const target = guidanceTarget(alternateID);
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+
+      expect(mockNavigate).toHaveBeenCalledTimes(1);
+      expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+      expect(document.activeElement).toBe(target);
+    });
+
+    test('given both visible markers in reverse DOM order, when guidance activates, then requested marker wins', async () => {
+      const alternate = guidanceTarget(alternateID, { left: 220, right: 320, top: 10, bottom: 40 });
+      const requested = guidanceTarget(requestedID);
+      await launchGuidanceLab(`<a href="/topology" data-interactive-labs-guidance-id="${requestedID}">Topology</a>`);
+      const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === 'Topology')!;
+
+      await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(container.querySelector<HTMLElement>('.interactive-labs-guidance-ring')?.style.left).toBe('10px');
+      expect(document.activeElement).toBe(requested);
+      expect(document.activeElement).not.toBe(alternate);
+    });
+  });
+
+  describe('collapsed Console navigation guidance', () => {
+    let navContainer: HTMLDivElement;
+    let disclosures: string[];
+    let commits: Map<string, () => void>;
+    let destinationClick: jest.Mock;
+
+    beforeEach(() => {
+      navContainer = document.createElement('div');
+      document.body.appendChild(navContainer);
+      disclosures = [];
+      commits = new Map();
+      destinationClick = jest.fn((event: React.MouseEvent) => event.preventDefault());
+    });
+
+    afterEach(() => {
+      act(() => {
+        ReactDOM.unmountComponentAtNode(navContainer);
+        ReactDOM.unmountComponentAtNode(container);
+      });
+      navContainer.remove();
+    });
+
+    const Section = ({ id, children }: { id: string; children: React.ReactNode }): React.ReactElement => {
+      const [expanded, setExpanded] = React.useState(false);
+      return <NavExpandable id={id} title={id} isExpanded={expanded} onExpand={(_event, value) => {
+        disclosures.push(id);
+        // Hold React's commit so guidance cannot mistake an in-flight expansion for a miss.
+        commits.set(id, () => setExpanded(value));
+      }}>{children}</NavExpandable>;
+    };
+
+    const Target = ({ id = 'qs-nav-search' }: { id?: string }): React.ReactElement =>
+      <li className="pf-v6-c-nav__item"><a href="/destination" data-quickstart-id={id} onClick={destinationClick}>Destination</a></li>;
+
+    const renderNav = (children: React.ReactNode): HTMLElement => {
+      act(() => { ReactDOM.render(<Nav><NavList>{children}</NavList></Nav>, navContainer); });
+      for (const element of Array.from(navContainer.querySelectorAll<HTMLElement>('button, a'))) {
+        element.getBoundingClientRect = () => ({
+          left: 10, right: 110, top: 10, bottom: 40, x: 10, y: 10,
+          width: element.closest('[hidden], [inert]') ? 0 : 100,
+          height: element.closest('[hidden], [inert]') ? 0 : 30,
+          toJSON: () => ({}),
+        }) as DOMRect;
+      }
+      return navContainer.querySelector<HTMLElement>('[data-quickstart-id]')!;
+    };
+
+    const activate = async (text = 'Search'): Promise<void> => {
+      const link = Array.from(container.querySelectorAll('a')).find((candidate) => candidate.textContent === text)!;
+      await act(async () => { link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
+    };
+    const commit = async (id: string): Promise<void> => {
+      expect(commits.has(id)).toBe(true);
+      await act(async () => { commits.get(id)!(); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+    };
+
+    test.each([
+      ['qs-nav-search', '/search-page'],
+      ['qs-nav-home', '#'],
+    ])('given one collapsed section for %s, when guidance activates, then expand before navigation and spotlight without activating destination', async (id, href) => {
+      const target = renderNav(<Section id="workloads"><Target id={id} /></Section>);
+      await launchGuidanceLab(`<a href="${href}" data-interactive-labs-guidance-id="${id}">Search</a>`);
+
+      await activate();
+      expect(disclosures).toEqual(['workloads']);
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+      // Observer churn before React commits must not toggle again or navigate.
+      await act(async () => { navContainer.classList.add('changed'); });
+      expect(disclosures).toEqual(['workloads']);
+      await commit('workloads');
+
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+      expect(document.activeElement).toBe(target);
+      expect(destinationClick).not.toHaveBeenCalled();
+      await act(async () => { document.body.click(); });
+      expect(navContainer.querySelector('#workloads')?.getAttribute('aria-expanded')).toBe('true');
+    });
+
+    test('given nested collapsed ancestors, when guidance activates, then expand outermost first and leave unrelated section untouched', async () => {
+      const target = renderNav(<>
+        <Section id="outer"><Section id="inner"><Target /></Section></Section>
+        <Section id="unrelated"><Target id="qs-nav-builds" /></Section>
+      </>);
+      await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>');
+
+      await activate();
+      expect(disclosures).toEqual(['outer']);
+      await commit('outer');
+      expect(disclosures).toEqual(['outer', 'inner']);
+      expect(mockNavigate).not.toHaveBeenCalled();
+      await commit('inner');
+
+      expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+      expect(document.activeElement).toBe(target);
+      expect(navContainer.querySelector('#unrelated')?.getAttribute('aria-expanded')).toBe('false');
+      expect(destinationClick).not.toHaveBeenCalled();
+    });
+
+    test('given existing spotlight, when replacement guidance expands nested ancestors, then stale dismissal cannot cancel expansion or spotlight', async () => {
+      const previousTarget = guidanceTarget('qs-nav-topology');
+      const target = renderNav(<Section id="outer"><Section id="inner"><Target /></Section></Section>);
+      await launchGuidanceLab([
+        '<a href="/topology" data-interactive-labs-guidance-id="qs-nav-topology">Topology</a>',
+        '<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>',
+      ].join(''));
+      await activate('Topology');
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+      expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+      expect(document.activeElement).toBe(previousTarget);
+
+      await activate();
+      expect(disclosures).toEqual(['outer']);
+      await commit('outer');
+      expect(disclosures).toEqual(['outer', 'inner']);
+      await commit('inner');
+
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(destinationClick).not.toHaveBeenCalled();
+      expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+      expect(document.activeElement).toBe(target);
+      expect(container.querySelector('[role="status"]')?.textContent).toMatch(/highlighted/i);
+    });
+
+    test.each([
+      ['qs-nav-topology', 'qs-admin-nav-topology'],
+      ['qs-admin-nav-topology', 'qs-nav-topology'],
+    ])('given hidden topology alternate %s/%s, when guidance activates, then expand alternate without navigating', async (requested, alternate) => {
+      const target = renderNav(<Section id="workloads"><Target id={alternate} /></Section>);
+      await launchGuidanceLab(`<a href="/topology" data-interactive-labs-guidance-id="${requested}">Topology</a>`);
+
+      await activate('Topology');
+      expect(disclosures).toEqual(['workloads']);
+      expect(mockNavigate).not.toHaveBeenCalled();
+      await commit('workloads');
+
+      expect(document.activeElement).toBe(target);
+      expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+      expect(destinationClick).not.toHaveBeenCalled();
+    });
+
+    test('given visible requested topology and hidden alternate, when guidance activates, then do not open alternate section', async () => {
+      const target = renderNav(<>
+        <Section id="workloads"><Target id="qs-admin-nav-topology" /></Section>
+        <Target id="qs-nav-topology" />
+      </>);
+      const requested = navContainer.querySelector('[data-quickstart-id="qs-nav-topology"]');
+      await launchGuidanceLab('<a href="/topology" data-interactive-labs-guidance-id="qs-nav-topology">Topology</a>');
+
+      await activate('Topology');
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+
+      expect(disclosures).toEqual([]);
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(requested);
+      expect(document.activeElement).not.toBe(target);
+    });
+
+    test('given collapsed ancestor appearing after navigation, when observer probes, then expand and spotlight', async () => {
+      mockNavigate.mockImplementation((route: string) => { mockLocation = { pathname: route, search: '' }; });
+      await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>');
+      await activate();
+      expect(mockNavigate).toHaveBeenCalledTimes(1);
+      expect(mockNavigate).toHaveBeenCalledWith('/search-page');
+
+      let target!: HTMLElement;
+      await act(async () => { target = renderNav(<Section id="workloads"><Target /></Section>); });
+      expect(disclosures).toEqual(['workloads']);
+      await commit('workloads');
+
+      expect(mockNavigate).toHaveBeenCalledTimes(1);
+      expect(document.activeElement).toBe(target);
+      expect(container.querySelector('.interactive-labs-guidance-ring')).not.toBeNull();
+      expect(destinationClick).not.toHaveBeenCalled();
+    });
+
+    test.each(['wrong-label', 'outside-nav', 'lab-content-nav', 'destination-link', 'foreign-button', 'disabled-button', 'hidden-sidebar', 'lookalike-marker'])('given %s relationship, when guidance activates, then no disclosure or destination activation', async (malformation) => {
+      renderNav(<Section id="workloads"><Target /></Section>);
+      const section = navContainer.querySelector('section')!;
+      const button = navContainer.querySelector('button')!;
+      if (malformation === 'wrong-label') section.setAttribute('aria-labelledby', 'other');
+      if (malformation === 'outside-nav') navContainer.querySelector('nav')!.classList.remove('pf-v6-c-nav');
+      if (malformation === 'lab-content-nav') navContainer.classList.add('interactive-labs-content');
+      if (malformation === 'disabled-button') button.disabled = true;
+      if (malformation === 'lookalike-marker') navContainer.querySelector<HTMLElement>('[data-quickstart-id]')!.dataset.quickstartId = 'qs-nav-search-other';
+      if (malformation === 'destination-link') {
+        const link = document.createElement('a');
+        link.id = button.id;
+        link.className = button.className;
+        link.setAttribute('aria-expanded', 'false');
+        link.addEventListener('click', () => disclosures.push('destination-link'));
+        button.replaceWith(link);
+      }
+      if (malformation === 'foreign-button') navContainer.appendChild(button);
+      if (malformation === 'hidden-sidebar') navContainer.hidden = true;
+      await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>');
+
+      await activate();
+
+      expect(disclosures).toEqual([]);
+      expect(destinationClick).not.toHaveBeenCalled();
+      expect(mockNavigate).toHaveBeenCalledTimes(1);
+      expect(mockNavigate).toHaveBeenCalledWith('/search-page');
+      expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+    });
+
+    test('given malformed inner section, when guidance activates, then valid outer section is not opened either', async () => {
+      renderNav(<Section id="outer"><Section id="inner"><Target /></Section></Section>);
+      navContainer.querySelector('#inner')!.parentElement!.querySelector('section')!.setAttribute('aria-labelledby', 'outer');
+      await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>');
+
+      await activate();
+
+      expect(disclosures).toEqual([]);
+      expect(destinationClick).not.toHaveBeenCalled();
+      expect(mockNavigate).toHaveBeenCalledWith('/search-page');
+    });
+
+    test('given expansion that never commits, when wait expires, then announce unavailable without retrying toggle or navigating', async () => {
+      jest.useFakeTimers();
+      try {
+        renderNav(<Section id="workloads"><Target /></Section>);
+        await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>');
+        await activate();
+
+        await act(async () => { jest.advanceTimersByTime(10_000); });
+
+        expect(disclosures).toEqual(['workloads']);
+        expect(mockNavigate).not.toHaveBeenCalled();
+        expect(destinationClick).not.toHaveBeenCalled();
+        expect(container.querySelector('[role="status"]')?.textContent).toMatch(/unavailable/i);
+        await act(async () => { commits.get('workloads')!(); jest.advanceTimersByTime(16); });
+        expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    test('given pending React expansion, when drawer closes, then observer cannot open nested section after commit', async () => {
+      renderNav(<Section id="outer"><Section id="inner"><Target /></Section></Section>);
+      await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>');
+      await activate();
+      expect(disclosures).toEqual(['outer']);
+
+      await act(async () => { getButton(/close/i).click(); });
+      await commit('outer');
+
+      expect(disclosures).toEqual(['outer']);
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(container.querySelector('.interactive-labs-guidance-ring')).toBeNull();
+    });
+
+    test('given untrusted guidance, when clicked, then collapsed ancestor remains untouched', async () => {
+      renderNav(<Section id="workloads"><Target /></Section>);
+      await launchGuidanceLab('<a href="/search-page" data-interactive-labs-guidance-id="qs-nav-search">Search</a>', false);
+      await activate();
+      expect(disclosures).toEqual([]);
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(destinationClick).not.toHaveBeenCalled();
+      expect(container.textContent).toContain('Link is unavailable or unsafe.');
+    });
   });
 
   test('rejects a forged guidance marker rather than spotlighting its matching target', async () => {
