@@ -386,7 +386,7 @@ func BuildValues(flat map[string]string) (map[string]interface{}, error) {
 	vals := map[string]interface{}{}
 	for k, v := range flat {
 		if err := strvals.ParseInto(k+"="+v, vals); err != nil {
-			return nil, fmt.Errorf("parse helm value %s=%s: %w", k, v, err)
+			return nil, fmt.Errorf("parse helm value %s: %w", k, err)
 		}
 	}
 	return vals, nil

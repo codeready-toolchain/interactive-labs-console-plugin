@@ -125,6 +125,7 @@ func subjectHomeSpace(subject string) string { return subject + "-dev" }
 func (m *Manager) labRelease(ctx context.Context, namespace, token, ref string) (*LabRelease, error) {
 	releases, err := m.config.Helm.ListLabReleases(ctx, namespace, token, nil)
 	if err != nil {
+		LoggerFromContext(ctx).Error("ListLabReleases failed", "namespace", namespace, "ref", ref, "err", err)
 		return nil, managerError(ManagerBadGateway, "Unable to check Helm setup. Check permissions before retrying.")
 	}
 	var existing *LabRelease
@@ -153,6 +154,7 @@ func (m *Manager) Start(ctx context.Context, subject, token string, entry catalo
 	}
 	ref := entry.CatalogRef
 	if _, err := CatalogRefLabel(ref); err != nil {
+		LoggerFromContext(ctx).Error("invalid catalog ref in Start", "namespace", subjectHomeSpace(subject), "ref", ref, "err", err)
 		return Status{}, false, managerError(ManagerBadRequest, "invalid catalog identity")
 	}
 	plan, err := m.prepare(entry, subject)
@@ -165,8 +167,10 @@ func (m *Manager) Start(ctx context.Context, subject, token string, entry catalo
 	bindings, chartDir := plan.Bindings, plan.ChartDir
 	operationCtx, id, finish, err := m.config.Coordinator.acquire(ctx, subject, ref, false)
 	if err != nil {
+		LoggerFromContext(ctx).Error("coordinator acquire failed", "namespace", subjectHomeSpace(subject), "ref", ref, "err", err)
 		return Status{}, false, managerError(ManagerConflict, "lab setup or teardown is already running")
 	}
+	operationCtx = ContextWithLogger(operationCtx, LoggerFromContext(ctx))
 	release := func() { _ = finish(false) }
 	workerOwnsLock := false
 	defer func() {
@@ -193,6 +197,7 @@ func (m *Manager) Start(ctx context.Context, subject, token string, entry catalo
 	// Inspect all bindings for this lab, including names removed from its schema.
 	srs, err := m.config.SpaceRequests.ListSpaceRequestsForLab(preflightCtx, token, namespace, ref)
 	if err != nil {
+		LoggerFromContext(ctx).Error("ListSpaceRequestsForLab failed", "namespace", namespace, "ref", ref, "err", err)
 		if existing != nil {
 			return Status{}, false, managerError(ManagerConflict, "Existing lab namespace bindings changed. Clean up before relaunch.")
 		}
@@ -225,6 +230,7 @@ func (m *Manager) Start(ctx context.Context, subject, token string, entry catalo
 	}
 	status, err := m.config.Helm.ReleaseStatus(preflightCtx, releaseName, namespace, token)
 	if err != nil || status != "" {
+		LoggerFromContext(ctx).Error("unverified release status", "release", releaseName, "namespace", namespace, "status", status, "err", err)
 		return Status{}, false, managerError(ManagerConflict, "Unverified existing lab release. Contact an administrator before retrying.")
 	}
 
@@ -262,11 +268,13 @@ func (m *Manager) ensureLabBindingUID(ctx context.Context, token, namespace, ref
 		if errors.Is(err, errSpaceRequestTerminating) {
 			return "", managerError(ManagerConflict, "Lab namespaces are still terminating. Wait for cleanup before relaunch.")
 		}
+		LoggerFromContext(ctx).Error("EnsureSpaceRequestForLab failed", "namespace", namespace, "bindingKey", bindingKey, "ref", ref, "err", err)
 		return "", managerError(ManagerBadGateway, "failed to create SpaceRequest")
 	}
 	label, _ := CatalogRefLabel(ref) // Ensure already validated the catalog identity.
 	sr, err := m.config.SpaceRequests.GetSpaceRequest(ctx, token, namespace, bindingKey)
 	if err != nil || !sr.matchesLabBinding(namespace, bindingKey, label, bindingKey) || sr.DeletionTimestamp != "" {
+		LoggerFromContext(ctx).Error("SpaceRequest identity verification failed", "namespace", namespace, "bindingKey", bindingKey, "err", err)
 		return "", managerError(ManagerConflict, "SpaceRequest identity changed; refresh before retrying.")
 	}
 	return sr.UID, nil
@@ -299,6 +307,7 @@ func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, 
 		}
 		select {
 		case <-pollCtx.Done():
+			LoggerFromContext(ctx).Error("timed out waiting for SpaceRequests", "namespace", namespace, "ref", ref, "err", err)
 			fail("timed out waiting for SpaceRequests")
 			return
 		case <-time.After(managerPollInterval):
@@ -311,6 +320,7 @@ func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, 
 	if len(pwBindings) > 0 {
 		passwords, err := GeneratePasswordValues(pwBindings)
 		if err != nil {
+			LoggerFromContext(ctx).Error("GeneratePasswordValues failed", "namespace", namespace, "ref", ref, "err", err)
 			fail("password generation failed")
 			return
 		}
@@ -320,11 +330,13 @@ func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, 
 	}
 	for _, b := range urlBindings {
 		if m.config.ClusterIngressDomain == "" {
+			LoggerFromContext(ctx).Error("cluster ingress domain not configured", "namespace", namespace, "ref", ref)
 			fail("cluster ingress domain not configured")
 			return
 		}
 		ns := namespaces[BindingPath(nsBindings, b.NamespaceRef)]
 		if ns == "" {
+			LoggerFromContext(ctx).Error("root-url references unknown namespace binding", "namespace", namespace, "ref", ref, "namespaceRef", b.NamespaceRef)
 			fail("root-url references unknown namespace binding")
 			return
 		}
@@ -332,6 +344,7 @@ func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, 
 	}
 	label, err := CatalogRefLabel(ref)
 	if err != nil {
+		LoggerFromContext(ctx).Error("invalid catalog identity in worker", "namespace", namespace, "ref", ref, "err", err)
 		fail("invalid catalog identity")
 		return
 	}
@@ -346,6 +359,7 @@ func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, 
 		ChartDir: chartDir, ReleaseName: releaseName, Namespace: namespace, Token: token,
 		Values: values, Labels: map[string]string{CatalogRefLabelKey: label}, Timeout: timeout,
 	}); err != nil {
+		LoggerFromContext(ctx).Error("Helm install failed", "release", releaseName, "namespace", namespace, "ref", ref, "err", err)
 		fail("Helm install failed")
 		return
 	}
@@ -378,6 +392,7 @@ func (m *Manager) Status(ctx context.Context, subject, token string, entry catal
 	for _, b := range nsBindings {
 		sr, readErr := m.config.SpaceRequests.GetSpaceRequest(ctx, token, namespace, b.Key)
 		if readErr != nil {
+			LoggerFromContext(ctx).Error("GetSpaceRequest failed", "namespace", namespace, "bindingKey", b.Key, "err", readErr)
 			return Status{}, managerError(ManagerBadGateway, "Unable to check SpaceRequests. Check permissions before retrying.")
 		}
 		if sr == nil {
@@ -453,6 +468,7 @@ func (m *Manager) observeHelmSetup(ctx context.Context, subject, token, ref, rel
 			if srStatus == "ready" && result.Status == "deployed" {
 				values, err = existing.bindingValues(bindings)
 				if err != nil {
+					LoggerFromContext(ctx).Error("bindingValues failed", "release", existing.Name, "namespace", namespace, "err", err)
 					return helmSetupObservation{}, managerError(ManagerBadGateway, "Unable to resolve Helm setup attributes. Refresh or contact an administrator.")
 				}
 			}
@@ -472,6 +488,7 @@ func (m *Manager) observeHelmSetup(ctx context.Context, subject, token, ref, rel
 		if releaseStatus == "" && result.Status == "pending" && srStatus != "failed" {
 			tornDown, err := m.config.Coordinator.HasTeardownReceipt(ctx, subject, ref)
 			if err != nil {
+				LoggerFromContext(ctx).Error("HasTeardownReceipt failed", "namespace", namespace, "ref", ref, "err", err)
 				return helmSetupObservation{}, managerError(ManagerUnavailable, "Unable to check lab recovery. Retry status.")
 			}
 			if tornDown {
@@ -545,10 +562,12 @@ func (m *Manager) readLabInventory(ctx context.Context, subject, token, reserved
 	namespace := subjectHomeSpace(subject)
 	srs, err := m.config.SpaceRequests.ListSpaceRequestsForLab(ctx, token, namespace, "")
 	if err != nil {
+		LoggerFromContext(ctx).Error("ListSpaceRequestsForLab failed", "namespace", namespace, "err", err)
 		return nil, managerError(ManagerBadGateway, "Unable to list lab setups. Check permissions or ask an administrator for help.")
 	}
 	releases, err := m.config.Helm.ListLabReleases(ctx, namespace, token, srs)
 	if err != nil {
+		LoggerFromContext(ctx).Error("ListLabReleases failed", "namespace", namespace, "err", err)
 		return nil, managerError(ManagerBadGateway, "Unable to list lab setups. Check permissions or ask an administrator for help.")
 	}
 	byRef := map[string]*LabSetup{}
@@ -561,6 +580,7 @@ func (m *Manager) readLabInventory(ctx context.Context, subject, token, reserved
 	for _, sr := range srs {
 		ref, err := CatalogRefFromLabel(sr.Labels[CatalogRefLabelKey])
 		if err != nil {
+			LoggerFromContext(ctx).Error("CatalogRefFromLabel failed", "namespace", namespace, "spaceRequest", sr.Name, "label", sr.Labels[CatalogRefLabelKey], "err", err)
 			return nil, managerError(ManagerBadGateway, "Unable to list lab setups. Check permissions or ask an administrator for help.")
 		}
 		item := get(ref)
@@ -569,10 +589,12 @@ func (m *Manager) readLabInventory(ctx context.Context, subject, token, reserved
 	}
 	for _, rel := range releases {
 		if _, err := CatalogRefLabel(rel.CatalogRef); err != nil || !rel.hasStorageIdentity(namespace) {
+			LoggerFromContext(ctx).Error("release identity check failed", "release", rel.Name, "catalogRef", rel.CatalogRef, "namespace", namespace)
 			return nil, managerError(ManagerBadGateway, "Unable to list lab setups. Check permissions or ask an administrator for help.")
 		}
 		item := get(rel.CatalogRef)
 		if item.Release != nil {
+			LoggerFromContext(ctx).Error("duplicate release for catalog ref", "catalogRef", rel.CatalogRef, "namespace", namespace)
 			return nil, managerError(ManagerBadGateway, "Unable to list lab setups. Check permissions or ask an administrator for help.")
 		}
 		snapshot := rel
@@ -671,8 +693,10 @@ func (m *Manager) BeginTeardown(ctx context.Context, subject, token, ref, genera
 	}
 	operationCtx, id, finish, err := m.config.Coordinator.AcquireTeardown(ctx, subject, ref)
 	if err != nil {
+		LoggerFromContext(ctx).Error("AcquireTeardown failed", "namespace", subjectHomeSpace(subject), "ref", ref, "err", err)
 		return TeardownProgress{}, managerError(ManagerConflict, "Lab setup or teardown is running or needs administrator recovery.")
 	}
+	operationCtx = ContextWithLogger(operationCtx, LoggerFromContext(ctx))
 	target, err := m.teardownTarget(operationCtx, subject, token, ref, generation)
 	if err != nil {
 		_ = finish(false)
@@ -711,6 +735,7 @@ func (m *Manager) TeardownStatus(ctx context.Context, subject, ref, id string) (
 		return TeardownProgress{}, managerError(ManagerNotFound, "Teardown operation not found. Refresh lab setups.")
 	}
 	if err != nil {
+		LoggerFromContext(ctx).Error("TeardownStatus failed", "namespace", subjectHomeSpace(subject), "ref", ref, "operationId", id, "err", err)
 		return TeardownProgress{}, managerError(ManagerUnavailable, "Unable to check teardown status. Retry or contact an administrator.")
 	}
 	return teardownProgress(ref, id, status), nil
@@ -735,6 +760,7 @@ func (m *Manager) validateTeardown(subject, token, ref, generation string) error
 func (m *Manager) teardownTarget(ctx context.Context, subject, token, ref, generation string) (*LabSetup, error) {
 	items, err := m.readLabInventory(ctx, subject, token, ref)
 	if err != nil {
+		LoggerFromContext(ctx).Error("readLabInventory failed during teardown", "namespace", subjectHomeSpace(subject), "ref", ref, "err", err)
 		return nil, managerTeardownFailure()
 	}
 	for i := range items {
@@ -756,6 +782,7 @@ func (m *Manager) teardownReserved(ctx context.Context, subject, token, ref stri
 	namespace := subjectHomeSpace(subject)
 	currentSRs, err := m.config.SpaceRequests.ListSpaceRequestsForLab(ctx, token, namespace, "")
 	if err != nil {
+		LoggerFromContext(ctx).Error("ListSpaceRequestsForLab failed during teardown", "namespace", namespace, "err", err)
 		return managerTeardownFailure()
 	}
 	byName := make(map[string]SpaceRequestResult, len(currentSRs))
@@ -765,16 +792,19 @@ func (m *Manager) teardownReserved(ctx context.Context, subject, token, ref stri
 	for _, sr := range target.srs {
 		current, found := byName[sr.Name]
 		if !found || !current.matchesLabBinding(sr.Namespace, sr.Name, sr.Labels[CatalogRefLabelKey], sr.Annotations[BindingKeyAnnotation]) || current.UID != sr.UID {
+			LoggerFromContext(ctx).Error("SpaceRequest identity mismatch during teardown", "spaceRequest", sr.Name, "namespace", namespace, "found", found)
 			return managerTeardownFailure()
 		}
 	}
 	if target.Release != nil {
 		if err := m.config.Helm.UninstallLabRelease(ctx, namespace, token, *target.Release, currentSRs); err != nil {
+			LoggerFromContext(ctx).Error("UninstallLabRelease failed", "release", target.Release.Name, "namespace", namespace, "err", err)
 			return managerTeardownFailure()
 		}
 	}
 	for _, sr := range target.srs {
 		if err := m.config.SpaceRequests.DeleteVerifiedSpaceRequest(ctx, token, namespace, ref, sr); err != nil {
+			LoggerFromContext(ctx).Error("DeleteVerifiedSpaceRequest failed", "spaceRequest", sr.Name, "namespace", namespace, "err", err)
 			return managerTeardownFailure()
 		}
 	}

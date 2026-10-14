@@ -92,7 +92,10 @@ func NewRouter(cfg Config) http.Handler {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := setup.ContextWithLogger(r.Context(), cfg.Logger)
+		mux.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // --- helpers ---
