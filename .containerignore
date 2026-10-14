@@ -1,0 +1,7 @@
+**/node_modules
+**/dist
+**/coverage
+backend/server
+.git
+.jj
+tmp
