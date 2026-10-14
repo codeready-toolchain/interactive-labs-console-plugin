@@ -150,12 +150,12 @@ func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir strin
 	}
 	_, err := CatalogRefLabel(ref)
 	if err != nil {
-		LoggerFromContext(ctx).Error("invalid catalog ref in Start", "ref", ref, "err", err)
+		LoggerFromContext(ctx).Error("invalid catalog ref in Start", "namespace", subjectHomeSpace(subject), "ref", ref, "err", err)
 		return Status{}, false, managerError(ManagerBadRequest, "invalid catalog identity")
 	}
 	operationCtx, id, finish, err := m.config.Coordinator.acquire(ctx, subject, ref, false)
 	if err != nil {
-		LoggerFromContext(ctx).Error("coordinator acquire failed", "subject", subject, "ref", ref, "err", err)
+		LoggerFromContext(ctx).Error("coordinator acquire failed", "namespace", subjectHomeSpace(subject), "ref", ref, "err", err)
 		return Status{}, false, managerError(ManagerConflict, "lab setup or teardown is already running")
 	}
 	operationCtx = ContextWithLogger(operationCtx, LoggerFromContext(ctx))
@@ -470,7 +470,7 @@ func (m *Manager) observeHelmSetup(ctx context.Context, subject, token, ref stri
 		if releaseStatus == "" && result.Status == "pending" && srStatus != "failed" {
 			tornDown, err := m.config.Coordinator.HasTeardownReceipt(ctx, subject, ref)
 			if err != nil {
-				LoggerFromContext(ctx).Error("HasTeardownReceipt failed", "subject", subject, "ref", ref, "err", err)
+				LoggerFromContext(ctx).Error("HasTeardownReceipt failed", "namespace", namespace, "ref", ref, "err", err)
 				return helmSetupObservation{}, managerError(ManagerUnavailable, "Unable to check lab recovery. Retry status.")
 			}
 			if tornDown {
@@ -562,7 +562,7 @@ func (m *Manager) readLabInventory(ctx context.Context, subject, token, reserved
 	for _, sr := range srs {
 		ref, err := CatalogRefFromLabel(sr.Labels[CatalogRefLabelKey])
 		if err != nil {
-			LoggerFromContext(ctx).Error("CatalogRefFromLabel failed", "spaceRequest", sr.Name, "label", sr.Labels[CatalogRefLabelKey], "err", err)
+			LoggerFromContext(ctx).Error("CatalogRefFromLabel failed", "namespace", namespace, "spaceRequest", sr.Name, "label", sr.Labels[CatalogRefLabelKey], "err", err)
 			return nil, managerError(ManagerBadGateway, "Unable to list lab setups. Check permissions or ask an administrator for help.")
 		}
 		item := get(ref)
@@ -675,7 +675,7 @@ func (m *Manager) BeginTeardown(ctx context.Context, subject, token, ref, genera
 	}
 	operationCtx, id, finish, err := m.config.Coordinator.AcquireTeardown(ctx, subject, ref)
 	if err != nil {
-		LoggerFromContext(ctx).Error("AcquireTeardown failed", "subject", subject, "ref", ref, "err", err)
+		LoggerFromContext(ctx).Error("AcquireTeardown failed", "namespace", subjectHomeSpace(subject), "ref", ref, "err", err)
 		return TeardownProgress{}, managerError(ManagerConflict, "Lab setup or teardown is running or needs administrator recovery.")
 	}
 	operationCtx = ContextWithLogger(operationCtx, LoggerFromContext(ctx))
@@ -717,7 +717,7 @@ func (m *Manager) TeardownStatus(ctx context.Context, subject, ref, id string) (
 		return TeardownProgress{}, managerError(ManagerNotFound, "Teardown operation not found. Refresh lab setups.")
 	}
 	if err != nil {
-		LoggerFromContext(ctx).Error("TeardownStatus failed", "subject", subject, "ref", ref, "operationId", id, "err", err)
+		LoggerFromContext(ctx).Error("TeardownStatus failed", "namespace", subjectHomeSpace(subject), "ref", ref, "operationId", id, "err", err)
 		return TeardownProgress{}, managerError(ManagerUnavailable, "Unable to check teardown status. Retry or contact an administrator.")
 	}
 	return teardownProgress(ref, id, status), nil
@@ -742,7 +742,7 @@ func (m *Manager) validateTeardown(subject, token, ref, generation string) error
 func (m *Manager) teardownTarget(ctx context.Context, subject, token, ref, generation string) (*LabSetup, error) {
 	items, err := m.readLabInventory(ctx, subject, token, ref)
 	if err != nil {
-		LoggerFromContext(ctx).Error("readLabInventory failed during teardown", "subject", subject, "ref", ref, "err", err)
+		LoggerFromContext(ctx).Error("readLabInventory failed during teardown", "namespace", subjectHomeSpace(subject), "ref", ref, "err", err)
 		return nil, managerTeardownFailure()
 	}
 	for i := range items {
