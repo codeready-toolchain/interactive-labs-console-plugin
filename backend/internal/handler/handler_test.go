@@ -63,12 +63,13 @@ func newRouter(t *testing.T) http.Handler {
 				"user": subject, "openshift-api-url": "https://api.example.test", "openshift-console-url": "https://console.example.test", "openshift-cluster-ingress-domain": "apps.example.test",
 			}, nil
 		},
+		SetupManager: newTestManager(t, nil, nil, func(c *setup.ManagerConfig) { c.WithSnapshot = snapshotForSchema(t, nil) }),
 	})
 }
 
 func newTestManager(t *testing.T, client *setup.SpaceRequestClient, helm setup.HelmManager, configure ...func(*setup.ManagerConfig)) *setup.Manager {
 	t.Helper()
-	config := setup.ManagerConfig{SpaceRequests: client, Helm: helm, Coordinator: setup.NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns")}
+	config := setup.ManagerConfig{WithSnapshot: snapshotForSchema(t, testValuesSchema), SpaceRequests: client, Helm: helm, Coordinator: setup.NewOperationCoordinator(fake.NewSimpleClientset(), "plugin-ns")}
 	for _, update := range configure {
 		update(&config)
 	}
@@ -83,15 +84,6 @@ func newSetupRouter(t *testing.T) (http.Handler, <-chan struct{}) {
 		CatalogSource: goodCatalogCM,
 		Authenticate: func(_ context.Context, _, token string) (string, error) {
 			return token, nil
-		},
-		BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-			return &bundle.Result{
-				Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Manifest Lab"}},
-				Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
-				HelmChartAvailable: true,
-				HelmChartDir:       t.TempDir(),
-				ValuesSchema:       testValuesSchema,
-			}, nil
 		},
 		SetupManager: newTestManager(t, client, &stubHelmManager{installCh: installCh}, func(c *setup.ManagerConfig) { c.HelmTimeout = 5 * time.Second }),
 	}), installCh
@@ -311,7 +303,9 @@ func TestModuleWireContract(t *testing.T) {
 			res.Revision = "abc123"
 			return res, nil
 		},
-		SetupManager: newTestManager(t, prepareSetupClient(t, ref), &stubHelmManager{status: "deployed", catalogRef: ref}),
+		SetupManager: newTestManager(t, prepareSetupClient(t, ref), &stubHelmManager{status: "deployed", catalogRef: ref}, func(c *setup.ManagerConfig) {
+			c.WithSnapshot = func(_, _ string, read func(string) error) error { return read(root) }
+		}),
 	})
 
 	t.Run("catalog exposes manifest title and safely omits invalid lab", func(t *testing.T) {
@@ -344,6 +338,9 @@ func TestModuleWireContract(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
 		assert.Equal(t, "LabBundle", body["kind"])
 		assert.NotContains(t, body, "pages")
+		for _, internal := range []string{root, "chartDir", "chartPath", "releaseName", "x-interactive-labs"} {
+			assert.NotContains(t, rw.Body.String(), internal, "browser bundle must not expose preparation data")
+		}
 		modules, ok := body["modules"].([]any)
 		require.True(t, ok, "bundle must have modules: %s", rw.Body.String())
 		require.Len(t, modules, 2)
@@ -579,6 +576,18 @@ var testValuesSchema = []byte(`{
 	}
 }`)
 
+func snapshotForSchema(t *testing.T, schema []byte) func(string, string, func(string) error) error {
+	t.Helper()
+	root := t.TempDir()
+	identityManifest(t, root, "lab", "")
+	identityFile(t, root, "lab/modules/010-intro/content/intro.adoc", "= Intro\n")
+	if schema != nil {
+		identityFile(t, root, "setup/helm/Chart.yaml", "apiVersion: v2\nname: test\nversion: 1.0.0\n")
+		identityFile(t, root, "setup/helm/values.schema.json", string(schema))
+	}
+	return func(_, _ string, read func(string) error) error { return read(root) }
+}
+
 func prepareSetupClient(t *testing.T, catalogRefs ...string) *setup.SpaceRequestClient {
 	t.Helper()
 	ref := goodCatalogRef()
@@ -629,10 +638,9 @@ func TestSetupHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
-				return &bundle.Result{ValuesSchema: []byte(`{"properties":{"password":{"x-interactive-labs":{"kind":"generated-password"}},"url":{"x-interactive-labs":{"kind":"root-url"}}}}`)}, nil
-			},
-			SetupManager: newTestManager(t, nil, nil),
+			SetupManager: newTestManager(t, nil, nil, func(c *setup.ManagerConfig) {
+				c.WithSnapshot = snapshotForSchema(t, []byte(`{"properties":{"password":{"x-interactive-labs":{"kind":"generated-password"}},"url":{"x-interactive-labs":{"kind":"root-url"}}}}`))
+			}),
 		})
 		for _, target := range []struct{ method, suffix string }{{http.MethodPost, "/setup"}, {http.MethodGet, "/setup/status"}} {
 			req := httptest.NewRequestWithContext(t.Context(), target.method, "/api/v1alpha1/labs/"+goodCatalogRef()+target.suffix, nil)
@@ -708,10 +716,7 @@ func TestSetupHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}}, HelmChartAvailable: true, ValuesSchema: testValuesSchema}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
 		})
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
 		req.Header.Set("Authorization", "Bearer user1")
@@ -743,10 +748,7 @@ func TestSetupHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}}, HelmChartAvailable: true, ValuesSchema: testValuesSchema}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, &stubHelmManager{}, func(c *setup.ManagerConfig) { c.Coordinator = second }),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, &stubHelmManager{}, func(c *setup.ManagerConfig) { c.Coordinator = second }),
 		})
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
 		req.Header.Set("Authorization", "Bearer user1")
@@ -760,10 +762,7 @@ func TestSetupHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
-				return &bundle.Result{ValuesSchema: testValuesSchema}, nil
-			},
-			SetupManager: newTestManager(t, prepareSetupClient(t), &stubHelmManager{}, func(c *setup.ManagerConfig) { c.Coordinator = nil }),
+			SetupManager:  newTestManager(t, prepareSetupClient(t), &stubHelmManager{}, func(c *setup.ManagerConfig) { c.Coordinator = nil }),
 		})
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup", nil)
 		req.Header.Set("Authorization", "Bearer user1")
@@ -826,15 +825,7 @@ func TestSetupHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchema,
-				}, nil
-			},
-			SetupManager: newTestManager(t, client, helm),
+			SetupManager:  newTestManager(t, client, helm),
 		})
 
 		ref := goodCatalogRef()
@@ -895,16 +886,7 @@ func TestSetupHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
-					HelmChartAvailable: true,
-					HelmChartDir:       t.TempDir(),
-					ValuesSchema:       testValuesSchema,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, countingHelm, func(c *setup.ManagerConfig) { c.HelmTimeout = 5 * time.Second }),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, countingHelm, func(c *setup.ManagerConfig) { c.HelmTimeout = 5 * time.Second }),
 		})
 
 		ref := goodCatalogRef()
@@ -964,10 +946,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
-				return &bundle.Result{ValuesSchema: testValuesSchema}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
 		})
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1alpha1/labs/"+goodCatalogRef()+"/setup/status", nil)
 		req.Header.Set("Authorization", "Bearer user1")
@@ -986,15 +965,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchema,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
 		})
 
 		ref := goodCatalogRef()
@@ -1021,15 +992,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchema,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
 		})
 
 		ref := goodCatalogRef()
@@ -1054,15 +1017,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchema,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
 		})
 
 		ref := goodCatalogRef()
@@ -1089,15 +1044,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchema,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
 		})
 
 		ref := goodCatalogRef()
@@ -1135,15 +1082,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchema,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
 		})
 
 		ref := goodCatalogRef()
@@ -1168,15 +1107,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchema,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
 		})
 
 		ref := goodCatalogRef()
@@ -1203,15 +1134,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules:            []bundle.Module{{ID: "010-intro", Pages: []string{"intro.adoc"}}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchemaWithPasswords,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm, func(c *setup.ManagerConfig) { c.WithSnapshot = snapshotForSchema(t, testValuesSchemaWithPasswords) }),
 		})
 
 		ref := goodCatalogRef()
@@ -1237,15 +1160,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest:           &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules:            []bundle.Module{{Pages: []string{"= Intro"}}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchema,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
 		})
 
 		ref := goodCatalogRef()
@@ -1269,17 +1184,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules: []bundle.Module{{
-						Pages: []string{"intro.adoc"},
-					}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchema,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, nil),
 		})
 
 		ref := goodCatalogRef()
@@ -1304,17 +1209,7 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules: []bundle.Module{{
-						Pages: []string{"= Intro"},
-					}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchemaWithPasswords,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm, func(c *setup.ManagerConfig) { c.WithSnapshot = snapshotForSchema(t, testValuesSchemaWithPasswords) }),
 		})
 
 		ref := goodCatalogRef()
@@ -1339,17 +1234,10 @@ func TestSetupStatusHandler(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(_ context.Context, _, _, _ string) (*bundle.Result, error) {
-				return &bundle.Result{
-					Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}},
-					Modules: []bundle.Module{{
-						Pages: []string{"= Intro"},
-					}},
-					HelmChartAvailable: true,
-					ValuesSchema:       testValuesSchemaWithRootURL,
-				}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm, func(c *setup.ManagerConfig) { c.ClusterIngressDomain = "apps.example.com" }),
+			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm, func(c *setup.ManagerConfig) {
+				c.ClusterIngressDomain = "apps.example.com"
+				c.WithSnapshot = snapshotForSchema(t, testValuesSchemaWithRootURL)
+			}),
 		})
 
 		ref := goodCatalogRef()
@@ -1783,49 +1671,450 @@ func makeTestJWT(sub string) string {
 	return header + "." + payload + "."
 }
 
-// --- GET /api/healthz ---
+func identityFile(t *testing.T, root, name, contents string) {
+	t.Helper()
+	file := filepath.Join(root, name)
+	require.NoError(t, os.MkdirAll(filepath.Dir(file), 0o755))
+	require.NoError(t, os.WriteFile(file, []byte(contents), 0o600))
+}
 
-func TestHealthzHandler(t *testing.T) {
-	t.Run("returns 200", func(t *testing.T) {
+func identityManifest(t *testing.T, root, lab, override string) {
+	t.Helper()
+	identityFile(t, root, lab+"/lab.yaml", fmt.Sprintf("apiVersion: v1alpha1\nkind: Lab\nmetadata:\n  title: Test\nspec:\n  setupDir: %q\n", override))
+}
+
+type identityHelmManager struct {
+	stubHelmManager
+	checked []string
+}
+
+func (h *identityHelmManager) ReleaseStatus(_ context.Context, release, _, _ string) (string, error) {
+	h.checked = append(h.checked, release)
+	return h.status, h.statusErr
+}
+
+func TestSetupPreparation(t *testing.T) {
+	t.Run("setup status and worker consume prepared plan, never browser bundle", func(t *testing.T) {
+		// Given a plan with an already-derived name, and an unusable browser loader.
+		root := t.TempDir()
+		identityManifest(t, root, "lab", "")
+		identityFile(t, root, "lab/modules/010-intro/content/intro.adoc", "= Intro\n")
+		identityFile(t, root, "setup/helm/Chart.yaml", "apiVersion: v2\nname: test\nversion: 1.0.0\n")
+		identityFile(t, root, "setup/helm/values.schema.json", string(testValuesSchema))
+		plan, err := setup.Prepare(root, "lab/", "verified-subject", goodCatalogRef())
+		require.NoError(t, err)
+		helm := &identityHelmManager{stubHelmManager: stubHelmManager{installCh: make(chan struct{})}}
+		var calls int
+		router := handler.NewRouter(handler.Config{
+			CatalogSource: goodCatalogCM,
+			Authenticate: func(_ context.Context, impersonation, token string) (string, error) {
+				assert.Equal(t, "untrusted-hint", impersonation)
+				assert.Equal(t, "request-token", token)
+				return "verified-subject", nil
+			},
+			BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
+				assert.Fail(t, "setup must not load a browser bundle")
+				return nil, bundle.ErrRepositoryUnavailable
+			},
+			SetupManager: newTestManager(t, prepareSetupClient(t), helm, func(c *setup.ManagerConfig) {
+				c.WithSnapshot = func(repository, branch string, read func(string) error) error {
+					assert.Equal(t, "https://github.com/redhat-scholars/lab1", repository)
+					assert.Equal(t, "main", branch)
+					calls++
+					return read(root)
+				}
+			}),
+		})
+		for _, method := range []string{http.MethodPost, http.MethodGet} {
+			endpoint := "/api/v1alpha1/labs/" + goodCatalogRef() + "/setup"
+			if method == http.MethodGet {
+				endpoint += "/status"
+			}
+			req := httptest.NewRequestWithContext(context.Background(), method, endpoint, nil)
+			req.Header.Set("Authorization", "Bearer request-token")
+			req.Header.Set("Impersonate-User", "untrusted-hint")
+			rw := httptest.NewRecorder()
+			// When setup and polling run, both use the prepared identity unchanged.
+			router.ServeHTTP(rw, req)
+			if method == http.MethodPost {
+				require.Equal(t, http.StatusAccepted, rw.Code)
+				select {
+				case <-helm.installCh:
+				case <-time.After(5 * time.Second):
+					require.FailNow(t, "setup worker did not install prepared chart")
+				}
+			} else {
+				require.Equal(t, http.StatusOK, rw.Code)
+			}
+			var body map[string]any
+			require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+			assert.Equal(t, plan.ReleaseName, body["helm"].(map[string]any)["releaseName"])
+			assert.NotContains(t, rw.Body.String(), plan.ChartDir)
+			assert.NotContains(t, rw.Body.String(), "request-token")
+		}
+		assert.Equal(t, 2, calls)
+		assert.Equal(t, []string{plan.ReleaseName}, helm.checked)
+		require.NotNil(t, helm.installOpts)
+		assert.Equal(t, plan.ChartDir, helm.installOpts.ChartDir)
+		assert.Equal(t, plan.ReleaseName, helm.installOpts.ReleaseName)
+		assert.Equal(t, "verified-subject-dev", helm.installOpts.Namespace)
+		assert.Equal(t, "ns-gitea", helm.installOpts.Values["gitea.namespace"])
+	})
+	for _, method := range []string{http.MethodPost, http.MethodGet} {
+		t.Run(method+" preserves preparation errors and auth boundary", func(t *testing.T) {
+			for _, tc := range []struct {
+				name, token, errorType string
+				prepErr                error
+				status                 int
+				unconfigured           bool
+				authErr                error
+				emptySubject           bool
+			}{
+				{name: "no auth", errorType: "unauthorized", status: http.StatusUnauthorized},
+				{name: "authentication failed", token: "untrusted", authErr: errors.New("rejected token"), errorType: "unauthorized", status: http.StatusUnauthorized},
+				{name: "empty authenticated subject", token: "untrusted", emptySubject: true, errorType: "unauthorized", status: http.StatusUnauthorized},
+				{name: "no preparer", token: "user1", errorType: "repository_error", status: http.StatusServiceUnavailable, unconfigured: true},
+				{name: "no schema", token: "user1", prepErr: setup.ErrChartNotFound, errorType: "chart_not_found", status: http.StatusUnprocessableEntity},
+				{name: "no bindings", token: "user1", prepErr: setup.ErrNamespaceBindingsMissing, errorType: "configuration_error", status: http.StatusUnprocessableEntity},
+				{name: "invalid lab", token: "user1", prepErr: bundle.ErrLabInvalid, errorType: "repository_error", status: http.StatusBadGateway},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					calls := 0
+					cfg := handler.Config{
+						CatalogSource: goodCatalogCM,
+						Authenticate: func(_ context.Context, _, token string) (string, error) {
+							if tc.emptySubject {
+								return "", nil
+							}
+							return token, tc.authErr
+						},
+						SetupManager: newTestManager(t, prepareSetupClient(t), nil, func(c *setup.ManagerConfig) {
+							c.WithSnapshot = nil
+							if !tc.unconfigured {
+								c.WithSnapshot = func(string, string, func(string) error) error { calls++; return tc.prepErr }
+							}
+						}),
+					}
+					endpoint := "/api/v1alpha1/labs/" + goodCatalogRef() + "/setup"
+					if method == http.MethodGet {
+						endpoint += "/status"
+					}
+					req := httptest.NewRequestWithContext(context.Background(), method, endpoint, nil)
+					if tc.token != "" {
+						req.Header.Set("Authorization", "Bearer "+tc.token)
+					}
+					rw := httptest.NewRecorder()
+					handler.NewRouter(cfg).ServeHTTP(rw, req)
+					require.Equal(t, tc.status, rw.Code)
+					var body map[string]any
+					require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+					assert.Equal(t, tc.errorType, body["type"])
+					if tc.token == "" || tc.authErr != nil || tc.emptySubject || tc.unconfigured {
+						assert.Zero(t, calls)
+					} else {
+						assert.Equal(t, 1, calls)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestChartReleaseIdentity(t *testing.T) {
+	// Given two labs using the same approved chart files and two snapshot locations.
+	roots := []string{t.TempDir(), t.TempDir()}
+	for _, root := range roots {
+		for _, lab := range []string{"lab", "other"} {
+			identityManifest(t, root, lab, "../shared/a")
+			identityFile(t, root, lab+"/modules/010-intro/content/intro.adoc", "= Intro\n")
+		}
+		for _, chart := range []string{"shared/a", "shared/b"} {
+			identityFile(t, root, chart+"/Chart.yaml", "apiVersion: v2\nname: test\nversion: 1.0.0\n")
+			identityFile(t, root, chart+"/values.schema.json", string(testValuesSchemaWithPasswords))
+		}
+	}
+	const repository = "https://github.com/redhat/chart-identity"
+	root := roots[0]
+	cfg := handler.Config{
+		CatalogSource: stubCatalogCM(map[string]string{"catalog.yaml": `- repository: https://github.com/redhat/chart-identity
+  branch: main
+  labPath: lab
+- repository: https://github.com/redhat/chart-identity
+  branch: main
+  labPath: other`}),
+		Authenticate: func(_ context.Context, _, token string) (string, error) { return token, nil },
+	}
+	request := func(method, lab, user string) string {
+		t.Helper()
+		ref := catalog.DeriveRef(repository, "main", lab, nil)
+		helm := &stubHelmManager{installCh: make(chan struct{})}
+		cfg.SetupManager = newTestManager(t, prepareSetupClient(t, ref), helm, func(c *setup.ManagerConfig) {
+			c.WithSnapshot = func(_, _ string, read func(string) error) error { return read(root) }
+		})
+		endpoint := "/api/v1alpha1/labs/" + ref + "/setup"
+		if method == http.MethodGet {
+			endpoint += "/status"
+		}
+		req := httptest.NewRequestWithContext(t.Context(), method, endpoint, nil)
+		req.Header.Set("Authorization", "Bearer "+user)
 		rw := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/healthz", nil)
-		newRouter(t).ServeHTTP(rw, req)
-
-		assert.Equal(t, http.StatusOK, rw.Code)
+		handler.NewRouter(cfg).ServeHTTP(rw, req)
+		if method == http.MethodPost {
+			require.Equal(t, http.StatusAccepted, rw.Code, rw.Body.String())
+			select {
+			case <-helm.installCh:
+			case <-time.After(time.Second):
+				t.Fatal("worker did not install selected chart")
+			}
+		} else {
+			require.Equal(t, http.StatusOK, rw.Code, rw.Body.String())
+		}
+		var body struct {
+			Helm struct {
+				ReleaseName string `json:"releaseName"`
+			} `json:"helm"`
+		}
+		require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+		if method == http.MethodPost {
+			assert.Equal(t, body.Helm.ReleaseName, helm.installOpts.ReleaseName)
+		}
+		return body.Helm.ReleaseName
+	}
+	original := request(http.MethodPost, "lab", "user1")
+	t.Run("setup and status agree", func(t *testing.T) {
+		assert.Equal(t, original, request(http.MethodGet, "lab", "user1"))
+	})
+	t.Run("selected chart path changes both endpoints without changing catalogRef", func(t *testing.T) {
+		identityManifest(t, root, "lab", "../shared/b")
+		changed := request(http.MethodPost, "lab", "user1")
+		assert.NotEqual(t, original, changed)
+		assert.Equal(t, changed, request(http.MethodGet, "lab", "user1"))
+		identityManifest(t, root, "lab", "../shared/a")
+	})
+	t.Run("normalized spellings and snapshot location do not change identity", func(t *testing.T) {
+		identityManifest(t, root, "lab", "./../shared/./a/")
+		assert.Equal(t, original, request(http.MethodPost, "lab", "user1"))
+		root = roots[1]
+		assert.Equal(t, original, request(http.MethodGet, "lab", "user1"))
+		root = roots[0]
+	})
+	t.Run("chart content does not change identity", func(t *testing.T) {
+		identityFile(t, root, "shared/a/Chart.yaml", "apiVersion: v2\nname: renamed\nversion: 2.0.0\n")
+		assert.Equal(t, original, request(http.MethodPost, "lab", "user1"))
+	})
+	t.Run("shared chart keeps independent user and lab releases", func(t *testing.T) {
+		assert.NotEqual(t, original, request(http.MethodPost, "other", "user1"))
+		assert.NotEqual(t, original, request(http.MethodPost, "lab", "user2"))
+	})
+	t.Run("compatible verified deployment stays authoritative after chart selection changes", func(t *testing.T) {
+		// Given the approved lab now selects another chart, but already has an owned deployment.
+		identityManifest(t, root, "lab", "../shared/b")
+		ref := catalog.DeriveRef(repository, "main", "lab", nil)
+		label, err := setup.CatalogRefLabel(ref)
+		require.NoError(t, err)
+		sr := fmt.Sprintf(`{"metadata":{"name":"gitea","namespace":"user1-dev","uid":"sr-uid","labels":{%q:%q},"annotations":{%q:"gitea"}},"status":{"namespaceAccess":[{"name":"existing-gitea"}],"conditions":[{"type":"Ready","status":"True"}]}}`, setup.CatalogRefLabelKey, label, setup.BindingKeyAnnotation)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodGet, r.Method)
+			if strings.HasSuffix(r.URL.Path, "/spacerequests") {
+				_, _ = fmt.Fprintf(w, `{"items":[%s]}`, sr)
+			} else {
+				_, _ = fmt.Fprint(w, sr)
+			}
+		}))
+		t.Cleanup(server.Close)
+		helm := &identityHelmManager{stubHelmManager: stubHelmManager{status: "deployed", catalogRef: ref, releaseValues: map[string]string{"passwords.postgres": "existing-password"}}}
+		cfg.SetupManager = newTestManager(t, &setup.SpaceRequestClient{APIHost: server.URL, HTTPClient: server.Client()}, helm, func(c *setup.ManagerConfig) {
+			c.WithSnapshot = func(_, _ string, read func(string) error) error { return read(root) }
+		})
+		// When reopening and polling, then no install or name-based value reread happens.
+		for _, method := range []string{http.MethodPost, http.MethodGet} {
+			endpoint := "/api/v1alpha1/labs/" + ref + "/setup"
+			if method == http.MethodGet {
+				endpoint += "/status"
+			}
+			req := httptest.NewRequestWithContext(t.Context(), method, endpoint, nil)
+			req.Header.Set("Authorization", "Bearer user1")
+			rw := httptest.NewRecorder()
+			handler.NewRouter(cfg).ServeHTTP(rw, req)
+			require.Equal(t, http.StatusOK, rw.Code, rw.Body.String())
+			var body setup.Status
+			require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+			assert.Equal(t, "il-existing", body.Helm.ReleaseName)
+			if method == http.MethodGet {
+				assert.Equal(t, "existing-password", body.Attributes["passwords-postgres"])
+			}
+		}
+		assert.False(t, helm.installed)
+		assert.Empty(t, helm.checked)
 	})
 }
 
-// --- GET /api/readyz ---
+func TestSelectedChartInstall(t *testing.T) {
+	for _, tc := range []struct {
+		name, override, selected string
+	}{
+		{name: "local", selected: "local/setup/helm"},
+		{name: "explicit", override: "../shared/chart", selected: "shared/chart"},
+		{name: "fallback", selected: "setup/helm"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			identityManifest(t, root, tc.name, tc.override)
+			identityFile(t, root, tc.name+"/modules/010-intro/content/intro.adoc", "= Intro\n")
+			for _, chart := range []string{"setup/helm", tc.selected} {
+				identityFile(t, root, chart+"/Chart.yaml", "apiVersion: v2\nname: test\nversion: 1.0.0\n")
+				identityFile(t, root, chart+"/values.schema.json", string(testValuesSchema))
+			}
+			const repository = "https://github.com/redhat/chart-install"
+			ref := catalog.DeriveRef(repository, "main", tc.name, nil)
+			helm := &stubHelmManager{installCh: make(chan struct{})}
+			router := handler.NewRouter(handler.Config{
+				CatalogSource: stubCatalogCM(map[string]string{"catalog.yaml": fmt.Sprintf("- repository: %s\n  branch: main\n  labPath: %s\n", repository, tc.name)}),
+				Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
+				SetupManager: newTestManager(t, prepareSetupClient(t, ref), helm, func(c *setup.ManagerConfig) {
+					c.WithSnapshot = func(_, _ string, read func(string) error) error { return read(root) }
+				}),
+			})
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
+			req.Header.Set("Authorization", "Bearer install-user")
+			rw := httptest.NewRecorder()
+			router.ServeHTTP(rw, req)
+			require.Equal(t, http.StatusAccepted, rw.Code)
+			select {
+			case <-helm.installCh:
+			case <-time.After(5 * time.Second):
+				require.FailNow(t, "setup worker did not reach Helm install")
+			}
+			var body struct {
+				Helm struct {
+					ReleaseName string `json:"releaseName"`
+				} `json:"helm"`
+			}
+			require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+			require.NotNil(t, helm.installOpts)
+			assert.Equal(t, filepath.Join(root, tc.selected), helm.installOpts.ChartDir)
+			assert.Equal(t, body.Helm.ReleaseName, helm.installOpts.ReleaseName)
+			assert.Equal(t, "install-user-dev", helm.installOpts.Namespace)
+		})
+	}
+}
+
+func TestSelectedChartSetupRequirements(t *testing.T) {
+	for _, tc := range []struct {
+		name, schema, errorType string
+	}{
+		{name: "absent schema", errorType: "chart_not_found"},
+		{name: "no namespace bindings", schema: "{}", errorType: "configuration_error"},
+		{name: "ignored unknown kind", schema: `{"properties":{"future":{"x-interactive-labs":{"kind":"future-kind"}}}}`, errorType: "configuration_error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			identityManifest(t, root, "lab", "")
+			identityFile(t, root, "lab/modules/010-intro/content/intro.adoc", "= Intro\n")
+			identityFile(t, root, "lab/setup/helm/Chart.yaml", "apiVersion: v2\nname: test\nversion: 1.0.0\n")
+			if tc.schema != "" {
+				identityFile(t, root, "lab/setup/helm/values.schema.json", tc.schema)
+			}
+			result, err := bundle.LoadFromSnapshot(root, "lab")
+			require.NoError(t, err)
+			assert.True(t, result.HelmChartAvailable)
+			router := handler.NewRouter(handler.Config{
+				CatalogSource: goodCatalogCM,
+				Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
+				SetupManager: newTestManager(t, prepareSetupClient(t), nil, func(c *setup.ManagerConfig) {
+					c.WithSnapshot = func(_, _ string, read func(string) error) error { return read(root) }
+				}),
+			})
+			for _, method := range []string{http.MethodPost, http.MethodGet} {
+				t.Run(method, func(t *testing.T) {
+					endpoint := "/api/v1alpha1/labs/" + goodCatalogRef() + "/setup"
+					if method == http.MethodGet {
+						endpoint += "/status"
+					}
+					req := httptest.NewRequestWithContext(context.Background(), method, endpoint, nil)
+					req.Header.Set("Authorization", "Bearer user1")
+					rw := httptest.NewRecorder()
+					router.ServeHTTP(rw, req)
+					require.Equal(t, http.StatusUnprocessableEntity, rw.Code)
+					var body map[string]any
+					require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+					assert.Equal(t, tc.errorType, body["type"])
+				})
+			}
+		})
+	}
+}
+
+func TestSelectedChartCatalogOmission(t *testing.T) {
+	root := t.TempDir()
+	for _, lab := range []string{"valid", "invalid", "invalid-schema", "empty-schema"} {
+		identityManifest(t, root, lab, "")
+		identityFile(t, root, lab+"/modules/010-intro/content/intro.adoc", "= Intro\n")
+	}
+	// A valid root fallback must not hide an invalid selected local chart.
+	identityFile(t, root, "setup/helm/Chart.yaml", "apiVersion: v2\nname: test\nversion: 1.0.0\n")
+	identityFile(t, root, "invalid/setup/helm/Chart.yaml", "name: broken\nversion: invalid\n")
+	for _, lab := range []string{"invalid-schema", "empty-schema"} {
+		identityFile(t, root, lab+"/setup/helm/Chart.yaml", "apiVersion: v2\nname: test\nversion: 1.0.0\n")
+	}
+	identityFile(t, root, "invalid-schema/setup/helm/values.schema.json", `{"properties":{"lab":{"x-interactive-labs":{"kind":42}}}}`)
+	identityFile(t, root, "empty-schema/setup/helm/values.schema.json", "{}")
+	var reasons []string
+	router := handler.NewRouter(handler.Config{
+		CatalogSource: stubCatalogCM(map[string]string{"catalog.yaml": `- repository: https://github.com/redhat/chart-omission
+  branch: main
+  labPath: valid
+- repository: https://github.com/redhat/chart-omission
+  branch: main
+  labPath: invalid
+- repository: https://github.com/redhat/chart-omission
+  branch: main
+  labPath: invalid-schema
+- repository: https://github.com/redhat/chart-omission
+  branch: main
+  labPath: empty-schema`}),
+		BundleLoader: func(_ context.Context, _, _, lab string) (*bundle.Result, error) {
+			return bundle.LoadFromSnapshot(root, lab)
+		},
+		CatalogLabOmitted: func(_ context.Context, entry catalog.Entry, reason string) {
+			reasons = append(reasons, entry.LabPath+":"+reason)
+		},
+	})
+	rw := httptest.NewRecorder()
+	router.ServeHTTP(rw, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1alpha1/catalog", nil))
+	require.Equal(t, http.StatusOK, rw.Code)
+	var body struct {
+		Items []struct {
+			LabPath string `json:"labPath"`
+		} `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &body))
+	require.Len(t, body.Items, 2)
+	assert.Equal(t, "valid", body.Items[0].LabPath)
+	assert.Equal(t, "empty-schema", body.Items[1].LabPath)
+	assert.Equal(t, []string{"invalid:LabInvalid", "invalid-schema:LabInvalid"}, reasons)
+}
+
+func TestHealthzHandler(t *testing.T) {
+	rw := httptest.NewRecorder()
+	newRouter(t).ServeHTTP(rw, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/healthz", nil))
+	assert.Equal(t, http.StatusOK, rw.Code)
+}
 
 func TestReadyzHandler(t *testing.T) {
-	t.Run("returns 200 when ready", func(t *testing.T) {
-		router := handler.NewRouter(handler.Config{
-			ReadinessCheck: func() bool { return true },
+	for _, tc := range []struct {
+		name   string
+		check  func() bool
+		status int
+	}{
+		{"ready", func() bool { return true }, http.StatusOK},
+		{"not ready", func() bool { return false }, http.StatusServiceUnavailable},
+		{"not configured", nil, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rw := httptest.NewRecorder()
+			handler.NewRouter(handler.Config{ReadinessCheck: tc.check}).ServeHTTP(rw, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/readyz", nil))
+			assert.Equal(t, tc.status, rw.Code)
 		})
-		rw := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/readyz", nil)
-		router.ServeHTTP(rw, req)
-
-		assert.Equal(t, http.StatusOK, rw.Code)
-	})
-
-	t.Run("returns 503 when not ready", func(t *testing.T) {
-		router := handler.NewRouter(handler.Config{
-			ReadinessCheck: func() bool { return false },
-		})
-		rw := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/readyz", nil)
-		router.ServeHTTP(rw, req)
-
-		assert.Equal(t, http.StatusServiceUnavailable, rw.Code)
-	})
-
-	t.Run("returns 200 when no readiness check configured", func(t *testing.T) {
-		router := handler.NewRouter(handler.Config{})
-		rw := httptest.NewRecorder()
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/readyz", nil)
-		router.ServeHTTP(rw, req)
-
-		assert.Equal(t, http.StatusOK, rw.Code)
-	})
+	}
 }

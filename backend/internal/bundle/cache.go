@@ -239,6 +239,25 @@ func (c *Cache) LoadBundle(_ context.Context, repository, branch, labPath string
 	return result, nil
 }
 
+// WithSnapshot runs a filesystem consumer under the existing source read lock.
+// It never acquires a source; the callback must finish its reads before returning
+// and must not modify the snapshot.
+func (c *Cache) WithSnapshot(repository, branch string, read func(root string) error) error {
+	if err := ValidateCloneArgs(repository, branch); err != nil {
+		return fmt.Errorf("%w: invalid source", ErrRepositoryUnavailable)
+	}
+	entry, err := c.entry(repository, branch)
+	if err != nil {
+		return err
+	}
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+	if entry.revision == nil {
+		return ErrRepositoryUnavailable
+	}
+	return read(entry.checkoutDirectory)
+}
+
 // ReadResource obtains a resource and its revision from one immutable source snapshot.
 func (c *Cache) ReadResource(_ context.Context, repository, branch, resourcePath string) (*Resource, error) {
 	if err := ValidateCloneArgs(repository, branch); err != nil {

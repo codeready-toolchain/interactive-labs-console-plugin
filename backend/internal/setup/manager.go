@@ -10,10 +10,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/catalog"
 )
 
 // ManagerConfig supplies existing cluster clients and setup settings.
 type ManagerConfig struct {
+	WithSnapshot         func(repository, branch string, read func(root string) error) error
 	Helm                 HelmManager
 	SpaceRequests        *SpaceRequestClient
 	Coordinator          *OperationCoordinator
@@ -53,11 +56,15 @@ type ManagerError struct {
 type ManagerErrorKind string
 
 const (
-	ManagerConflict    ManagerErrorKind = "conflict"
-	ManagerUnavailable ManagerErrorKind = "unavailable"
-	ManagerBadGateway  ManagerErrorKind = "bad_gateway"
-	ManagerBadRequest  ManagerErrorKind = "bad_request"
-	ManagerNotFound    ManagerErrorKind = "not_found"
+	ManagerConflict               ManagerErrorKind = "conflict"
+	ManagerUnavailable            ManagerErrorKind = "unavailable"
+	ManagerBadGateway             ManagerErrorKind = "bad_gateway"
+	ManagerBadRequest             ManagerErrorKind = "bad_request"
+	ManagerNotFound               ManagerErrorKind = "not_found"
+	ManagerPreparationUnavailable ManagerErrorKind = "preparation_unavailable"
+	ManagerPreparationFailed      ManagerErrorKind = "preparation_failed"
+	ManagerChartNotFound          ManagerErrorKind = "chart_not_found"
+	ManagerSchemaInvalid          ManagerErrorKind = "schema_invalid"
 )
 
 func (e *ManagerError) Error() string { return e.Message }
@@ -141,18 +148,23 @@ func (m *Manager) labRelease(ctx context.Context, namespace, token, ref string) 
 
 // Start either reports an existing verified deployment or hands the reservation
 // to a background worker. bool is true only for an already-ready setup.
-func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir string, bindings []SchemaBinding) (Status, bool, error) {
-	if !m.available() || m.config.Coordinator == nil {
-		return Status{}, false, managerError(ManagerUnavailable, "lab setup unavailable")
-	}
+func (m *Manager) Start(ctx context.Context, subject, token string, entry catalog.Entry) (Status, bool, error) {
 	if subject == "" || token == "" {
 		return Status{}, false, managerError(ManagerBadRequest, "authentication required")
 	}
-	_, err := CatalogRefLabel(ref)
-	if err != nil {
+	ref := entry.CatalogRef
+	if _, err := CatalogRefLabel(ref); err != nil {
 		LoggerFromContext(ctx).Error("invalid catalog ref in Start", "namespace", subjectHomeSpace(subject), "ref", ref, "err", err)
 		return Status{}, false, managerError(ManagerBadRequest, "invalid catalog identity")
 	}
+	plan, err := m.prepare(entry, subject)
+	if err != nil {
+		return Status{}, false, err
+	}
+	if !m.available() || m.config.Coordinator == nil {
+		return Status{}, false, managerError(ManagerUnavailable, "lab setup unavailable")
+	}
+	bindings, chartDir := plan.Bindings, plan.ChartDir
 	operationCtx, id, finish, err := m.config.Coordinator.acquire(ctx, subject, ref, false)
 	if err != nil {
 		LoggerFromContext(ctx).Error("coordinator acquire failed", "namespace", subjectHomeSpace(subject), "ref", ref, "err", err)
@@ -173,7 +185,7 @@ func (m *Manager) Start(ctx context.Context, subject, token, ref, chartDir strin
 
 	namespace := subjectHomeSpace(subject)
 	nsBindings := BindingsByKind(bindings, KindNamespaceName)
-	releaseName := HelmReleaseName(subject, ref, nsBindings)
+	releaseName := plan.ReleaseName
 	existing, err := m.labRelease(preflightCtx, namespace, token, ref)
 	if err != nil {
 		return Status{}, false, err
@@ -356,17 +368,23 @@ func (m *Manager) runWorker(ctx context.Context, token, namespace, releaseName, 
 
 // Status reports verified SpaceRequest readiness and Helm state, exposing only
 // annotated string values as attributes once the setup is ready and deployed.
-func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindings []SchemaBinding) (Status, error) {
-	if m == nil || m.config.SpaceRequests == nil {
-		return Status{}, managerError(ManagerUnavailable, "lab setup unavailable")
-	}
+func (m *Manager) Status(ctx context.Context, subject, token string, entry catalog.Entry) (Status, error) {
 	if subject == "" || token == "" {
 		return Status{}, managerError(ManagerBadRequest, "authentication required")
 	}
+	ref := entry.CatalogRef
 	label, err := CatalogRefLabel(ref)
 	if err != nil {
 		return Status{}, managerError(ManagerBadRequest, "invalid catalog identity")
 	}
+	plan, err := m.prepare(entry, subject)
+	if err != nil {
+		return Status{}, err
+	}
+	if m.config.SpaceRequests == nil {
+		return Status{}, managerError(ManagerUnavailable, "lab setup unavailable")
+	}
+	bindings := plan.Bindings
 	namespace := subjectHomeSpace(subject)
 	nsBindings := BindingsByKind(bindings, KindNamespaceName)
 	namespaces := make(map[string]NamespaceStatus, len(nsBindings))
@@ -401,7 +419,7 @@ func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindin
 	} else if allReady {
 		srStatus = "ready"
 	}
-	observed, err := m.observeHelmSetup(ctx, subject, token, ref, bindings, srStatus)
+	observed, err := m.observeHelmSetup(ctx, subject, token, ref, plan.ReleaseName, bindings, srStatus)
 	if err != nil {
 		return Status{}, err
 	}
@@ -429,9 +447,9 @@ func (m *Manager) Status(ctx context.Context, subject, token, ref string, bindin
 }
 
 // observeHelmSetup uses one verified release snapshot and advisory local state.
-func (m *Manager) observeHelmSetup(ctx context.Context, subject, token, ref string, bindings []SchemaBinding, srStatus string) (helmSetupObservation, error) {
+func (m *Manager) observeHelmSetup(ctx context.Context, subject, token, ref, releaseName string, bindings []SchemaBinding, srStatus string) (helmSetupObservation, error) {
 	namespace := subjectHomeSpace(subject)
-	result := HelmSetupStatus{Status: "pending", ReleaseName: HelmReleaseName(subject, ref, BindingsByKind(bindings, KindNamespaceName))}
+	result := HelmSetupStatus{Status: "pending", ReleaseName: releaseName}
 	var releaseStatus string
 	var values map[string]string
 	holder, held := m.config.Coordinator.currentHolder(ctx, subject, ref)

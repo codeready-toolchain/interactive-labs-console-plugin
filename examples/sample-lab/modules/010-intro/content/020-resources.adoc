@@ -20,7 +20,7 @@ This minimal chart stores it in the ConfigMap; it does not deploy a server or Ro
 endif::[]
 
 ifndef::namespaces-demo[]
-NOTE: Setup is inactive in this repository layout. See the sample README to publish this lab at a standalone repository root and activate its illustrative chart.
+NOTE: Setup attributes are unavailable. See the sample README for the illustrative chart and its setup requirements.
 endif::[]
 
 Return to xref:010-start.adoc[the introduction], or use the drawer's Previous button.

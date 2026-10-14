@@ -29,6 +29,19 @@ func TestValidateManifest(t *testing.T) {
 		assert.Equal(t, map[string]string{"audience": "developers"}, m.Spec.Attributes)
 	})
 
+	t.Run("setupDir is a string chart override", func(t *testing.T) {
+		m, labErr := manifest.ValidateManifest([]byte("apiVersion: v1alpha1\nkind: Lab\nmetadata:\n  title: Lab\nspec:\n  setupDir: ../shared/chart\n"))
+		require.Nil(t, labErr)
+		assert.Equal(t, "../shared/chart", m.Spec.SetupDir)
+	})
+	for _, value := range []string{"true", "42", "null", "[]", "{}"} {
+		t.Run("nonstring setupDir "+value, func(t *testing.T) {
+			_, labErr := manifest.ValidateManifest([]byte("apiVersion: v1alpha1\nkind: Lab\nmetadata:\n  title: Lab\nspec:\n  setupDir: " + value + "\n"))
+			require.NotNil(t, labErr)
+			assert.Equal(t, "content_error", labErr.ErrorType)
+		})
+	}
+
 	t.Run("spec is optional", func(t *testing.T) {
 		_, labErr := manifest.ValidateManifest([]byte("apiVersion: v1alpha1\nkind: Lab\nmetadata:\n  title: Lab\n"))
 		require.Nil(t, labErr)

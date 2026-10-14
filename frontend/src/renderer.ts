@@ -51,7 +51,13 @@ export type RenderInput = {
 };
 
 export type GuidanceLink = { id: string; href: string; token: string };
-export type RenderResult = { html: string; warnings: string[]; title?: string; guidanceLinks?: GuidanceLink[] };
+export type RenderResult = {
+  html: string;
+  warnings: string[];
+  title?: string;
+  guidanceLinks?: GuidanceLink[];
+  fragmentIds?: ReadonlyMap<string, string>;
+};
 
 const abort = (): DOMException => new DOMException("Aborted", "AbortError");
 
@@ -232,7 +238,7 @@ function rewriteImages(root: DocumentFragment, sourceURL: string): void {
   });
 }
 
-function namespaceIds(root: DocumentFragment, prefix: string): void {
+function namespaceIds(root: DocumentFragment, prefix: string): Map<string, string> {
   const ids = new Map<string, string>();
   root.querySelectorAll("[id]").forEach((element) => {
     if (!(element instanceof HTMLElement)) return;
@@ -246,6 +252,7 @@ function namespaceIds(root: DocumentFragment, prefix: string): void {
     const namespaced = href?.startsWith("#") && ids.get(href.slice(1));
     if (namespaced) link.setAttribute("href", `#${namespaced}`);
   });
+  return ids;
 }
 
 function highlight(root: DocumentFragment, warnings: string[]): void {
@@ -389,11 +396,11 @@ export async function renderAsciiDoc(input: RenderInput): Promise<RenderResult> 
     template.innerHTML = sanitizeAsciiDocHtml(template.innerHTML);
     injectCopyButtons(template.content);
     const renderedGuidanceLinks = replaceGuidanceLinks(template.content, guidanceLinks);
-    namespaceIds(template.content, prefix);
+    const fragmentIds = namespaceIds(template.content, prefix);
     await renderMermaid(template.content, warnings, prefix);
     if (controller.signal.aborted) throw abort();
     const title = asciidocDocument.getDocumentTitle();
-    return { html: template.innerHTML, warnings, title: typeof title === "string" ? title : undefined, guidanceLinks: renderedGuidanceLinks };
+    return { html: template.innerHTML, warnings, title: typeof title === "string" ? title : undefined, guidanceLinks: renderedGuidanceLinks, fragmentIds };
   } finally {
     input.signal?.removeEventListener("abort", forwardAbort);
   }

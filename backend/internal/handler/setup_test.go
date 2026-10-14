@@ -17,13 +17,9 @@ import (
 
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/bundle"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/handler"
-	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/manifest"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/setup"
 )
-
-var setupGuardSchema = []byte(`{"properties":{"gitea":{"properties":{"namespace":{"type":"string","x-interactive-labs":{"kind":"namespace-name"}}}}}}`)
 
 type setupGuardHelmManager struct {
 	*stubHelmManager
@@ -54,10 +50,7 @@ func TestSetupGuardConflictHTTPContract(t *testing.T) {
 		router := handler.NewRouter(handler.Config{
 			CatalogSource: goodCatalogCM,
 			Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-			BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
-				return &bundle.Result{ValuesSchema: setupGuardSchema}, nil
-			},
-			SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
+			SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
 		})
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
 		req.Header.Set("Authorization", "Bearer user1")
@@ -80,10 +73,7 @@ func TestSetupGuardConflictHTTPContract(t *testing.T) {
 	router := handler.NewRouter(handler.Config{
 		CatalogSource: goodCatalogCM,
 		Authenticate:  func(_ context.Context, _, token string) (string, error) { return token, nil },
-		BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
-			return &bundle.Result{ValuesSchema: setupGuardSchema}, nil
-		},
-		SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
+		SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
 	})
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
 	req.Header.Set("Authorization", "Bearer user1")
@@ -154,10 +144,7 @@ func TestSetupOwnershipPreflight(t *testing.T) {
 			router := handler.NewRouter(handler.Config{
 				Authenticate:  func(context.Context, string, string) (string, error) { return "alice", nil },
 				CatalogSource: goodCatalogCM,
-				BundleLoader: func(context.Context, string, string, string) (*bundle.Result, error) {
-					return &bundle.Result{Manifest: &manifest.LabManifest{Metadata: manifest.Metadata{Title: "Lab"}}, ValuesSchema: testValuesSchema}, nil
-				},
-				SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
+				SetupManager:  newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm),
 			})
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/setup", nil)
 			req.Header.Set("Authorization", "Bearer token")
@@ -264,7 +251,13 @@ func TestTeardown(t *testing.T) {
 					t.Error("teardown must not read current catalog")
 					return nil, fmt.Errorf("removed")
 				},
-				SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm, func(c *setup.ManagerConfig) { c.Coordinator = coord }),
+				SetupManager: newTestManager(t, &setup.SpaceRequestClient{HTTPClient: server.Client(), APIHost: server.URL}, helm, func(c *setup.ManagerConfig) {
+					c.Coordinator = coord
+					c.WithSnapshot = func(string, string, func(string) error) error {
+						t.Error("inventory and teardown must not read snapshots")
+						return fmt.Errorf("repository unavailable")
+					}
+				}),
 			})
 			request := func(method, url, body string, authorize bool) *httptest.ResponseRecorder {
 				req := httptest.NewRequestWithContext(t.Context(), method, url, strings.NewReader(body))

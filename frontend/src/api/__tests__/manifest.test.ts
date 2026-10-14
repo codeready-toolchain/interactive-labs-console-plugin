@@ -9,6 +9,15 @@ describe("validateManifest", () => {
       .toMatchObject({ metadata: { description: "Intro" }, spec: { attributes: { audience: "dev" } } });
   });
 
+  it.each(["../shared/chart", "setup/helm", ""])("accepts backend-owned setupDir %s", (setupDir) => {
+    // Given an approved bundle, when parsing its manifest, preserve the chart override as data.
+    expect(validateManifest({ ...valid, spec: { setupDir } })).toMatchObject({ spec: { setupDir } });
+  });
+
+  it.each([null, true, 42, [], {}])("rejects nonstring setupDir %p", (setupDir) => {
+    expect(() => validateManifest({ ...valid, spec: { setupDir } })).toThrow("manifest_invalid");
+  });
+
   it("rejects missing/empty title and legacy metadata", () => {
     for (const metadata of [{}, { title: "" }, { title: 1 }, { title: "L", name: "old" },
       { title: "L", displayName: "old" }, { title: "L", description: 42 }, { title: "L", extra: "bad" }]) {

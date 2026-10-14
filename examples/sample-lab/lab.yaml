@@ -13,9 +13,11 @@ metadata:
     the lab including images and partials here.
 
     Below the partial notification from the first module should be shown.
+
     include::modules/010-intro/content/_partials/note.adoc[]
 
     And below this line an image should be rendered.
+    
     image::modules/010-intro/content/images/flow.png[]
 
 spec:

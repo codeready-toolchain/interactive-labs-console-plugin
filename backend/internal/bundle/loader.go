@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/chart"
 	"github.com/codeready-toolchain/interactive-labs-console-plugin/backend/internal/manifest"
 )
 
@@ -55,8 +56,6 @@ type Result struct {
 	Manifest           *manifest.LabManifest
 	Modules            []Module // sorted by literal module ID
 	HelmChartAvailable bool
-	HelmChartDir       string // absolute path to setup/helm/ if available, empty otherwise
-	ValuesSchema       []byte // raw contents of setup/helm/values.schema.json, nil if absent
 	Revision           string // git commit SHA of the source snapshot
 }
 
@@ -147,17 +146,22 @@ func ReadResource(repositoryRoot, resourcePath string) (*Resource, error) {
 
 func rejectSymlinkPath(root, resourcePath string) error {
 	current := root
-	for _, segment := range strings.Split(resourcePath, "/") {
+	segments := strings.Split(resourcePath, "/")
+	for i, segment := range segments {
 		current = filepath.Join(current, segment)
-		info, err := os.Lstat(current)
+		rel, err := filepath.Rel(root, current)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("%w: target escapes repository", ErrResourceInvalid)
+		}
+		info, err := os.Lstat(current) // filepath.Rel above bounds every segment before inspection.
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("%w: target", ErrResourceNotFound)
 			}
 			return fmt.Errorf("%w: inspect target", ErrResourceInvalid)
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%w: symlink target", ErrResourceInvalid)
+		if info.Mode()&os.ModeSymlink != 0 || (i < len(segments)-1 && !info.IsDir()) {
+			return fmt.Errorf("%w: unsafe target", ErrResourceInvalid)
 		}
 	}
 	return nil
@@ -165,37 +169,83 @@ func rejectSymlinkPath(root, resourcePath string) error {
 
 // LoadFromSnapshot validates labPath before reading it from repositoryRoot.
 func LoadFromSnapshot(repositoryRoot, labPath string) (*Result, error) {
-	if err := ValidateLabPath(labPath); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrLabInvalid, err)
-	}
-	root, err := filepath.EvalSymlinks(repositoryRoot)
+	root, labDir, err := resolveSnapshotLab(repositoryRoot, labPath)
 	if err != nil {
-		return nil, fmt.Errorf("%w: repository snapshot unavailable", ErrRepositoryUnavailable)
-	}
-	if err = rejectSymlinkPath(root, labPath); err != nil {
-		if errors.Is(err, ErrResourceNotFound) {
-			return nil, fmt.Errorf("%w: lab path", ErrManifestMissing)
-		}
-		return nil, fmt.Errorf("%w: lab path", ErrLabInvalid)
-	}
-	labDir, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(labPath)))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("%w: lab path", ErrManifestMissing)
-		}
-		return nil, fmt.Errorf("%w: resolve lab path", ErrLabInvalid)
-	}
-	rel, err := filepath.Rel(root, labDir)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, fmt.Errorf("%w: lab path escapes repository", ErrLabInvalid)
+		return nil, err
 	}
 	return LoadFromDir(labDir, root)
 }
 
+// LoadContentFromSnapshot loads validated manifest and modules without chart or
+// provisioning policy. Consumers compose it with chart.LoadChart;
+// browser/catalog consumers must use LoadFromSnapshot to validate the whole bundle.
+func LoadContentFromSnapshot(repositoryRoot, labPath string) (*manifest.LabManifest, []Module, error) {
+	_, labDir, err := resolveSnapshotLab(repositoryRoot, labPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return loadContent(labDir)
+}
+
+func resolveSnapshotLab(repositoryRoot, labPath string) (string, string, error) {
+	if err := ValidateLabPath(labPath); err != nil {
+		return "", "", fmt.Errorf("%w: %w", ErrLabInvalid, err)
+	}
+	root, err := filepath.Abs(repositoryRoot)
+	if err == nil {
+		root, err = filepath.EvalSymlinks(root)
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("%w: repository snapshot unavailable", ErrRepositoryUnavailable)
+	}
+	if err = rejectSymlinkPath(root, labPath); err != nil {
+		if errors.Is(err, ErrResourceNotFound) {
+			return "", "", fmt.Errorf("%w: lab path", ErrManifestMissing)
+		}
+		return "", "", fmt.Errorf("%w: lab path", ErrLabInvalid)
+	}
+	labDir, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(labPath)))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", "", fmt.Errorf("%w: lab path", ErrManifestMissing)
+		}
+		return "", "", fmt.Errorf("%w: resolve lab path", ErrLabInvalid)
+	}
+	rel, err := filepath.Rel(root, labDir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("%w: lab path escapes repository", ErrLabInvalid)
+	}
+	return root, labDir, nil
+}
+
 // LoadFromDir loads a lab bundle from an already-populated labPath on disk.
-// repoRoot is the repository root directory where setup/helm/ is expected.
+// repoRoot bounds all selected chart paths, including lab-relative parent traversal.
 // Exported for filesystem-focused tests.
-func LoadFromDir(labDir string, repoRoot string) (*Result, error) { //nolint: gocyclo
+func LoadFromDir(labDir string, repoRoot string) (*Result, error) {
+	m, modules, err := loadContent(labDir)
+	if err != nil {
+		return nil, err
+	}
+	chart, err := chart.LoadChart(repoRoot, labDir, m.Spec.SetupDir)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrLabInvalid, err)
+	}
+	return &Result{Manifest: m, Modules: modules, HelmChartAvailable: chart.Dir != ""}, nil
+}
+
+func loadContent(labDir string) (*manifest.LabManifest, []Module, error) {
+	m, err := loadManifest(labDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	modules, err := loadModules(labDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	return m, modules, nil
+}
+
+func loadManifest(labDir string) (*manifest.LabManifest, error) {
 	manifestPath := filepath.Join(labDir, "lab.yaml")
 	manifestInfo, err := os.Lstat(manifestPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -216,6 +266,10 @@ func LoadFromDir(labDir string, repoRoot string) (*Result, error) { //nolint: go
 		return nil, fmt.Errorf("%w: manifest", ErrLabInvalid)
 	}
 
+	return m, nil
+}
+
+func loadModules(labDir string) ([]Module, error) {
 	modulesDir := filepath.Join(labDir, "modules")
 	info, err := os.Lstat(modulesDir)
 	if err != nil || !info.IsDir() {
@@ -232,8 +286,8 @@ func LoadFromDir(labDir string, repoRoot string) (*Result, error) { //nolint: go
 		}
 		moduleDir := filepath.Join(modulesDir, entry.Name())
 		contentDir := filepath.Join(moduleDir, "content")
-		contentInfo, err := os.Lstat(contentDir)
-		if err != nil || !contentInfo.IsDir() {
+		contentInfo, statErr := os.Lstat(contentDir)
+		if statErr != nil || !contentInfo.IsDir() {
 			return nil, fmt.Errorf("%w: module content directory", ErrLabInvalid)
 		}
 		var contentPaths []string
@@ -279,30 +333,19 @@ func LoadFromDir(labDir string, repoRoot string) (*Result, error) { //nolint: go
 			}
 		}
 		slices.Sort(pages)
-		moduleYAML, err := os.ReadFile(filepath.Join(moduleDir, "module.yaml"))
-		if err == nil {
+		moduleYAML, readErr := os.ReadFile(filepath.Join(moduleDir, "module.yaml"))
+		if readErr == nil {
 			if _, labErr := manifest.ValidateModule(moduleYAML, pages); labErr != nil {
 				return nil, fmt.Errorf("%w: invalid module.yaml", ErrLabInvalid)
 			}
-		} else if !errors.Is(err, os.ErrNotExist) {
+		} else if !errors.Is(readErr, os.ErrNotExist) {
 			return nil, fmt.Errorf("%w: read module.yaml", ErrLabInvalid)
 		}
 		modules = append(modules, Module{ID: entry.Name(), Pages: pages})
 	}
 	slices.SortFunc(modules, func(a, b Module) int { return strings.Compare(a.ID, b.ID) })
 
-	helmDir := filepath.Join(repoRoot, "setup", "helm")
-	_, helmErr := os.Stat(filepath.Join(helmDir, "Chart.yaml"))
-	helmAvailable := helmErr == nil
-
-	result := &Result{Manifest: m, Modules: modules, HelmChartAvailable: helmAvailable}
-	if helmAvailable {
-		result.HelmChartDir = helmDir
-		if schema, err := os.ReadFile(filepath.Join(helmDir, "values.schema.json")); err == nil {
-			result.ValuesSchema = schema
-		}
-	}
-	return result, nil
+	return modules, nil
 }
 
 func isIncludeOnly(page string) bool {
