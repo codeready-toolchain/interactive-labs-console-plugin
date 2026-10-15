@@ -1203,9 +1203,8 @@ const InteractiveLabsPage: React.FC = () => {
           const existing = new Set(existingCatalogRefs);
           const orphans = existingCatalogRefs.filter((catalogRef) => !catalog.some((item) => item.catalogRef === catalogRef));
           const visibleRefs = [
-            ...filteredItems.filter((item) => existing.has(item.catalogRef)).map((item) => item.catalogRef),
             ...orphans,
-            ...filteredItems.filter((item) => !existing.has(item.catalogRef)).map((item) => item.catalogRef),
+            ...filteredItems.map((item) => item.catalogRef),
           ];
           return (
             <>
