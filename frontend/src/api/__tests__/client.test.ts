@@ -2,7 +2,7 @@
 // consoleFetch is stubbed via moduleNameMapper → src/__mocks__/dynamic-plugin-sdk.ts
 
 import { consoleFetch } from "@openshift-console/dynamic-plugin-sdk";
-import { fetchResourceText, getSetupStatus, listCatalog, loadLabBundle, setupLab } from "../client";
+import { fetchResourceText, getSetupStatus, listCatalog, loadLabBundle, resyncRepository, setupLab } from "../client";
 
 const mockFetch = consoleFetch as jest.MockedFunction<typeof consoleFetch>;
 
@@ -42,6 +42,31 @@ async function expectBundleValidationFailure(body: unknown): Promise<void> {
 
 beforeEach(() => {
   mockFetch.mockReset();
+});
+
+describe("resyncRepository", () => {
+  it("given an approved catalog identity when resync finishes then POST only that identity and accept completed 204", async () => {
+    const signal = new AbortController().signal;
+    const json = jest.fn();
+    mockFetch.mockResolvedValueOnce({ ok: true, status: 204, json } as unknown as Response);
+
+    await expect(resyncRepository("l1", signal)).resolves.toBeUndefined();
+
+    expect(mockFetch).toHaveBeenCalledWith(`${PROXY_BASE}/api/v1alpha1/labs/l1/resync`, { method: "POST", signal });
+    expect(json).not.toHaveBeenCalled();
+  });
+
+  it("given an error or incomplete response when resync returns then reject rather than reload prematurely", async () => {
+    mockFetch.mockResolvedValueOnce(makeJsonResponse({ kind: "Error", type: "repository_error", message: "Repository refresh failed" }, 502));
+    await expect(resyncRepository("l1")).rejects.toMatchObject({ type: "repository_error", message: "Repository refresh failed" });
+    mockFetch.mockResolvedValueOnce(makeJsonResponse({}, 202));
+    await expect(resyncRepository("l1")).rejects.toThrow("Repository refresh did not complete.");
+  });
+
+  it("given a browser-controlled source URL when resync is requested then reject before calling proxy", async () => {
+    await expect(resyncRepository("https://evil.test/repo")).rejects.toThrow("Invalid catalog identity.");
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
 });
 
 describe("listCatalog", () => {

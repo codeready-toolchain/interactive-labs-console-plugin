@@ -69,6 +69,14 @@ Backend stages each `(repository, branch)` source under `/var/lib/interactive-la
 
 The named ConfigMap watch coalesces changes during a sweep into one non-overlapping follow-up. Every sweep re-gets and validates the current catalog rather than trusting watch data. Watch interruptions reconnect/re-list; periodic refresh remains fallback. Deleting the catalog causes a safe read failure without evicting snapshots; recreation retriggers refresh. No browser update notification is sent.
 
+### Temporary repository resync — remove for production
+
+The drawer-header pagination row includes an icon-only reload control at the right (tooltip retained). **Both this control and `POST /api/v1alpha1/labs/{catalogRef}/resync` MUST BE removed in production.** Any authenticated Console user can trigger it for a current catalog entry. The backend resolves that identity through the live validated catalog; browser-supplied repository URLs and branches never select the source. The shared repository+branch snapshot changes for **all users and labs using that source**, not only the requesting user or lab. Other open drawers are not automatically reloaded; sessions are not revision-pinned.
+
+Resync synchronously uses the existing cache refresh with its ten-minute deadline, including any wait behind another refresh of the same source. Periodic and manual acquisition serialize per repository+branch; unchanged snapshots avoid another clone, and readers retain the previous snapshot while staging runs. Only a completed refresh returns `204`. Cancellation, timeout, or refresh failure never returns success. The button stays focusable but disabled during resync, shows pending feedback, and reports errors. After success, the requesting drawer reloads its bundle and current page without setup/teardown or progress reset, retaining generated setup attributes. If refresh, bundle loading, or page rendering fails, existing drawer content stays visible. If the current page was removed, an error preserves the current view rather than silently resetting progress. A successful snapshot publication is not rolled back if later content loading fails or the connection is lost.
+
+The `UserToken` ConsolePlugin proxy has no explicit timeout setting in this repository. Server write timeout is 600 seconds, the same duration as source refresh, leaving no response margin at the deadline after authentication/catalog work. A near-deadline refresh or an earlier infrastructure timeout can therefore yield a connection error rather than a typed response; the UI does not treat that as success. No asynchronous job/polling framework or deployment timeout change is added for this temporary control.
+
 Schema, validation, and attributes: [catalog ConfigMap contract](../efforts/interactive-labs/contract/catalog-configmap.md).
 
 ## RBAC and runtime security

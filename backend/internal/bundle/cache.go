@@ -30,6 +30,7 @@ type sourceKey struct {
 }
 
 type cacheEntry struct {
+	refresh           chan struct{}
 	mu                sync.RWMutex
 	checkoutDirectory string
 	revision          *string
@@ -118,6 +119,18 @@ func (c *Cache) Refresh(ctx context.Context, request RepositoryRefreshRequest) e
 		return err
 	}
 
+	// Serialize acquisition for this source, including periodic and manual refreshes.
+	// Readers keep using the last snapshot while a new one is staged.
+	select {
+	case entry.refresh <- struct{}{}:
+	default:
+		select {
+		case entry.refresh <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	defer func() { <-entry.refresh }()
 	entry.mu.RLock()
 	localRevision := entry.revision
 	entry.mu.RUnlock()
@@ -132,8 +145,11 @@ func (c *Cache) Refresh(ctx context.Context, request RepositoryRefreshRequest) e
 	if !isCommitSHA(remoteRevision) {
 		return fmt.Errorf("%w: %w", ErrRepositoryUnavailable, ErrRemoteReferenceLookupFailed)
 	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	if localRevision != nil && *localRevision == remoteRevision {
-		return nil
+		return ctx.Err()
 	}
 
 	entryDir := filepath.Dir(entry.checkoutDirectory)
@@ -157,9 +173,12 @@ func (c *Cache) Refresh(ctx context.Context, request RepositoryRefreshRequest) e
 		return fmt.Errorf("%w: %w", ErrRepositoryUnavailable, ErrHeadResolutionFailed)
 	}
 	if localRevision != nil && *localRevision == revision {
-		return nil
+		return ctx.Err()
 	}
-	if err = c.publish(entry, staging, revision); err != nil {
+	if err = c.publish(ctx, entry, staging, revision); err != nil {
+		if errors.Is(err, ctx.Err()) {
+			return ctx.Err()
+		}
 		return fmt.Errorf("%w: publish snapshot", ErrRepositoryUnavailable)
 	}
 	return nil
@@ -185,7 +204,7 @@ func (c *Cache) entry(repository, branch string) (*cacheEntry, error) {
 	if entry := c.entries[key]; entry != nil {
 		return entry, nil
 	}
-	entry := &cacheEntry{checkoutDirectory: filepath.Join(c.root, snapshotID(repository, branch), "content")}
+	entry := &cacheEntry{refresh: make(chan struct{}, 1), checkoutDirectory: filepath.Join(c.root, snapshotID(repository, branch), "content")}
 	if revision, err := c.git.Head(entry.checkoutDirectory); err == nil && isCommitSHA(revision) {
 		entry.revision = &revision
 	}
@@ -193,9 +212,12 @@ func (c *Cache) entry(repository, branch string) (*cacheEntry, error) {
 	return entry, nil
 }
 
-func (c *Cache) publish(entry *cacheEntry, staging, revision string) error {
+func (c *Cache) publish(ctx context.Context, entry *cacheEntry, staging, revision string) error {
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	old := entry.checkoutDirectory + ".old"
 	if err := os.RemoveAll(old); err != nil {

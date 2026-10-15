@@ -74,6 +74,17 @@ func (c *RefreshCoordinator) RequestRefresh() {
 	}
 }
 
+// RefreshRepository synchronously refreshes one source within the existing deadline.
+// Cache.Refresh serializes concurrent periodic and manual refreshes of that source.
+func (c *RefreshCoordinator) RefreshRepository(ctx context.Context, request RepositoryRefreshRequest) error {
+	sourceCtx, cancel := context.WithTimeout(ctx, refreshDeadline)
+	defer cancel()
+	if err := c.refresh(sourceCtx, request); err != nil {
+		return err
+	}
+	return sourceCtx.Err()
+}
+
 // Refresh performs one grouped source refresh sweep.
 func (c *RefreshCoordinator) Refresh(ctx context.Context) error {
 	entries, err := c.entries(ctx)
@@ -105,9 +116,7 @@ func (c *RefreshCoordinator) Refresh(ctx context.Context) error {
 			}
 			defer func() { <-sem }()
 
-			sourceCtx, cancel := context.WithTimeout(ctx, refreshDeadline)
-			defer cancel()
-			if err := c.refresh(sourceCtx, group.request); err != nil {
+			if err := c.RefreshRepository(ctx, group.request); err != nil {
 				if ctx.Err() != nil {
 					return
 				}

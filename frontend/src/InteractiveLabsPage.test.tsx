@@ -41,6 +41,7 @@ jest.mock('react-router-dom-v5-compat', () => ({
 
 const mockListCatalog = client.listCatalog as jest.MockedFunction<typeof client.listCatalog>;
 const mockLoadLabBundle = client.loadLabBundle as jest.MockedFunction<typeof client.loadLabBundle>;
+const mockResyncRepository = client.resyncRepository as jest.MockedFunction<typeof client.resyncRepository>;
 const mockSetupLab = client.setupLab as jest.MockedFunction<typeof client.setupLab>;
 const mockGetSetupStatus = client.getSetupStatus as jest.MockedFunction<typeof client.getSetupStatus>;
 const mockFetchResourceText = client.fetchResourceText as jest.MockedFunction<typeof client.fetchResourceText>;
@@ -62,6 +63,7 @@ beforeEach(() => {
   (client.getTeardownStatus as jest.MockedFunction<typeof client.getTeardownStatus>).mockReset();
   sessionStorage.removeItem('interactive-labs-teardown');
   mockLoadLabBundle.mockReset();
+  mockResyncRepository.mockReset();
   mockSetupLab.mockReset();
   mockGetSetupStatus.mockReset();
   mockFetchResourceText.mockReset();
@@ -204,6 +206,174 @@ const launchGuidanceLab = async (html: string, trusted = true): Promise<void> =>
   await renderCatalog();
   await act(async () => { getButton(/^Launch$/).click(); });
 };
+
+describe('temporary repository resync', () => {
+  test('given an open lab when heading renders then icon-only resync aligns with page count and retains its accessible warning', async () => {
+    // Given an open lab.
+    mockLoadLabBundle.mockResolvedValue(noChartBundle);
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+
+    // When inspecting the heading control.
+    const button = getButton(/Resync repository/);
+
+    // Then the icon shares a full-width row with the page count, without a prominent text button.
+    expect(button.closest('.pf-v6-c-drawer__head')).not.toBeNull();
+    expect(button.classList.contains('pf-m-plain')).toBe(true);
+    expect(button.getAttribute('aria-label')).toBe('Resync repository');
+    expect(button.textContent).toBe('');
+    expect(button.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true');
+    expect(button.querySelector('.pfext-lab-resync__icon--pending')).toBeNull();
+    const row = button.closest('.pfext-lab-header-row');
+    expect(row?.parentElement?.classList.contains('pf-v6-c-drawer__head')).toBe(true);
+    expect(row?.querySelector('[aria-live="polite"]')?.textContent).toBe('Page 1 of 2');
+    const description = document.getElementById(button.getAttribute('aria-describedby')!);
+    expect(description?.textContent).toBe('Temporary testing control. Fetches the latest lab content from the configured repository and branch, affecting all users. This MUST BE removed in production.');
+    expect(button.tabIndex).toBe(0);
+    const css = readFileSync(`${__dirname}/interactive-labs.css`, 'utf8');
+    const rowStyle = css.match(/\.pfext-lab-header-row\s*\{([^}]*)\}/)?.[1];
+    expect(rowStyle).toContain('display: flex;');
+    expect(rowStyle).toContain('align-items: center;');
+    expect(rowStyle).toContain('grid-column: 1 / 3;');
+    expect(css.match(/\.pfext-lab-resync\s*\{([^}]*)\}/)?.[1]).toContain('margin-inline-start: auto;');
+    expect(css).not.toContain('#f0ab00');
+    expect(css).toMatch(/@media\s*\(prefers-reduced-motion: no-preference\)\s*\{\s*\.pfext-lab-resync__icon--pending\s*\{[^}]*animation:\s*pfext-lab-resync-rotate\s+1s\s+linear\s+infinite;/);
+    expect(css).toMatch(/@keyframes pfext-lab-resync-rotate\s*\{\s*to\s*\{\s*transform:\s*rotate\(360deg\);/);
+    jest.useFakeTimers();
+    try {
+      await act(async () => { button.focus(); jest.advanceTimersByTime(500); });
+      expect(document.querySelector('[role="tooltip"]')?.textContent).toBe(description?.textContent);
+      await act(async () => { button.blur(); jest.advanceTimersByTime(500); });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('given a chart-backed lab on its last page when resync completes then reload that page without lifecycle or progress changes', async () => {
+    // Given an already prepared lab with generated setup attributes and saved page progress.
+    mockLoadLabBundle.mockResolvedValue(chartBundle);
+    mockSetupLab.mockResolvedValue({ apiVersion: 'v1alpha1', kind: 'SetupStatus', spaceRequests: { status: 'ready', namespaces: {} }, helm: { status: 'deployed', releaseName: 'il-one' } });
+    mockGetSetupStatus.mockResolvedValue({ apiVersion: 'v1alpha1', kind: 'SetupStatus', spaceRequests: { status: 'ready', namespaces: {} }, helm: { status: 'deployed', releaseName: 'il-one' }, attributes: { 'lab-namespace': 'prepared-ns' } });
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Original content</p>', warnings: [] });
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+    await act(async () => { getButton(/^Next$/).click(); });
+    const saved = localStorage.getItem(sessionKey('lab-1'));
+    const sync = deferred<void>();
+    mockResyncRepository.mockReturnValue(sync.promise);
+    const updated = { ...chartBundle, manifest: { ...chartBundle.manifest, metadata: { title: 'Updated lab' }, spec: { attributes: { greeting: 'New greeting' } } } };
+    mockLoadLabBundle.mockResolvedValue(updated);
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Updated content</p>', warnings: [] });
+    const bundleCalls = mockLoadLabBundle.mock.calls.length;
+    const resourceCalls = mockFetchResourceText.mock.calls.length;
+    const setupCalls = mockSetupLab.mock.calls.length;
+    const statusCalls = mockGetSetupStatus.mock.calls.length;
+
+    // When resync is pending, keep content, suppress duplicate requests, and wait before reload.
+    await act(async () => { getButton(/Resync repository/).click(); getButton(/Resync repository/).click(); });
+    const button = getButton(/Resync repository/);
+    expect(button.getAttribute('aria-disabled')).toBe('true');
+    expect(button.tabIndex).toBe(0);
+    expect(button.textContent).toBe('');
+    expect(button.querySelector('svg.pfext-lab-resync__icon--pending')).not.toBeNull();
+    expect(button.querySelector('[role="progressbar"]')).toBeNull();
+    expect(container.textContent).toContain('Resyncing repository');
+    expect(container.querySelector('#interactive-labs-drawer-panel .interactive-labs-content.doc')?.textContent).toBe('Original content');
+    expect(mockResyncRepository).toHaveBeenCalledTimes(1);
+    expect(mockResyncRepository).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
+    expect(mockLoadLabBundle).toHaveBeenCalledTimes(bundleCalls);
+    expect(mockFetchResourceText).toHaveBeenCalledTimes(resourceCalls);
+    await act(async () => { sync.resolve(); });
+
+    // Then only current content reloads, with new static attributes and existing setup values.
+    expect(container.textContent).toContain('Updated lab');
+    expect(container.querySelector('#interactive-labs-drawer-panel .interactive-labs-content.doc')?.textContent).toBe('Updated content');
+    expect(mockRenderAsciiDoc).toHaveBeenLastCalledWith(expect.objectContaining({ sourceURL: lastPage.url, attributes: { greeting: 'New greeting', 'lab-namespace': 'prepared-ns' } }));
+    expect(localStorage.getItem(sessionKey('lab-1'))).toBe(saved);
+    expect(mockSetupLab).toHaveBeenCalledTimes(setupCalls);
+    expect(mockGetSetupStatus).toHaveBeenCalledTimes(statusCalls);
+    expect(client.teardownLab).not.toHaveBeenCalled();
+    expect(button.getAttribute('aria-disabled')).toBeNull();
+    expect(button.querySelector('.pfext-lab-resync__icon--pending')).toBeNull();
+  });
+
+  test('given staged resync content when drawer is minimized before rendering completes then keep it minimized', async () => {
+    mockLoadLabBundle.mockResolvedValue(noChartBundle);
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Original content</p>', warnings: [] });
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+    mockResyncRepository.mockResolvedValue(undefined);
+    const rendered = deferred<Awaited<ReturnType<typeof renderAsciiDoc>>>();
+    mockRenderAsciiDoc.mockReturnValue(rendered.promise);
+    await act(async () => { getButton(/Resync repository/).click(); });
+    await act(async () => { getButton(/Minimize lab/).click(); });
+
+    await act(async () => { rendered.resolve({ html: '<p>Updated content</p>', warnings: [] }); });
+
+    expect(container.querySelector('#interactive-labs-drawer-panel')).toBeNull();
+    expect(getButton(/Restore lab/)).toBeDefined();
+    expect(JSON.parse(localStorage.getItem(sessionKey('lab-1'))!).panelMode).toBe('minimized');
+  });
+
+  test.each(['refresh', 'bundle', 'page', 'render', 'removed page'])('given %s failure when resync runs then retain current content and surface a retryable error', async (stage) => {
+    // Given visible last-page content and saved progress.
+    mockLoadLabBundle.mockResolvedValue(noChartBundle);
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Original content</p>', warnings: [] });
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+    await act(async () => { getButton(/^Next$/).click(); });
+    const saved = localStorage.getItem(sessionKey('lab-1'));
+    const bundleCalls = mockLoadLabBundle.mock.calls.length;
+    mockResyncRepository.mockResolvedValue(undefined);
+    const error = new Error('Testing resync failure');
+    if (stage === 'refresh') mockResyncRepository.mockRejectedValue(error);
+    if (stage === 'bundle') mockLoadLabBundle.mockRejectedValue(error);
+    if (stage === 'page') mockFetchResourceText.mockRejectedValue(error);
+    if (stage === 'render') mockRenderAsciiDoc.mockRejectedValue(error);
+    if (stage === 'removed page') mockLoadLabBundle.mockResolvedValue({ ...noChartBundle, modules: [{ ...noChartBundle.modules[0], pages: [firstPage] }] });
+
+    // When refresh or staged loading fails.
+    await act(async () => { getButton(/Resync repository/).click(); });
+
+    // Then no content/progress is discarded, no lifecycle mutation happens, and retry remains available.
+    expect(container.querySelector('#interactive-labs-drawer-panel .interactive-labs-content.doc')?.textContent).toBe('Original content');
+    expect(container.textContent).toContain(stage === 'removed page' ? 'Current lab page is no longer available.' : error.message);
+    expect(localStorage.getItem(sessionKey('lab-1'))).toBe(saved);
+    expect(getButton(/Resync repository/).getAttribute('aria-disabled')).toBeNull();
+    expect(getButton(/Resync repository/).querySelector('.pfext-lab-resync__icon--pending')).toBeNull();
+    expect(mockSetupLab).not.toHaveBeenCalled();
+    expect(client.teardownLab).not.toHaveBeenCalled();
+    if (stage === 'refresh') expect(mockLoadLabBundle).toHaveBeenCalledTimes(bundleCalls);
+  });
+
+  test.each(['close', 'switch', 'navigate', 'unmount'])('given a pending resync when user chooses %s then cancel and ignore stale completion', async (action) => {
+    mockLoadLabBundle.mockResolvedValue(noChartBundle);
+    mockRenderAsciiDoc.mockResolvedValue({ html: '<p>Original content</p>', warnings: [] });
+    await renderCatalog();
+    await act(async () => { getButton(/^Launch$/).click(); });
+    const sync = deferred<void>();
+    mockResyncRepository.mockReturnValue(sync.promise);
+    await act(async () => { getButton(/Resync repository/).click(); });
+    const signal = mockResyncRepository.mock.calls[0][1]!;
+    await act(async () => {
+      if (action === 'close') getButton(/Close lab/).click();
+      if (action === 'navigate') getButton(/^Next$/).click();
+      if (action === 'switch') {
+        const buttons = Array.from(container.querySelectorAll('button')).filter((button) => button.textContent?.trim() === 'Launch');
+        buttons[1].click();
+      }
+      if (action === 'unmount') ReactDOM.unmountComponentAtNode(container);
+    });
+    const bundleCalls = mockLoadLabBundle.mock.calls.length;
+    const currentHTML = container.innerHTML;
+    expect(signal.aborted).toBe(true);
+
+    await act(async () => { sync.resolve(); });
+
+    expect(mockLoadLabBundle).toHaveBeenCalledTimes(bundleCalls);
+    expect(container.innerHTML).toBe(currentHTML);
+  });
+});
 
 const renderPageCatalog = renderCatalog;
 describe('catalog setup actions', () => {
@@ -1220,6 +1390,11 @@ describe('InteractiveLabsPage', () => {
     expect(moduleOptions()).toHaveLength(0);
     expect(mockFetchResourceText).not.toHaveBeenCalled();
     expect(mockSetupLab).toHaveBeenCalledWith('lab-1', expect.any(AbortSignal));
+    const resync = getButton(/Resync repository/);
+    expect(resync.getAttribute('aria-disabled')).toBe('true');
+    expect(resync.querySelector('.pfext-lab-resync__icon--pending')).toBeNull();
+    await act(async () => { resync.click(); });
+    expect(mockResyncRepository).not.toHaveBeenCalled();
   });
 
   test('renders chart-backed first page after setup becomes ready', async () => {

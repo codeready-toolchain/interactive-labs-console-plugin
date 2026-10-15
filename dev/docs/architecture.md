@@ -39,6 +39,10 @@ Evidence: [Containerfile](../../Containerfile), [server](../../backend/cmd/serve
 
 **Implemented and verified:** A client-go informer watches only the named `interactive-labs-catalog` ConfigMap in the configured namespace. Create, update, and delete signal a coalescing coordinator; sweeps do not overlap, and changes during a sweep cause one follow-up. Every sweep performs a fresh ConfigMap `Get` and validates the full catalog; event payloads are not refresh configuration. Startup and periodic sweeps remain, and the informer reconnects/re-lists after interruption. Deletion fails safely without evicting snapshots; recreation can trigger recovery. No browser notification is added.
 
+### Temporary targeted repository resync
+
+The icon-only reload control at the right of the drawer-header pagination row (tooltip retained) calls authenticated `POST /api/v1alpha1/labs/{catalogRef}/resync` through the existing `UserToken` proxy. Backend resolves the current validated catalog entry and passes only its repository+branch to the existing coordinator/cache collaborators. The synchronous request has the existing ten-minute source deadline and returns `204` only after completion; per-source cache acquisition serializes manual and periodic refreshes without blocking reads during staging. It changes the shared source for all dependent labs/users, not a private session snapshot. The browser stages a new bundle and rendered current page before replacing visible content; errors retain the current view. Setup/teardown, generated setup values, and saved page progress are unchanged. No other browser is notified or reloaded, and no revisions are pinned. **This testing control and endpoint MUST BE removed in production.** See [operational limits and timeout caveat](administrator-guide.md#temporary-repository-resync--remove-for-production).
+
 ### Bundle
 
 1. Browser requests `GET /api/v1alpha1/labs/{catalogRef}/bundle` through same proxy.

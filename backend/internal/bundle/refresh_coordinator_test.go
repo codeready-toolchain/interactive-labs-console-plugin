@@ -13,6 +13,35 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRefreshRepository(t *testing.T) {
+	t.Run("given a targeted source when refreshing then wait for completion within the existing ten minute deadline", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// Given a targeted refresh that does not complete before its deadline.
+			request := RepositoryRefreshRequest{Repository: testRepository, Branch: testBranch}
+			coordinator := NewRefreshCoordinator(nil, func(ctx context.Context, received RepositoryRefreshRequest) error {
+				assert.Equal(t, request, received)
+				deadline, ok := ctx.Deadline()
+				assert.True(t, ok)
+				assert.Equal(t, 10*time.Minute, time.Until(deadline))
+				<-ctx.Done()
+				return ctx.Err()
+			}, nil, time.Hour, 1)
+
+			// When the existing deadline expires, no sweep or background receipt is needed.
+			err := coordinator.RefreshRepository(t.Context(), request)
+
+			// Then the caller receives the timeout, not premature success.
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+		})
+	})
+	t.Run("given a canceled caller when refresher returns nil then cancellation is not success", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		coordinator := NewRefreshCoordinator(nil, func(context.Context, RepositoryRefreshRequest) error { cancel(); return nil }, nil, time.Hour, 1)
+		require.ErrorIs(t, coordinator.RefreshRepository(ctx, RepositoryRefreshRequest{}), context.Canceled)
+	})
+}
+
 func TestNewRefreshCoordinatorAcceptsNamedDependencies(t *testing.T) {
 	entries := LoadEntries(func(context.Context) ([]RefreshEntry, error) {
 		return []RefreshEntry{{Repository: "https://example.test/labs.git", Branch: "main", LabPath: "lab"}}, nil
