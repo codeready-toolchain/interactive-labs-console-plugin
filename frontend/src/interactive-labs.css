@@ -55,6 +55,13 @@
   --caption-font-weight: var(--body-font-weight-bold);
   --code-background: var(--panel-background);
   --code-font-color: var(--color-jet-70);
+  /* Syntax palette; base text and surface use --code-font-color / --pre-background. */
+  --syntax-comment-font-color: #5d5d5d;
+  --syntax-keyword-font-color: #7b268c;
+  --syntax-string-font-color: #226b35;
+  --syntax-literal-font-color: #8a4300;
+  --syntax-title-font-color: #005a9c;
+  --syntax-variable-font-color: #a11b35;
   --example-background: var(--color-white);
   --example-border-color: var(--color-gray-70);
   --kbd-background: var(--panel-background);
@@ -99,6 +106,12 @@
   --example-background: #151515;
   --link-font-color: #ff6b6b;
   --link_hover-font-color: #ff9b8e;
+  --syntax-comment-font-color: #b8bbbe;
+  --syntax-keyword-font-color: #d7a6ed;
+  --syntax-string-font-color: #a3d9a5;
+  --syntax-literal-font-color: #ffc78a;
+  --syntax-title-font-color: #8bc1f7;
+  --syntax-variable-font-color: #ffacb6;
 }
 
 @media screen and (min-width: 1024px) {
@@ -597,6 +610,60 @@
   display: block;
   overflow-x: auto;
   padding: 0.75rem;
+}
+
+/* Outrank ordinary global highlight.js selectors, regardless of load order. */
+.interactive-labs-content.doc pre,
+.interactive-labs-content.doc pre code.hljs {
+  background: var(--pre-background);
+  color: var(--code-font-color);
+  font-style: normal;
+  font-weight: normal;
+  text-decoration: none;
+}
+
+.interactive-labs-content.doc .hljs span {
+  background: none;
+  color: inherit;
+  font-style: inherit;
+  font-weight: inherit;
+  text-decoration: none;
+}
+
+.interactive-labs-content.doc .hljs :is(.hljs-comment, .hljs-quote) {
+  color: var(--syntax-comment-font-color);
+}
+
+.interactive-labs-content.doc .hljs :is(.hljs-keyword, .hljs-selector-tag, .hljs-doctag, .hljs-meta) {
+  color: var(--syntax-keyword-font-color);
+}
+
+.interactive-labs-content.doc .hljs :is(.hljs-string, .hljs-regexp, .hljs-addition) {
+  color: var(--syntax-string-font-color);
+}
+
+.interactive-labs-content.doc .hljs :is(.hljs-number, .hljs-literal, .hljs-built_in, .hljs-type) {
+  color: var(--syntax-literal-font-color);
+}
+
+.interactive-labs-content.doc .hljs :is(.hljs-title, .hljs-section, .hljs-attribute, .hljs-attr, .hljs-name, .hljs-selector-id, .hljs-selector-class) {
+  color: var(--syntax-title-font-color);
+}
+
+.interactive-labs-content.doc .hljs :is(.hljs-symbol, .hljs-bullet, .hljs-variable, .hljs-template-variable, .hljs-link, .hljs-deletion) {
+  color: var(--syntax-variable-font-color);
+}
+
+.interactive-labs-content.doc .hljs .hljs-subst {
+  color: var(--code-font-color);
+}
+
+.interactive-labs-content.doc .hljs .hljs-strong {
+  font-weight: bold;
+}
+
+.interactive-labs-content.doc .hljs .hljs-emphasis {
+  font-style: italic;
 }
 
 .interactive-labs-content .listingblock .content > pre {
