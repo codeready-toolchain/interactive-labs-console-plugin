@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/go-git/go-git/v5"
@@ -145,6 +146,64 @@ func refresh(cache *Cache, repository, branch string) error {
 }
 
 func TestCache(t *testing.T) {
+	t.Run("given concurrent refreshes when one source is busy then serialize that source and allow cancellation", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// Given a staged refresh that has not published yet.
+			client := newFakeGit()
+			key := sourceKey{testRepository, testBranch}
+			client.refs[key], client.contents[key] = oldRevision, "= Test"
+			client.cloneStarted = make(chan struct{})
+			release := make(chan struct{})
+			client.cloneWait = release
+			cache := newCache(t.TempDir(), client)
+			first := make(chan error, 1)
+			go func() { first <- refresh(cache, testRepository, testBranch) }()
+			<-client.cloneStarted
+			client.mu.Lock()
+			client.cloneStarted = nil
+			other := sourceKey{testRepository, "other"}
+			client.refs[other], client.contents[other] = oldRevision, "= Other"
+			client.mu.Unlock()
+
+			// When another refresh queues for the same source and a different branch starts.
+			ctx, cancel := context.WithCancel(t.Context())
+			second, independent := make(chan error, 1), make(chan error, 1)
+			go func() {
+				second <- cache.Refresh(ctx, RepositoryRefreshRequest{Repository: testRepository, Branch: testBranch})
+			}()
+			go func() { independent <- refresh(cache, testRepository, "other") }()
+			synctest.Wait()
+			assert.Equal(t, 1, client.cloneCount(testRepository, testBranch), "same-source refreshes must not overlap")
+			assert.Equal(t, 1, client.cloneCount(testRepository, "other"), "different sources stay independent")
+			cancel()
+			require.ErrorIs(t, <-second, context.Canceled)
+
+			// Then the first refresh publishes; a queued retry reuses its snapshot.
+			close(release)
+			require.NoError(t, <-first)
+			require.NoError(t, <-independent)
+			require.NoError(t, refresh(cache, testRepository, testBranch))
+			assert.Equal(t, 1, client.cloneCount(testRepository, testBranch))
+		})
+	})
+	t.Run("given cancellation after clone when refresh finishes then do not publish or report success", func(t *testing.T) {
+		client := newFakeGit()
+		key := sourceKey{testRepository, testBranch}
+		client.refs[key], client.contents[key] = oldRevision, "= Original"
+		cache := newCache(t.TempDir(), client)
+		require.NoError(t, refresh(cache, testRepository, testBranch))
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		client.refs[key], client.contents[key] = newRevision, "= Changed"
+		client.cloneCheck = func(string) error { cancel(); return nil }
+
+		err := cache.Refresh(ctx, RepositoryRefreshRequest{Repository: testRepository, Branch: testBranch})
+
+		require.ErrorIs(t, err, context.Canceled)
+		result, err := cache.LoadBundle(t.Context(), testRepository, testBranch, "lab")
+		require.NoError(t, err)
+		assert.Equal(t, oldRevision, result.Revision)
+	})
 	t.Run("snapshot callback reuses bundle snapshot without acquisition", func(t *testing.T) {
 		// Given an existing approved snapshot with a selected chart.
 		root := t.TempDir()

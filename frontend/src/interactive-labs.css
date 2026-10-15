@@ -793,6 +793,29 @@
   padding: var(--pf-t--global--spacer--md) var(--pf-t--global--spacer--lg);
 }
 
+.pfext-lab-panel-content .pfext-lab-header-row {
+  display: flex;
+  align-items: center;
+  grid-column: 1 / 3;
+}
+
+/* Temporary testing control; remove for production. */
+.pfext-lab-resync {
+  margin-inline-start: auto;
+}
+
+@keyframes pfext-lab-resync-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .pfext-lab-resync__icon--pending {
+    animation: pfext-lab-resync-rotate 1s linear infinite;
+  }
+}
+
 .pfext-lab-module-title {
   font-weight: var(--pf-t--global--font--weight--body--bold);
 }

@@ -48,6 +48,14 @@ export async function loadLabBundle(catalogRef: string, labPath: string, signal?
   return validateLabBundle(await parseResponse<unknown>(res), catalogRef, labPath);
 }
 
+// Temporary testing control; remove together with the backend resync route for production.
+export async function resyncRepository(catalogRef: string, signal?: AbortSignal): Promise<void> {
+  if (!/^[A-Za-z0-9_-]+$/.test(catalogRef)) throw new Error("Invalid catalog identity.");
+  const res = await consoleFetch(`${PROXY_BASE}/api/v1alpha1/labs/${catalogRef}/resync`, { method: "POST", signal });
+  if (!res.ok) throw parseLabError(await res.json());
+  if (res.status !== 204) throw new Error("Repository refresh did not complete.");
+}
+
 export async function fetchResourceText(resourceURL: string, signal: AbortSignal): Promise<string> {
   const base = new URL(`${PROXY_BASE}/`, window.location.origin);
   const resolved = new URL(resourceURL, window.location.origin);

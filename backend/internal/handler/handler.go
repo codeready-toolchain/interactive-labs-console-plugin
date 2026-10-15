@@ -1,4 +1,4 @@
-// Package handler wires the three MVP backend operations to http.ServeMux routes.
+// Package handler wires backend operations to http.ServeMux routes.
 package handler
 
 import (
@@ -32,6 +32,9 @@ type Config struct {
 	BundleLoader func(context.Context, string, string, string) (*bundle.Result, error)
 	// ResourceLoader reads an approved resource from the configured source snapshot.
 	ResourceLoader func(context.Context, string, string, string) (*bundle.Resource, error)
+	// RepositoryRefresher synchronously refreshes an approved source snapshot.
+	// Temporary testing control: remove this dependency and route for production.
+	RepositoryRefresher bundle.RepositoryRefresher
 	// CatalogLabOmitted receives validated catalog entry omission notifications.
 	CatalogLabOmitted func(ctx context.Context, entry catalog.Entry, reason string)
 	// Logger receives safe operational fields only; tokens must never be passed to it.
@@ -49,7 +52,7 @@ type Config struct {
 	ReadinessCheck func() bool
 }
 
-// NewRouter returns an http.Handler with all three MVP routes registered.
+// NewRouter returns an http.Handler with the backend routes registered.
 func NewRouter(cfg Config) http.Handler {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -64,6 +67,9 @@ func NewRouter(cfg Config) http.Handler {
 	})
 	mux.HandleFunc("GET /api/v1alpha1/labs/{catalogRef}/resources/{resourcePath...}", func(w http.ResponseWriter, r *http.Request) {
 		handleResource(w, r, cfg)
+	})
+	mux.HandleFunc("POST /api/v1alpha1/labs/{catalogRef}/resync", func(w http.ResponseWriter, r *http.Request) {
+		handleResync(w, r, cfg)
 	})
 	mux.HandleFunc("POST /api/v1alpha1/labs/{catalogRef}/setup", func(w http.ResponseWriter, r *http.Request) {
 		handleSetup(w, r, cfg)
@@ -221,6 +227,52 @@ func handleCatalog(w http.ResponseWriter, r *http.Request, cfg Config) {
 		"kind":       "CatalogList",
 		"items":      items,
 	})
+}
+
+// handleResync is a temporary global-impact testing control, not a lab lifecycle operation.
+func handleResync(w http.ResponseWriter, r *http.Request, cfg Config) {
+	w.Header().Set("Cache-Control", "no-store")
+	token := bearerToken(r)
+	if token == "" || cfg.Authenticate == nil {
+		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication required", nil))
+		return
+	}
+	subject, err := cfg.Authenticate(r.Context(), r.Header.Get("Impersonate-User"), token)
+	if err != nil || subject == "" {
+		writeError(w, http.StatusUnauthorized, laberr.New(laberr.TypeUnauthorized, "authentication failed", nil))
+		return
+	}
+	entry, labError := catalogEntryByCatalogRef(r.Context(), cfg, r.PathValue("catalogRef"))
+	if labError != nil {
+		status := http.StatusNotFound
+		switch labError.ErrorType {
+		case laberr.TypeCatalogUnavailable:
+			status = http.StatusServiceUnavailable
+		case laberr.TypeConfigurationError:
+			status = http.StatusInternalServerError
+		}
+		writeError(w, status, labError)
+		return
+	}
+	if cfg.RepositoryRefresher == nil {
+		writeError(w, http.StatusServiceUnavailable, laberr.New(laberr.TypeRepositoryError, "repository refresh unavailable", nil))
+		return
+	}
+	err = cfg.RepositoryRefresher(r.Context(), bundle.RepositoryRefreshRequest{Repository: entry.Repository, Branch: entry.Branch})
+	if err == nil {
+		err = r.Context().Err()
+	}
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+		} else if errors.Is(err, context.Canceled) {
+			status = http.StatusRequestTimeout
+		}
+		writeError(w, status, laberr.New(laberr.TypeRepositoryError, "failed to resync repository", nil))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func handleBundle(w http.ResponseWriter, r *http.Request, cfg Config) {

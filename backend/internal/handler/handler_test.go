@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -2117,4 +2118,137 @@ func TestReadyzHandler(t *testing.T) {
 			assert.Equal(t, tc.status, rw.Code)
 		})
 	}
+}
+
+func TestResyncHandler(t *testing.T) {
+	t.Run("given an approved lab when resync completes then only refresh its shared repository branch", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// Given a verified user and a catalog-selected source, with no setup manager.
+			cm, err := goodCatalogCM(t.Context())
+			require.NoError(t, err)
+			entries, err := catalog.Read(cm)
+			require.NoError(t, err)
+			started, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var received bundle.RepositoryRefreshRequest
+			cfg := handler.Config{
+				CatalogSource: goodCatalogCM,
+				Authenticate: func(_ context.Context, user, token string) (string, error) {
+					assert.Equal(t, "alice", user)
+					assert.Equal(t, "secret-token", token)
+					return "verified-alice", nil
+				},
+				RepositoryRefresher: func(_ context.Context, request bundle.RepositoryRefreshRequest) error {
+					received = request
+					close(started)
+					<-release
+					return nil
+				},
+			}
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+entries[0].CatalogRef+"/resync?repository=https://evil.test/repo&branch=evil", strings.NewReader(`{"repository":"https://evil.test/repo"}`))
+			request.Header.Set("Authorization", "Bearer secret-token")
+			request.Header.Set("Impersonate-User", "alice")
+			response := httptest.NewRecorder()
+
+			// When refreshing, no response is sent until publication completes.
+			go func() { handler.NewRouter(cfg).ServeHTTP(response, request); close(done) }()
+			<-started
+			synctest.Wait()
+			assert.NotEqual(t, http.StatusNoContent, response.Code, "success must wait for publication")
+			select {
+			case <-done:
+				assert.Fail(t, "response arrived before source refresh completed")
+			default:
+			}
+			close(release)
+			<-done
+
+			// Then the only mutation uses the approved source and succeeds without a body.
+			assert.Equal(t, bundle.RepositoryRefreshRequest{Repository: entries[0].Repository, Branch: entries[0].Branch}, received)
+			assert.Equal(t, http.StatusNoContent, response.Code)
+			assert.Empty(t, response.Body.String())
+			assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+		})
+	})
+	t.Run("given failed admission or refresh when requested then never return success or leak details", func(t *testing.T) {
+		cm, err := goodCatalogCM(t.Context())
+		require.NoError(t, err)
+		entries, err := catalog.Read(cm)
+		require.NoError(t, err)
+		for _, tc := range []struct {
+			name              string
+			configure         func(*handler.Config)
+			ref               string
+			status, refreshes int
+			canceled          bool
+		}{
+			{name: "unknown identity", ref: "untrusted", status: http.StatusNotFound},
+			{name: "canceled caller with nil refresh error", canceled: true, status: http.StatusRequestTimeout, refreshes: 1},
+			{name: "authentication failure", configure: func(c *handler.Config) {
+				c.Authenticate = func(context.Context, string, string) (string, error) { return "", errors.New("secret-token") }
+			}, status: http.StatusUnauthorized},
+			{name: "empty subject", configure: func(c *handler.Config) {
+				c.Authenticate = func(context.Context, string, string) (string, error) { return "", nil }
+			}, status: http.StatusUnauthorized},
+			{name: "no authenticator", configure: func(c *handler.Config) { c.Authenticate = nil }, status: http.StatusUnauthorized},
+			{name: "unsafe catalog", configure: func(c *handler.Config) {
+				c.CatalogSource = stubCatalogCM(map[string]string{"catalog.yaml": "- repository: file:///tmp/unsafe\n  branch: main\n  labPath: lab"})
+			}, status: http.StatusInternalServerError},
+			{name: "missing catalog", configure: func(c *handler.Config) { c.CatalogSource = nil }, status: http.StatusServiceUnavailable},
+			{name: "missing refresher", configure: func(c *handler.Config) { c.RepositoryRefresher = nil }, status: http.StatusServiceUnavailable},
+			{name: "source failure", configure: func(c *handler.Config) {
+				c.RepositoryRefresher = func(context.Context, bundle.RepositoryRefreshRequest) error {
+					return errors.New("secret-token https://evil.test")
+				}
+			}, status: http.StatusBadGateway},
+			{name: "deadline exceeded", configure: func(c *handler.Config) {
+				c.RepositoryRefresher = func(context.Context, bundle.RepositoryRefreshRequest) error { return context.DeadlineExceeded }
+			}, status: http.StatusGatewayTimeout},
+			{name: "canceled request", configure: func(c *handler.Config) {
+				c.RepositoryRefresher = func(context.Context, bundle.RepositoryRefreshRequest) error { return context.Canceled }
+			}, status: http.StatusRequestTimeout},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				// Given admission or refresh failure.
+				calls := 0
+				cfg := handler.Config{CatalogSource: goodCatalogCM, Authenticate: func(context.Context, string, string) (string, error) { return "alice", nil }, RepositoryRefresher: func(context.Context, bundle.RepositoryRefreshRequest) error { calls++; return nil }}
+				if tc.configure != nil {
+					tc.configure(&cfg)
+				}
+				ref := tc.ref
+				if ref == "" {
+					ref = entries[0].CatalogRef
+				}
+				request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1alpha1/labs/"+ref+"/resync", nil)
+				request.Header.Set("Authorization", "Bearer secret-token")
+				if tc.canceled {
+					ctx, cancel := context.WithCancel(request.Context())
+					cancel()
+					request = request.WithContext(ctx)
+				}
+				response := httptest.NewRecorder()
+
+				// When resync is requested.
+				handler.NewRouter(cfg).ServeHTTP(response, request)
+
+				// Then errors stay safe and never become success.
+				assert.Equal(t, tc.status, response.Code)
+				assert.Equal(t, tc.refreshes, calls)
+				assert.Contains(t, response.Body.String(), `"kind":"Error"`)
+				assert.NotContains(t, response.Body.String(), "secret-token")
+				assert.NotContains(t, response.Body.String(), "evil.test")
+			})
+		}
+	})
+	t.Run("given no user token when resync is requested then authenticate before accessing sources", func(t *testing.T) {
+		// Given no authenticated user or configured source.
+		router := handler.NewRouter(handler.Config{})
+		request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1alpha1/labs/untrusted/resync", nil)
+		response := httptest.NewRecorder()
+
+		// When resync is requested.
+		router.ServeHTTP(response, request)
+
+		// Then no source is accessed and authentication is required.
+		assert.Equal(t, http.StatusUnauthorized, response.Code)
+	})
 }

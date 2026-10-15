@@ -31,16 +31,18 @@ import {
   Spinner,
   TextInput,
   Title,
+  Tooltip,
 } from "@patternfly/react-core";
 import {
   fetchResourceText,
   getSetupStatus,
   listCatalog,
   loadLabBundle,
+  resyncRepository,
   setupLab,
 } from "./api/client";
 import { extractAsciiDocTitle, renderAsciiDoc, type RenderResult } from "./renderer";
-import { TimesIcon, WindowMinimizeIcon } from "@patternfly/react-icons";
+import { SyncAltIcon, TimesIcon, WindowMinimizeIcon } from "@patternfly/react-icons";
 import type { CatalogEntry } from "./types/catalog";
 import type { LabError } from "./types/errors";
 import type { PersistedSession } from "./types/session";
@@ -56,10 +58,12 @@ type PageState =
 
 type ActivePanel = PersistedSession & {
   catalogRef: string;
+  labPath: string;
   title: string;
   modules: LabModule[];
   pages: LabPage[];
   attributes: Record<string, string>;
+  setupAttributes?: Record<string, string>;
   launchController: AbortController;
 };
 
@@ -96,6 +100,7 @@ type InteractiveLabsContextValue = {
 
 const SESSION_PREFIX = "interactive-labs-console-plugin:session:";
 const PROXY_BASE = "/api/proxy/plugin/interactive-labs-console-plugin/backend";
+const RESYNC_WARNING = "Temporary testing control. Fetches the latest lab content from the configured repository and branch, affecting all users. This MUST BE removed in production.";
 const LINK_WARNING = "Link is unavailable or unsafe.";
 const GUIDANCE_UNAVAILABLE = "Console target is unavailable.";
 const GUIDANCE_HIGHLIGHTED = "Console target highlighted.";
@@ -317,6 +322,21 @@ const pollSetupUntilReady = async (catalogRef: string, signal: AbortSignal): Pro
   }
   throw new DOMException("Aborted", "AbortError");
 };
+const renderPanelPage = async (panel: ActivePanel, defaultNamespace: string | undefined, signal: AbortSignal): Promise<RenderResult> => {
+  const page = panel.pages.find((candidate) => candidate.path === panel.currentPagePath);
+  if (!page) throw new Error("Lab page is unavailable.");
+  const source = await fetchResourceText(page.url, signal);
+  return renderAsciiDoc({
+    source,
+    sourceURL: page.url,
+    attributes: panel.attributes,
+    loadResource: fetchResourceText,
+    pageURLs: panel.pages.map((candidate) => candidate.url),
+    defaultNamespace,
+    signal,
+  });
+};
+
 const InteractiveLabsProvider: React.FC = ({ children }) => {
   const [activeNamespace] = useActiveNamespace();
   const defaultNamespace = isAllNamespacesKey(activeNamespace) ? undefined : activeNamespace || undefined;
@@ -329,6 +349,11 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   const [renderRetry, setRenderRetry] = React.useState(0);
   const [moduleTitles, setModuleTitles] = React.useState<Record<string, string>>({});
   const [moduleSelectOpen, setModuleSelectOpen] = React.useState(false);
+  const [resyncState, setResyncState] = React.useState<SetupState>();
+  const resyncAbortRef = React.useRef<AbortController>();
+  const preRenderedPanelRef = React.useRef<ActivePanel>();
+  const currentContentRef = React.useRef({ panel: activePanel, defaultNamespace });
+  currentContentRef.current = { panel: activePanel, defaultNamespace };
   const launchTriggerRef = React.useRef<HTMLElement | null>(null);
   const drawerFocusRef = React.useRef<HTMLDivElement | null>(null);
   const restoreFocusRef = React.useRef<HTMLButtonElement | null>(null);
@@ -410,6 +435,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       const needsSetup = bundle.runtimeContext.helmChartAvailable || resumeSetup;
       const panel: ActivePanel = {
         catalogRef,
+        labPath,
         title: bundle.manifest.metadata.title,
         modules: bundle.modules,
         currentPagePath: requestedPage?.path ?? saved?.currentPagePath ?? entryPage,
@@ -435,6 +461,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
           setActivePanel((current) => current ? {
             ...current,
             attributes: { ...current.attributes, ...finalStatus.attributes },
+            setupAttributes: finalStatus.attributes,
           } : current);
         }
         setSetupState(undefined);
@@ -452,6 +479,54 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
       }
     }
   }, []);
+
+  React.useEffect(() => {
+    setResyncState(undefined);
+    return () => resyncAbortRef.current?.abort();
+  }, [activePanel?.launchController, activePanel?.currentPagePath, defaultNamespace]);
+
+  const resync = async (): Promise<void> => {
+    if (!activePanel || setupState || (resyncAbortRef.current && !resyncAbortRef.current.signal.aborted)) return;
+    const controller = new AbortController();
+    resyncAbortRef.current = controller;
+    const isCurrent = (): boolean => {
+      const current = currentContentRef.current;
+      return mountedRef.current && resyncAbortRef.current === controller && !controller.signal.aborted &&
+        !activePanel.launchController.signal.aborted && current.panel?.launchController === activePanel.launchController &&
+        current.panel?.currentPagePath === activePanel.currentPagePath && current.defaultNamespace === defaultNamespace;
+    };
+    setResyncState({ status: "pending" });
+    try {
+      await resyncRepository(activePanel.catalogRef, controller.signal);
+      if (!isCurrent()) return;
+      const bundle = await loadLabBundle(activePanel.catalogRef, activePanel.labPath, controller.signal);
+      if (!isCurrent()) return;
+      const pages = bundle.modules.flatMap((module) => module.pages);
+      if (!pages.some((page) => page.path === activePanel.currentPagePath)) {
+        throw new Error("Current lab page is no longer available.");
+      }
+      const panel: ActivePanel = {
+        ...currentContentRef.current.panel!,
+        title: bundle.manifest.metadata.title,
+        modules: bundle.modules,
+        pages,
+        attributes: { ...bundle.manifest.spec?.attributes, ...activePanel.setupAttributes },
+      };
+      const result = await renderPanelPage(panel, defaultNamespace, controller.signal);
+      if (!isCurrent()) return;
+      // Commit bundle and rendered page together; failures above leave current content untouched.
+      // The normal page effect must not immediately fetch this already-rendered page again.
+      panel.panelMode = currentContentRef.current.panel!.panelMode;
+      preRenderedPanelRef.current = panel;
+      setActivePanel(panel);
+      setRenderState({ status: "success", result });
+      setResyncState(undefined);
+    } catch (error: unknown) {
+      if (isCurrent()) setResyncState({ status: "error", message: (error as LabError | undefined)?.message || "Unable to resync repository." });
+    } finally {
+      if (resyncAbortRef.current === controller) resyncAbortRef.current = undefined;
+    }
+  };
 
   const setPanelMode = React.useCallback((panelMode: PersistedSession["panelMode"]): void => {
     setModuleSelectOpen(false);
@@ -643,6 +718,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
   React.useEffect(() => () => {
     mountedRef.current = false;
     launchAbortRef.current?.abort();
+    resyncAbortRef.current?.abort();
     guidanceControllerRef.current?.abort();
   }, []);
 
@@ -742,27 +818,17 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
         .catch(() => { /* Use literal module ID if its first page or title is unavailable. */ });
     }
     return () => controller.abort();
-  }, [activePanel?.launchController, setupState]);
+  }, [activePanel?.launchController, activePanel?.modules, setupState]);
 
   React.useEffect(() => {
     if (!activePanel || activePanel.panelMode !== "open" || setupState) return undefined;
-    const page = activePanel.pages.find((candidate) => candidate.path === activePanel.currentPagePath);
-    if (!page) {
-      setRenderState({ status: "error", message: "Lab page is unavailable." });
+    if (preRenderedPanelRef.current === activePanel) {
+      preRenderedPanelRef.current = undefined;
       return undefined;
     }
     const controller = new AbortController();
     setRenderState({ status: "loading" });
-    void fetchResourceText(page.url, controller.signal)
-      .then((source) => renderAsciiDoc({
-        source,
-        sourceURL: page.url,
-        attributes: activePanel.attributes,
-        loadResource: fetchResourceText,
-        pageURLs: activePanel.pages.map((candidate) => candidate.url),
-        defaultNamespace,
-        signal: controller.signal,
-      }))
+    void renderPanelPage(activePanel, defaultNamespace, controller.signal)
       .then((result) => {
         if (!controller.signal.aborted) setRenderState({ status: "success", result });
       })
@@ -829,10 +895,7 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
                         {activePanel.title}
                       </Title>
                       {!setupState && (
-                        <>
-                          <div className="pfext-lab-module-title">{activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}</div>
-                          <span aria-live="polite">Page {modulePageIndex + 1} of {activeModule?.pages.length ?? 0}</span>
-                        </>
+                        <div className="pfext-lab-module-title">{activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}</div>
                       )}
                     </div>
                     <DrawerActions>
@@ -843,10 +906,29 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
                         <TimesIcon />
                       </Button>
                     </DrawerActions>
+                    <div className="pfext-lab-header-row">
+                      {!setupState && (
+                        <span aria-live="polite">Page {modulePageIndex + 1} of {activeModule?.pages.length ?? 0}</span>
+                      )}
+                      <Tooltip content={RESYNC_WARNING} aria="none">
+                        <Button
+                          variant="plain"
+                          className="pfext-lab-resync"
+                          aria-label="Resync repository"
+                          aria-describedby="interactive-labs-resync-warning"
+                          isAriaDisabled={!!setupState || resyncState?.status === "pending"}
+                          icon={<SyncAltIcon className={resyncState?.status === "pending" ? "pfext-lab-resync__icon--pending" : undefined} />}
+                          onClick={() => void resync()}
+                        />
+                      </Tooltip>
+                      <span id="interactive-labs-resync-warning" className="pf-v6-screen-reader">{RESYNC_WARNING}</span>
+                    </div>
+                    {resyncState?.status === "pending" && <span role="status">Resyncing repository…</span>}
                   </DrawerHead>
                 </div>
                 <DrawerPanelBody className="pfext-lab-panel-content__body">
                   <div>
+                    {resyncState?.status === "error" && <Alert variant="danger" title={resyncState.message} isInline isLiveRegion />}
                     {setupState?.status === "pending" && (
                       <Alert variant="info" title="Setting up your lab environment..." isInline isLiveRegion>
                         <Spinner size="md" aria-label="Setting up lab" className="pf-v5-u-mr-xs" />

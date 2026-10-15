@@ -98,6 +98,7 @@ func main() {
 		serverConfig.CacheRefreshInterval,
 		int(serverConfig.CacheConcurrentRefreshLimit),
 	)
+	cfg.RepositoryRefresher = refreshCoordinator.RefreshRepository
 	cfg.ReadinessCheck = func() bool {
 		return refreshCoordinator.IsReady() && !shuttingDown.Load()
 	}
