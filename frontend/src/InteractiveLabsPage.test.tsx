@@ -426,7 +426,7 @@ describe('catalog setup actions', () => {
     });
   };
 
-  test('given interleaved catalog entries, when inventory loads, then one list stably places every existing setup before inactive entries', async () => {
+  test('given interleaved catalog entries, when inventory loads, then one list preserves catalog order regardless of setup status', async () => {
     const entries = ['inactive-one', 'failed', 'pending', 'inactive-two', 'deployed', 'remnants'].map((catalogRef) => ({ catalogRef, title: catalogRef, labPath: catalogRef }));
     setInventory([
       { ...setup, catalogRef: 'deployed' },
@@ -442,12 +442,12 @@ describe('catalog setup actions', () => {
     const list = lists[0];
     expect(list.tagName).toBe('UL');
     expect(Array.from(list.children).map((child) => child.querySelector('h2')?.id)).toEqual([
-      'lab-failed', 'lab-pending', 'lab-deployed', 'lab-remnants', 'lab-inactive-one', 'lab-inactive-two',
+      'lab-inactive-one', 'lab-failed', 'lab-pending', 'lab-inactive-two', 'lab-deployed', 'lab-remnants',
     ]);
     expect(Array.from(list.children).every((child) => child.classList.contains('pf-v6-c-data-list__item'))).toBe(true);
     expect(container.querySelector('section[aria-label="Your lab setups"]')).toBeNull();
     expect(Array.from(list.querySelectorAll('h2')).map((heading) => heading.textContent)).toEqual([
-      'failed', 'pending', 'deployed', 'remnants', 'inactive-one', 'inactive-two',
+      'inactive-one', 'failed', 'pending', 'inactive-two', 'deployed', 'remnants',
     ]);
     const order = list.innerHTML;
     await act(async () => { getButton(/Refresh setups/).click(); });
@@ -947,7 +947,7 @@ describe('catalog setup actions', () => {
     const orphanRow = container.querySelector(`#lab-${orphan.catalogRef}`)!.closest<HTMLElement>('.pf-v6-c-data-list__item-row')!;
     expect(container.querySelectorAll('.pf-v6-c-data-list')).toHaveLength(1);
     expect(Array.from(list.children).map((child) => child.querySelector('h2')?.id)).toEqual([
-      `lab-${ref}`, `lab-${orphan.catalogRef}`, `lab-${otherRef}`,
+      `lab-${orphan.catalogRef}`, `lab-${ref}`, `lab-${otherRef}`,
     ]);
     expect(container.querySelector('section[aria-label="Your lab setups"]')).toBeNull();
     expect(orphanRow.className).toBe(row().className);
@@ -991,7 +991,7 @@ describe('catalog setup actions', () => {
     expect(teardown).not.toHaveBeenCalled();
   });
 
-  test.each(['running', 'unknown'] as const)('given receipt-only %s cleanup, when resources disappear, then row-local orphan notices and existing-first order remain', async (status) => {
+  test.each(['running', 'unknown'] as const)('given receipt-only %s cleanup, when resources disappear, then row-local orphan notices and stable catalog order remain', async (status) => {
     const orphanRef = '01'.repeat(32);
     const operationId = '12'.repeat(16);
     sessionStorage.setItem('interactive-labs-teardown', JSON.stringify([{ catalogRef: ref, operationId }, { catalogRef: orphanRef, operationId }]));
@@ -1004,7 +1004,7 @@ describe('catalog setup actions', () => {
     const list = container.querySelector('.pf-v6-c-data-list')!;
     expect(container.querySelectorAll('.pf-v6-c-data-list')).toHaveLength(1);
     expect(Array.from(list.children).map((child) => child.querySelector('h2')?.id)).toEqual([
-      `lab-${ref}`, `lab-${orphanRef}`, `lab-${otherRef}`,
+      `lab-${orphanRef}`, `lab-${otherRef}`, `lab-${ref}`,
     ]);
     const orphanRow = container.querySelector(`#lab-${orphanRef}`)!.closest('.pf-v6-c-data-list__item-row')!;
     expect(orphanRow.querySelector('h2')?.textContent).toBe(orphanRef);
