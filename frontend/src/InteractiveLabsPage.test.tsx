@@ -207,6 +207,66 @@ const launchGuidanceLab = async (html: string, trusted = true): Promise<void> =>
   await act(async () => { getButton(/^Launch$/).click(); });
 };
 
+describe('docked Console layout', () => {
+  test('given stateful Console children when a lab launches, minimizes, restores and closes then child state and mount identity survive', async () => {
+    // Given a mounted Console application with user state.
+    const mounted = jest.fn();
+    const unmounted = jest.fn();
+    const ConsoleApplication = () => {
+      const [edits, setEdits] = React.useState(0);
+      React.useEffect(() => { mounted(); return unmounted; }, []);
+      return <><button onClick={() => setEdits((count) => count + 1)}>Console edits: {edits}</button><InteractiveLabsPage /></>;
+    };
+    mockListCatalog.mockResolvedValue(sampleCatalog);
+    mockLoadLabBundle.mockResolvedValue(noChartBundle);
+    await act(async () => {
+      ReactDOM.render(<InteractiveLabsProvider><ConsoleApplication /></InteractiveLabsProvider>, container);
+    });
+    const consoleButton = getButton(/^Console edits:/);
+    act(() => { consoleButton.click(); });
+
+    // When each public lab lifecycle action changes panel visibility.
+    for (const action of [/^Launch$/, /Minimize lab/, /Restore lab/, /Close lab/]) {
+      await act(async () => { getButton(action).click(); });
+
+      // Then Console keeps both its React state and original DOM node.
+      expect(getButton(/^Console edits:/)).toBe(consoleButton);
+      expect(consoleButton.textContent).toBe('Console edits: 1');
+      expect(mounted).toHaveBeenCalledTimes(1);
+      expect(unmounted).not.toHaveBeenCalled();
+    }
+    expect(mockLoadLabBundle).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('#interactive-labs-drawer-panel')).toBeNull();
+  });
+
+  test('given Console children when the lab opens and closes then one persistent inline drawer shares content and panel layout', async () => {
+    // Given Console content already inside the unexpanded layout.
+    mockLoadLabBundle.mockResolvedValue(noChartBundle);
+    await renderCatalog();
+    const drawer = container.querySelector<HTMLElement>('.pfext-lab-drawer');
+    expect(drawer).not.toBeNull();
+    expect(drawer?.classList.contains('pf-m-inline')).toBe(true);
+    expect(drawer?.classList.contains('pf-m-expanded')).toBe(false);
+    const content = drawer?.querySelector('.pf-v6-c-drawer__main > .pf-v6-c-drawer__content');
+    expect(getButton(/^Launch$/).closest('.pf-v6-c-drawer__body')?.parentElement).toBe(content);
+
+    // When the lab opens, its panel is a sibling of Console content, not a separate fixed overlay.
+    await act(async () => { getButton(/^Launch$/).click(); });
+    const panel = container.querySelector('#interactive-labs-drawer-panel');
+    expect(panel?.parentElement).toBe(content?.parentElement);
+    expect(drawer?.classList.contains('pf-m-expanded')).toBe(true);
+    expect(drawer?.style.position).not.toBe('fixed');
+    expect(drawer?.style.pointerEvents).not.toBe('none');
+
+    // Then closing releases the panel without replacing the shared Console layout.
+    await act(async () => { getButton(/Close lab/).click(); });
+    expect(container.querySelector('.pfext-lab-drawer')).toBe(drawer);
+    expect(drawer?.querySelector('.pf-v6-c-drawer__content')).toBe(content);
+    expect(drawer?.classList.contains('pf-m-expanded')).toBe(false);
+    expect(container.querySelector('#interactive-labs-drawer-panel')).toBeNull();
+  });
+});
+
 describe('temporary repository resync', () => {
   test('given an open lab when heading renders then icon-only resync aligns with page count and retains its accessible warning', async () => {
     // Given an open lab.
@@ -2171,7 +2231,7 @@ describe('InteractiveLabsPage', () => {
     expect(document.activeElement).toBe(launch);
   });
 
-  test('keeps overlay in root provider across child changes and requires explicit relaunch after close', async () => {
+  test('keeps drawer in root provider across child changes and requires explicit relaunch after close', async () => {
     mockLoadLabBundle.mockResolvedValue(noChartBundle);
     await renderCatalog();
 
