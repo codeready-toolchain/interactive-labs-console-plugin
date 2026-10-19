@@ -18,6 +18,7 @@ import {
   Drawer,
   DrawerActions,
   DrawerContent,
+  DrawerContentBody,
   DrawerHead,
   DrawerPanelBody,
   DrawerPanelContent,
@@ -870,176 +871,172 @@ const InteractiveLabsProvider: React.FC = ({ children }) => {
 
   return (
     <InteractiveLabsContext.Provider value={value}>
-      {children}
-      {activePanel && (
-        <Drawer
-          className="pfext-lab-drawer"
-          isExpanded={isOpen}
-          position="end"
-          style={{ position: "fixed", inset: 0, zIndex: 1000, pointerEvents: "none" }}
-        >
-          <DrawerContent
-            panelContent={isOpen ? (
-              <DrawerPanelContent
-                id="interactive-labs-drawer-panel"
-                isResizable
-                minSize="20rem"
-                defaultSize="40%"
-                resizeAriaLabel="Resize lab drawer"
-                style={{ pointerEvents: "auto" }}
-              >
-                <div className="pfext-lab-panel-content">
-                  <DrawerHead>
-                    <div ref={drawerFocusRef} tabIndex={-1}>
-                      <Title headingLevel="h2" style={{ marginRight: "var(--pf-t--global--spacer--md)" }}>
-                        {activePanel.title}
-                      </Title>
-                      {!setupState && (
-                        <div className="pfext-lab-module-title">{activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}</div>
-                      )}
-                    </div>
-                    <DrawerActions>
-                      <Button variant="plain" onClick={() => setPanelMode("minimized")} aria-label="Minimize lab">
-                        <WindowMinimizeIcon />
-                      </Button>
-                      <Button variant="plain" onClick={closePanel} aria-label="Close lab">
-                        <TimesIcon />
-                      </Button>
-                    </DrawerActions>
-                    <div className="pfext-lab-header-row">
-                      {!setupState && (
-                        <span aria-live="polite">Page {modulePageIndex + 1} of {activeModule?.pages.length ?? 0}</span>
-                      )}
-                      <Tooltip content={RESYNC_WARNING} aria="none">
-                        <Button
-                          variant="plain"
-                          className="pfext-lab-resync"
-                          aria-label="Resync repository"
-                          aria-describedby="interactive-labs-resync-warning"
-                          isAriaDisabled={!!setupState || resyncState?.status === "pending"}
-                          icon={<SyncAltIcon className={resyncState?.status === "pending" ? "pfext-lab-resync__icon--pending" : undefined} />}
-                          onClick={() => void resync()}
-                        />
-                      </Tooltip>
-                      <span id="interactive-labs-resync-warning" className="pf-v6-screen-reader">{RESYNC_WARNING}</span>
-                    </div>
-                    {resyncState?.status === "pending" && <span role="status">Resyncing repository…</span>}
-                  </DrawerHead>
-                </div>
-                <DrawerPanelBody className="pfext-lab-panel-content__body">
-                  <div>
-                    {resyncState?.status === "error" && <Alert variant="danger" title={resyncState.message} isInline isLiveRegion />}
-                    {setupState?.status === "pending" && (
-                      <Alert variant="info" title="Setting up your lab environment..." isInline isLiveRegion>
-                        <Spinner size="md" aria-label="Setting up lab" className="pf-v5-u-mr-xs" />
-                        Lab pages will appear when setup finishes.
-                      </Alert>
-                    )}
-                    {setupState?.status === "error" && (
-                      <Alert variant="danger" title={setupState.message} isInline isLiveRegion />
-                    )}
+      <Drawer
+        className="pfext-lab-drawer"
+        isInline
+        isExpanded={isOpen}
+        position="end"
+      >
+        <DrawerContent
+          panelContent={activePanel && isOpen ? (
+            <DrawerPanelContent
+              id="interactive-labs-drawer-panel"
+              isResizable
+              minSize="20rem"
+              defaultSize="40%"
+              resizeAriaLabel="Resize lab drawer"
+            >
+              <div className="pfext-lab-panel-content">
+                <DrawerHead>
+                  <div ref={drawerFocusRef} tabIndex={-1}>
+                    <Title headingLevel="h2" style={{ marginRight: "var(--pf-t--global--spacer--md)" }}>
+                      {activePanel.title}
+                    </Title>
                     {!setupState && (
-                      <>
-                        <Title headingLevel="h2">
-                          <span dangerouslySetInnerHTML={{
-                            __html: renderState.status === "success"
-                              ? sanitizeTitle(renderState.result.title ?? activePanel.currentPagePath)
-                              : ""
-                          }} />
-                        </Title>
-                        {navigationWarning && <Alert variant="warning" title={navigationWarning} isInline />}
-                        {renderState.status === "loading" && <Spinner aria-label="Loading lab page" />}
-                        {renderState.status === "error" && (
-                          <>
-                            <Alert variant="danger" title={renderState.message} isInline isLiveRegion />
-                            <Button variant="link" onClick={() => setRenderRetry((count) => count + 1)}>Retry</Button>
-                          </>
-                        )}
-                        {renderState.status === "success" && (
-                          <>
-                            {renderState.result.warnings.map((warning, index) => (
-                              <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
-                            ))}
-                            <div
-                              ref={renderedContentRef}
-                              className="interactive-labs-content doc"
-                              onClick={handleRenderedLink}
-                              dangerouslySetInnerHTML={{ __html: renderState.result.html }}
-                            />
-                          </>
-                        )}
-                      </>
+                      <div className="pfext-lab-module-title">{activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}</div>
                     )}
                   </div>
-                </DrawerPanelBody>
-                <div className="pfext-lab-footer">
-                  <ActionList>
-                    <ActionListGroup className="pfext-lab-footer__actions">
-                      <ActionListItem>
-                        <Button
-                          variant="primary"
-                          isDisabled={!!setupState || currentPageIndex < 0 || currentPageIndex >= pagePaths.length - 1}
-                          onClick={() => selectPage(pagePaths[currentPageIndex + 1])}
-                        >
-                          Next
-                        </Button>
-                      </ActionListItem>
-                      <ActionListItem>
-                        <Button
-                          variant="secondary"
-                          isDisabled={!!setupState || currentPageIndex <= 0}
-                          onClick={() => selectPage(pagePaths[currentPageIndex - 1])}
-                        >
-                          Back
-                        </Button>
-                      </ActionListItem>
-                      {activePanel.modules.length > 1 && (
-                        <ActionListItem className="pfext-lab-footer__module">
-                          <Select
-                            isOpen={!setupState && moduleSelectOpen}
-                            selected={setupState ? undefined : activeModule?.id}
-                            onOpenChange={setModuleSelectOpen}
-                            shouldFocusToggleOnSelect
-                            onSelect={(_event, id) => {
-                              const firstPage = activePanel.modules.find((module) => module.id === id)?.pages[0];
-                              if (firstPage) selectPage(firstPage.path);
-                              setModuleSelectOpen(false);
-                            }}
-                            toggle={(toggleRef) => (
-                              <MenuToggle
-                                ref={toggleRef}
-                                className="pfext-lab-module-toggle"
-                                aria-label={setupState ? "Module" : `Module: ${activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}`}
-                                title={setupState ? undefined : activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}
-                                aria-haspopup="listbox"
-                                isExpanded={!setupState && moduleSelectOpen}
-                                isDisabled={!!setupState}
-                                onClick={() => setModuleSelectOpen((open) => !open)}
-                              >
-                                {setupState ? "Module" : activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}
-                              </MenuToggle>
-                            )}
-                          >
-                            <SelectList>
-                              {!setupState && activePanel.modules.map((module) => (
-                                <SelectOption key={module.id} value={module.id}>
-                                  {moduleTitles[module.id] ?? module.id}
-                                </SelectOption>
-                              ))}
-                            </SelectList>
-                          </Select>
-                        </ActionListItem>
+                  <DrawerActions>
+                    <Button variant="plain" onClick={() => setPanelMode("minimized")} aria-label="Minimize lab">
+                      <WindowMinimizeIcon />
+                    </Button>
+                    <Button variant="plain" onClick={closePanel} aria-label="Close lab">
+                      <TimesIcon />
+                    </Button>
+                  </DrawerActions>
+                  <div className="pfext-lab-header-row">
+                    {!setupState && (
+                      <span aria-live="polite">Page {modulePageIndex + 1} of {activeModule?.pages.length ?? 0}</span>
+                    )}
+                    <Tooltip content={RESYNC_WARNING} aria="none">
+                      <Button
+                        variant="plain"
+                        className="pfext-lab-resync"
+                        aria-label="Resync repository"
+                        aria-describedby="interactive-labs-resync-warning"
+                        isAriaDisabled={!!setupState || resyncState?.status === "pending"}
+                        icon={<SyncAltIcon className={resyncState?.status === "pending" ? "pfext-lab-resync__icon--pending" : undefined} />}
+                        onClick={() => void resync()}
+                      />
+                    </Tooltip>
+                    <span id="interactive-labs-resync-warning" className="pf-v6-screen-reader">{RESYNC_WARNING}</span>
+                  </div>
+                  {resyncState?.status === "pending" && <span role="status">Resyncing repository…</span>}
+                </DrawerHead>
+              </div>
+              <DrawerPanelBody className="pfext-lab-panel-content__body">
+                <div>
+                  {resyncState?.status === "error" && <Alert variant="danger" title={resyncState.message} isInline isLiveRegion />}
+                  {setupState?.status === "pending" && (
+                    <Alert variant="info" title="Setting up your lab environment..." isInline isLiveRegion>
+                      <Spinner size="md" aria-label="Setting up lab" className="pf-v5-u-mr-xs" />
+                      Lab pages will appear when setup finishes.
+                    </Alert>
+                  )}
+                  {setupState?.status === "error" && (
+                    <Alert variant="danger" title={setupState.message} isInline isLiveRegion />
+                  )}
+                  {!setupState && (
+                    <>
+                      <Title headingLevel="h2">
+                        <span dangerouslySetInnerHTML={{
+                          __html: renderState.status === "success"
+                            ? sanitizeTitle(renderState.result.title ?? activePanel.currentPagePath)
+                            : ""
+                        }} />
+                      </Title>
+                      {navigationWarning && <Alert variant="warning" title={navigationWarning} isInline />}
+                      {renderState.status === "loading" && <Spinner aria-label="Loading lab page" />}
+                      {renderState.status === "error" && (
+                        <>
+                          <Alert variant="danger" title={renderState.message} isInline isLiveRegion />
+                          <Button variant="link" onClick={() => setRenderRetry((count) => count + 1)}>Retry</Button>
+                        </>
                       )}
-                    </ActionListGroup>
-                  </ActionList>
+                      {renderState.status === "success" && (
+                        <>
+                          {renderState.result.warnings.map((warning, index) => (
+                            <Alert key={`${warning}-${index}`} variant="warning" title={warning} isInline />
+                          ))}
+                          <div
+                            ref={renderedContentRef}
+                            className="interactive-labs-content doc"
+                            onClick={handleRenderedLink}
+                            dangerouslySetInnerHTML={{ __html: renderState.result.html }}
+                          />
+                        </>
+                      )}
+                    </>
+                  )}
                 </div>
-              </DrawerPanelContent>
-            ) : null}
-          >
-            <div />
-          </DrawerContent>
-        </Drawer>
-      )}
+              </DrawerPanelBody>
+              <div className="pfext-lab-footer">
+                <ActionList>
+                  <ActionListGroup className="pfext-lab-footer__actions">
+                    <ActionListItem>
+                      <Button
+                        variant="primary"
+                        isDisabled={!!setupState || currentPageIndex < 0 || currentPageIndex >= pagePaths.length - 1}
+                        onClick={() => selectPage(pagePaths[currentPageIndex + 1])}
+                      >
+                        Next
+                      </Button>
+                    </ActionListItem>
+                    <ActionListItem>
+                      <Button
+                        variant="secondary"
+                        isDisabled={!!setupState || currentPageIndex <= 0}
+                        onClick={() => selectPage(pagePaths[currentPageIndex - 1])}
+                      >
+                        Back
+                      </Button>
+                    </ActionListItem>
+                    {activePanel.modules.length > 1 && (
+                      <ActionListItem className="pfext-lab-footer__module">
+                        <Select
+                          isOpen={!setupState && moduleSelectOpen}
+                          selected={setupState ? undefined : activeModule?.id}
+                          onOpenChange={setModuleSelectOpen}
+                          shouldFocusToggleOnSelect
+                          onSelect={(_event, id) => {
+                            const firstPage = activePanel.modules.find((module) => module.id === id)?.pages[0];
+                            if (firstPage) selectPage(firstPage.path);
+                            setModuleSelectOpen(false);
+                          }}
+                          toggle={(toggleRef) => (
+                            <MenuToggle
+                              ref={toggleRef}
+                              className="pfext-lab-module-toggle"
+                              aria-label={setupState ? "Module" : `Module: ${activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}`}
+                              title={setupState ? undefined : activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}
+                              aria-haspopup="listbox"
+                              isExpanded={!setupState && moduleSelectOpen}
+                              isDisabled={!!setupState}
+                              onClick={() => setModuleSelectOpen((open) => !open)}
+                            >
+                              {setupState ? "Module" : activeModule && (moduleTitles[activeModule.id] ?? activeModule.id)}
+                            </MenuToggle>
+                          )}
+                        >
+                          <SelectList>
+                            {!setupState && activePanel.modules.map((module) => (
+                              <SelectOption key={module.id} value={module.id}>
+                                {moduleTitles[module.id] ?? module.id}
+                              </SelectOption>
+                            ))}
+                          </SelectList>
+                        </Select>
+                      </ActionListItem>
+                    )}
+                  </ActionListGroup>
+                </ActionList>
+              </div>
+            </DrawerPanelContent>
+          ) : null}
+        >
+          <DrawerContentBody className="pfext-lab-console-content">{children}</DrawerContentBody>
+        </DrawerContent>
+      </Drawer>
       {guidance?.phase === "spotlight" && guidance.target && spotlightRect && (
         <div
           key={guidance.animationKey}

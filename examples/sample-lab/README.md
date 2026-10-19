@@ -66,7 +66,7 @@ Each immediate directory under `modules/` is a module, and `.adoc` files under i
 | Same-page fragment | `[[try-links]]` and `<<try-links,Return to this section>>` | Local anchor; renderer namespaces IDs and fragment links together. |
 | Partial | `include::_partials/note.adoc[]` | Include resolves relative to current source; nested includes resolve from included file. |
 | Local image | `image::images/flow.png[Two blue pages connected by a green arrow,width=192]` | Image resolves from active page; supply meaningful alt text. |
-| Attribute | `{lab-title}`, `{user}`, `{openshift_console_url}` | Manifest, runtime, or setup values substitute into content. |
+| Attribute | `{lab-title}`, `{user}`, `{openshift-console-url}` | Manifest, runtime, or setup values substitute into content. |
 
 Use source-relative paths for files. To refer to a page in another module, for example, use `../../020-next/content/010-start.adoc`. Unknown-page links produce warnings. Includes and images may refer to files outside the lab directory, as long as those files are still in the approved repository. Nested includes resolve relative to the file that includes them; images in partials remain relative to the active page.
 
