@@ -5,8 +5,7 @@
       "id": "interactive-labs-console-plugin-nav",
       "name": "Interactive Labs",
       "href": "/interactive-labs",
-      "perspective": "admin",
-      "section": "home"
+      "perspective": "admin"
     }
   },
   {
