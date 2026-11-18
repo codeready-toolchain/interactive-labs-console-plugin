@@ -29,9 +29,6 @@ type Chart struct {
 // wins, with root setup/helm used only if the local directory is absent.
 func LoadChart(repositoryRoot, labDir, override string) (*Chart, error) {
 	root, err := filepath.Abs(repositoryRoot)
-	if err == nil {
-		root, err = filepath.EvalSymlinks(root)
-	}
 	if err != nil {
 		return nil, fmt.Errorf("resolve chart snapshot: %w", err)
 	}
@@ -39,7 +36,19 @@ func LoadChart(repositoryRoot, labDir, override string) (*Chart, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve chart lab: %w", err)
 	}
-	helmDir, err := resolveChartDir(root, labDir, override)
+	// Relate the lab directory to the snapshot spelling the caller used before
+	// canonicalizing the root, so shared symlinked ancestors (a symlinked temp
+	// directory, for example) cancel out of both paths. resolveChartDir still
+	// rejects symlinked lab path segments and escapes from the canonical root.
+	labPath, err := filepath.Rel(root, labDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve chart lab: %w", err)
+	}
+	snapshot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve chart snapshot: %w", err)
+	}
+	helmDir, err := resolveChartDir(snapshot, labPath, override)
 	if err != nil {
 		return nil, fmt.Errorf("chart not resolved: %w", err)
 	}
@@ -78,11 +87,7 @@ func LoadChart(repositoryRoot, labDir, override string) (*Chart, error) {
 	return chart, nil
 }
 
-func resolveChartDir(root, labDir, override string) (string, error) {
-	labPath, err := filepath.Rel(root, labDir)
-	if err != nil {
-		return "", err
-	}
+func resolveChartDir(root, labPath, override string) (string, error) {
 	candidates := []string{filepath.ToSlash(labPath) + "/setup/helm", "setup/helm"}
 	if override != "" {
 		parsed, err := url.Parse(override)

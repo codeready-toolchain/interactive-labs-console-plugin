@@ -1959,7 +1959,10 @@ func TestSelectedChartInstall(t *testing.T) {
 		{name: "fallback", selected: "setup/helm"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			root := t.TempDir()
+			// Platform temp directories may sit behind a symlink (macOS /var -> /private/var)
+			// and chart directories are reported in canonical form.
+			root, err := filepath.EvalSymlinks(t.TempDir())
+			require.NoError(t, err)
 			identityManifest(t, root, tc.name, tc.override)
 			identityFile(t, root, tc.name+"/modules/010-intro/content/intro.adoc", "= Intro\n")
 			for _, chart := range []string{"setup/helm", tc.selected} {
