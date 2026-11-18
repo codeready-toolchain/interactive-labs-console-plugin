@@ -472,7 +472,7 @@ func TestCache(t *testing.T) {
 			return cache.closed
 		}, time.Second, time.Millisecond)
 		select {
-		case <-closeDone:
+		case <-closeDone: //nolint:errcheck
 			require.FailNow(t, "Close returned before refresh completed")
 		default:
 		}

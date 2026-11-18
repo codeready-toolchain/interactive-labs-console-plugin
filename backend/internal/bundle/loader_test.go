@@ -23,7 +23,10 @@ func writeFile(t *testing.T, file, contents string) {
 
 func moduleLab(t *testing.T) (string, string) {
 	t.Helper()
-	root := t.TempDir()
+	// Platform temp directories may sit behind a symlink (macOS /var -> /private/var)
+	// and chart directories are reported in canonical form.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
 	lab := filepath.Join(root, "lab")
 	writeFile(t, filepath.Join(lab, "lab.yaml"), "apiVersion: v1alpha1\nkind: Lab\nmetadata:\n  title: Test\n  description: ' Keep description '\nspec: {}\n")
 	writeFile(t, filepath.Join(lab, "modules", "020-apply", "content", "z.adoc"), "= Apply")
